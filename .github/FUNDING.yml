@@ -1,0 +1,9 @@
+# Renders the "Sponsor" button at the top of the repository and in the
+# sidebar of every issue and pull request — the only placement that follows
+# a reader around instead of waiting to be scrolled to.
+#
+# Roamkeep is free, has no paid tier and sells nothing. Donations cover the
+# push relay and development; they unlock no features, because there are
+# none to unlock, and they grant no commercial licence (see LICENSE).
+github: [roamkeep]
+ko_fi: roamkeep
