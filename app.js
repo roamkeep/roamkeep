@@ -1462,9 +1462,14 @@
             S.tiles[k] = 'loading';
             const img = new Image();
             img.crossOrigin = 'anonymous';
-            const sub = ['a', 'b', 'c'][Math.abs(tx + ty) % 3];
             const ttx = ((tx % n) + n) % n;
-            img.src = 'https://' + sub + '.tile.openstreetmap.org/' + S.mZoom + '/' + ttx + '/' + ty + '.png';
+            // Canonical host, no a/b/c rotation. The OSM Tile Usage Policy
+            // says to use exactly tile.openstreetmap.org and that other
+            // subdomains "may be slower or withdrawn without notice" — the
+            // rotation was an HTTP/1.1 trick for connection parallelism that
+            // HTTP/2 multiplexing makes unnecessary anyway, and the policy
+            // recommends HTTP/2.
+            img.src = 'https://tile.openstreetmap.org/' + S.mZoom + '/' + ttx + '/' + ty + '.png';
             ((key, i) => {
               i.onload = () => { S.tiles[key] = i; drawMap(); };
               i.onerror = () => { S.tiles[key] = 'err'; };

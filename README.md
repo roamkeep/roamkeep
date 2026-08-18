@@ -106,6 +106,10 @@ distinction matters, so here is the reasoning in full.
   argument that adds nothing. We say **source-available**. If that distinction
   matters to you, it should — and now you know exactly where Roamkeep sits.
 
+Third-party components ship under their own licences — see
+[NOTICE.md](NOTICE.md), which is generated from the packages actually
+installed rather than maintained by hand.
+
 The author retains copyright, so separate commercial licensing terms are
 available on request — see the contact in [`LICENSE`](LICENSE).
 
