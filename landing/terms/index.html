@@ -1,0 +1,217 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Roamkeep — Terms of Use</title>
+<meta name="theme-color" content="#0E7C7B">
+<!--
+  Published at https://get.roamkeep.app/terms — goes in the Play Console
+  listing alongside the privacy policy.
+
+  DRAFT. NOT YET REVIEWED BY A LAWYER. The liability, consumer-law and
+  governing-law clauses should be checked by someone qualified in the
+  jurisdiction named at the bottom before this is relied on.
+
+  Written to match landing/privacy/index.html: same tokens, same voice, same
+  structure. Keep them consistent — they are read together, and a
+  contradiction between them is worse than a gap in either. In particular,
+  the "your family holds the data" position appears in both and must say the
+  same thing in both.
+-->
+<style>
+  :root {
+    --primary: #0E7C7B; --primary-2: #0B5F5E;
+    --surface: #FAFBFC; --surface-2: #F1F5F9; --sand: #E2E8F0;
+    --ink: #0F172A; --muted: #64748B;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: -apple-system, 'Segoe UI', Roboto, sans-serif;
+    background: var(--surface); color: var(--ink);
+    padding: 24px 20px 60px; line-height: 1.62;
+  }
+  main { max-width: 680px; margin: 0 auto; }
+  .mark { width: 54px; height: 54px; display: block; margin: 10px auto 16px; color: var(--primary); }
+  h1 { font-size: 25px; text-align: center; margin-bottom: 4px; }
+  .sub { text-align: center; color: var(--muted); font-size: 13px; margin-bottom: 30px; }
+  h2 {
+    font-size: 16.5px; margin: 30px 0 9px; padding-top: 18px;
+    border-top: 1px solid var(--sand);
+  }
+  h2:first-of-type { border-top: none; padding-top: 0; }
+  p, li { font-size: 14.5px; color: #253449; margin-bottom: 11px; }
+  ul { padding-left: 22px; }
+  strong { color: var(--ink); }
+  .lede {
+    background: #fff; border: 1px solid var(--sand); border-left: 3px solid var(--primary);
+    border-radius: 12px; padding: 16px 18px; margin-bottom: 8px;
+  }
+  .lede p:last-child { margin-bottom: 0; }
+  code { background: var(--surface-2); padding: 1px 5px; border-radius: 4px; font-size: 12.5px; }
+  a { color: var(--primary); }
+  footer { margin-top: 34px; text-align: center; color: var(--muted); font-size: 12px; }
+  @media (prefers-color-scheme: dark) {
+    :root { --surface: #0B1220; --surface-2: #16202F; --sand: #24314A; --ink: #E8EEF6; --muted: #94A3B8; }
+    body { background: var(--surface); color: var(--ink); }
+    p, li { color: #C7D3E2; }
+    .lede { background: #111B2B; }
+  }
+</style>
+</head>
+<body>
+<main>
+
+<svg class="mark" viewBox="0 0 64 64" fill="none" aria-hidden="true">
+  <path d="M32 6 L52 14 v18 c0 13-9 21-20 26-11-5-20-13-20-26V14z" fill="currentColor" opacity=".16"/>
+  <path d="M32 6 L52 14 v18 c0 13-9 21-20 26-11-5-20-13-20-26V14z" stroke="currentColor" stroke-width="3.2" stroke-linejoin="round"/>
+  <circle cx="32" cy="29" r="6.5" fill="currentColor"/>
+</svg>
+
+<h1>Terms of Use</h1>
+<p class="sub">Roamkeep · <code>com.roamkeep.app</code> · last updated 17 August 2026</p>
+
+<div class="lede">
+  <p><strong>Roamkeep is a convenience, not a safety system.</strong> It shows
+  your family where each other are, when it can. Nobody monitors it, it will
+  sometimes be wrong or silent, and it must not be relied on to keep a person
+  safe.</p>
+  <p>Everything else here follows from that, and from the fact that your data
+  lives in a database you control rather than one we run.</p>
+</div>
+
+<h2>Who provides Roamkeep</h2>
+<p>Roamkeep is provided by <strong>David Carabetta</strong>, an individual
+developer in Australia (&ldquo;we&rdquo;, &ldquo;us&rdquo;). Contact:
+<a href="mailto:support@roamkeep.app">support@roamkeep.app</a>.</p>
+<p>By installing or using Roamkeep you agree to these terms. If you do not
+agree, do not use it.</p>
+
+<h2>Roamkeep is not an emergency service</h2>
+<p><strong>The SOS feature sends an alert to the other members of your Keep.
+It does nothing else.</strong> It does not contact police, ambulance, fire
+services or any monitoring centre. Nobody at Roamkeep sees it. No one is on
+call.</p>
+<p><strong>In an emergency, call 000</strong> (or your local emergency
+number). Do not use Roamkeep instead of doing so, and do not wait for it.</p>
+<p>Roamkeep is not a personal safety device, a medical alert system, a
+security product, or a substitute for supervising a child.</p>
+
+<h2>Location is best-effort, and will sometimes be wrong or absent</h2>
+<p>Roamkeep depends on a phone, its battery, its operating system, its
+permissions and a network. Every one of those can interrupt it, and in normal
+use they do. A location may be stale, inaccurate by tens or hundreds of
+metres, or missing entirely because:</p>
+<ul>
+  <li>the phone is off, flat, in flight mode, or has no signal</li>
+  <li>location permission was declined, revoked, or reduced to
+      &ldquo;while using the app&rdquo;</li>
+  <li>the operating system suspended or stopped the app to save power —
+      Android does this routinely, and some manufacturers do it
+      aggressively</li>
+  <li>battery optimisation is switched on for Roamkeep</li>
+  <li>satellite positioning is poor indoors, underground, in vehicles, or
+      among tall buildings</li>
+  <li>an adult member has paused their own location sharing, which they are
+      entitled to do at any time</li>
+</ul>
+<p><strong>The absence of an alert is not evidence of anything.</strong> If no
+&ldquo;arrived&rdquo; notification appears, that does not mean a person has
+not arrived. Treat what Roamkeep shows as a hint, never as a fact, and never
+as the basis for a decision that matters.</p>
+
+<h2>Your family&rsquo;s data is yours, and so is the database</h2>
+<p>Roamkeep stores nothing centrally. Your family creates and controls its own
+database with a third-party provider, and your family is responsible for it:
+its credentials, its cost, its configuration, and who is invited into it. See
+the <a href="/privacy">Privacy Policy</a> for what is stored and where.</p>
+<p>We have no access to it. We cannot recover it, reset it, or retrieve
+anything from it on your behalf. Anyone holding your setup link can reach
+your Keep&rsquo;s sign-up screen, so share it like an address, not a
+password.</p>
+
+<h2>The notification relay</h2>
+<p>One small component is operated by us: a relay that wakes phones when a
+notification is due. It carries no content — see the Privacy Policy.</p>
+<p>It is provided on a best-effort basis with no guarantee of availability. It
+may be rate-limited, interrupted, or withdrawn. When it is unavailable,
+notifications simply appear the next time the app is opened; nothing is lost
+from your database.</p>
+
+<h2>Using Roamkeep responsibly</h2>
+<p>Location sharing between people who have agreed to it is the only use this
+app is for.</p>
+<ul>
+  <li><strong>Every adult in a Keep must know they are in it and agree to
+      it.</strong> Adults can pause their own sharing at any time.</li>
+  <li>A parent or guardian is responsible for members of their household who
+      cannot consent for themselves, and for explaining to them that their
+      location is shared.</li>
+  <li><strong>Do not use Roamkeep to track anyone covertly</strong>, or for
+      stalking, harassment, intimidation, or controlling another person. This
+      is the most important rule on this page.</li>
+  <li>Do not use it unlawfully, or in breach of the terms of any service it
+      depends on.</li>
+</ul>
+<p>Because your data is in your own database, we cannot see this happening and
+cannot intervene in it. That is a direct consequence of the privacy design,
+and it places the responsibility with you.</p>
+
+<h2>The software licence</h2>
+<p>Roamkeep&rsquo;s source is published under the Business Source License 1.1.
+That licence governs the code — reading it, modifying it, running it for your
+own family. These terms govern your use of the published app and the relay.
+Neither grants any right to the Roamkeep name or logo.</p>
+
+<h2>Donations</h2>
+<p>Roamkeep is free. Donations are voluntary, unlock no features, and confer
+no licence, warranty, support entitlement, or priority of any kind. There are
+no paid features to unlock.</p>
+
+<h2>No warranty</h2>
+<p>Roamkeep is provided <strong>&ldquo;as is&rdquo;</strong>. To the maximum
+extent permitted by law we make no warranties of any kind, and do not warrant
+that it will be accurate, available, uninterrupted, or fit for any particular
+purpose.</p>
+<p><strong>Nothing in these terms excludes, restricts or modifies any
+guarantee, right or remedy you have under the Australian Consumer Law, or
+under any other law, that cannot lawfully be excluded.</strong> Where a
+guarantee cannot be excluded but our liability for failing to comply with it
+can be limited, our liability is limited to supplying the software again or
+paying the cost of having it supplied again.</p>
+
+<h2>Limitation of liability</h2>
+<p>To the maximum extent permitted by law, we are not liable for any loss or
+damage arising from your use of, or inability to use, Roamkeep. That includes
+loss arising from location data that was late, inaccurate, missing or
+misinterpreted; from a notification that did not arrive; from the relay being
+unavailable; or from anything that happens to your own database.</p>
+<p>Roamkeep is supplied free of charge. To the extent our liability cannot be
+excluded, it is limited in aggregate to AUD $100.</p>
+
+<h2>Changes, and stopping</h2>
+<p>We may change or discontinue Roamkeep, including the relay, at any time.
+Because your data is in your own database, discontinuation does not take it
+away from you — the app is source-available and the database remains
+yours.</p>
+<p>You can stop at any time: disconnect the device in Settings, leave your
+Keep, or delete your database entirely.</p>
+
+<h2>Changes to these terms</h2>
+<p>If these terms change materially, the date at the top of this page will
+change and the change will be noted in the app&rsquo;s release notes.</p>
+
+<h2>Governing law</h2>
+<p>These terms are governed by the laws of New South Wales, Australia, and you
+submit to the non-exclusive jurisdiction of its courts.</p>
+
+<h2>Contact</h2>
+<p>General: <a href="mailto:support@roamkeep.app">support@roamkeep.app</a><br>
+Privacy: <a href="mailto:privacy@roamkeep.app">privacy@roamkeep.app</a><br>
+Security: <a href="mailto:security@roamkeep.app">security@roamkeep.app</a></p>
+
+<footer>Roamkeep · private family location sharing · you own your data</footer>
+
+</main>
+</body>
+</html>

@@ -55,6 +55,12 @@ including the parts that are non-obvious: why push is content-free, how
 native geofence state is kept in step with the database, and which failures
 are silent by nature.
 
+## Contributing
+
+Small and specific is best. [CONTRIBUTING.md](CONTRIBUTING.md) covers the
+conventions and the contributor terms — the latter exist so that every
+version can still convert to Apache 2.0 on its Change Date.
+
 ## Security
 
 Please report vulnerabilities privately — see
