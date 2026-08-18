@@ -1,0 +1,23 @@
+<!--
+  Roamkeep app mark — "Keep + Hearth".
+
+  A castle keep (battlements + tower) whose base tapers to a map-pin
+  point: the fortified place where a family's whereabouts are kept.
+  The arched window is lit in the SOS coral — someone is home.
+
+  This SVG is the SOURCE OF TRUTH for every raster icon in the repo.
+  Regenerate the PNGs with `npm run icons` after editing.
+
+  Geometry lives in a 100x100 local space (see the transform) so the
+  same path can be reused at any size / in the Android vector drawable.
+-->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" width="1024" height="1024">
+  <rect width="1024" height="1024" fill="#0E7C7B"/>
+  <g transform="translate(58.5,31.3) scale(9.07)">
+    <!-- keep silhouette: battlements, tower body, tapered pin point -->
+    <path fill="#FFFFFF"
+          d="M26,18 L35,18 L35,26 L44,26 L44,18 L56,18 L56,26 L65,26 L65,18 L74,18 L74,60 L50,88 L26,60 Z"/>
+    <!-- lit arched window -->
+    <path fill="#FF6B5B" d="M40,58 L40,44 A10,10 0 0 1 60,44 L60,58 Z"/>
+  </g>
+</svg>

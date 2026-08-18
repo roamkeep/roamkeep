@@ -1,0 +1,7 @@
+<?xml version='1.0' encoding='utf-8'?>
+<resources>
+    <string name="app_name">Roamkeep</string>
+    <string name="title_activity_main">Roamkeep</string>
+    <string name="package_name">com.roamkeep.app</string>
+    <string name="custom_url_scheme">com.roamkeep.app</string>
+</resources>

@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  API 31+. allowBackup="false" stops the Google Drive backup, but from
+  Android 12 device-to-device transfer is governed separately by this file —
+  so without it, setting up a new phone from the old one would still carry
+  across SharedPreferences, which is where the Supabase session tokens and
+  the family's saved places live.
+
+  Both channels exclude everything. There is nothing in this app worth
+  restoring that is not one setup link away.
+-->
+<data-extraction-rules>
+    <cloud-backup>
+        <exclude domain="root" />
+        <exclude domain="file" />
+        <exclude domain="database" />
+        <exclude domain="sharedpref" />
+        <exclude domain="external" />
+    </cloud-backup>
+    <device-transfer>
+        <exclude domain="root" />
+        <exclude domain="file" />
+        <exclude domain="database" />
+        <exclude domain="sharedpref" />
+        <exclude domain="external" />
+    </device-transfer>
+</data-extraction-rules>

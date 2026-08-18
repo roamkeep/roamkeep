@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Brand teal (the CSS "primary" token). Was #2E1F0A, a brown left
+         over from the palette that predated the teal redesign. -->
+    <color name="ic_launcher_background">#0E7C7B</color>
+</resources>

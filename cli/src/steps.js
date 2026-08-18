@@ -1,0 +1,228 @@
+// The provisioning steps, in order.
+//
+// Every step is IDEMPOTENT and individually re-runnable (`--from <n>`).
+// That matters more than it sounds: the Management API's shapes drift,
+// families run this once on an unfamiliar machine, and a half-provisioned
+// project that can't be resumed is worse than one that never started.
+//
+// A step that fails reports what to do by hand instead of aborting the
+// run, so a drifted endpoint costs a manual dashboard click rather than
+// the whole setup.
+
+import fs from 'node:fs';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { ApiError } from './api.js';
+
+const HERE = path.dirname(fileURLToPath(import.meta.url));
+const REPO = path.join(HERE, '..', '..');
+
+export const readSchema = () =>
+  fs.readFileSync(path.join(REPO, 'db', 'schema.sql'), 'utf8');
+
+export const readFunction = () =>
+  fs.readFileSync(path.join(REPO, 'supabase', 'functions', 'notify-checkin', 'index.ts'), 'utf8');
+
+/**
+ * Extensions the schema depends on.
+ *
+ * pgcrypto backs gen_random_bytes for invite codes; pg_cron runs the
+ * 7-day breadcrumb sweep. schema.sql degrades gracefully without pg_cron
+ * (it RAISEs a NOTICE and skips the job) so this is best-effort — some
+ * plans don't allow it.
+ */
+export async function enableExtensions(api, ref) {
+  const out = { pgcrypto: false, pg_cron: false };
+  for (const ext of ['pgcrypto', 'pg_cron']) {
+    try {
+      await api.query(ref, `CREATE EXTENSION IF NOT EXISTS ${ext};`);
+      out[ext] = true;
+    } catch {
+      out[ext] = false;
+    }
+  }
+  return out;
+}
+
+/**
+ * Apply the consolidated schema. It is idempotent and non-destructive by
+ * design, so re-running is safe and is the supported upgrade path.
+ */
+export async function applySchema(api, ref) {
+  await api.query(ref, readSchema());
+}
+
+/**
+ * Confirm the schema actually took, rather than trusting a 200.
+ * Checks the tables and the RPCs the app cannot work without.
+ */
+export async function verifySchema(api, ref) {
+  const sql = `
+    select
+      (select count(*) from information_schema.tables
+        where table_schema='public'
+          and table_name in ('keeps','keep_members','checkins','keep_places','location_history')) as tables,
+      (select count(*) from information_schema.routines
+        where routine_schema='public'
+          and routine_name in ('create_keep','join_keep_by_code','rotate_keep_code','remove_member')) as rpcs;`;
+  const rows = await api.query(ref, sql);
+  const r = Array.isArray(rows) ? rows[0] : rows;
+  const tables = Number(r?.tables ?? 0);
+  const rpcs = Number(r?.rpcs ?? 0);
+  if (tables < 5 || rpcs < 4) {
+    throw new Error(`schema incomplete — ${tables}/5 tables, ${rpcs}/4 RPCs`);
+  }
+  return { tables, rpcs };
+}
+
+/**
+ * Turn OFF email confirmation.
+ *
+ * The app signs people straight in after sign-up; with confirmations on,
+ * a family member creates an account and then sits at a screen waiting
+ * for an email that the project has no SMTP configured to send. This is
+ * the one setting with no SQL representation.
+ */
+export async function configureAuth(api, ref) {
+  await api.updateAuthConfig(ref, { mailer_autoconfirm: true });
+  const cfg = await api.getAuthConfig(ref);
+  if (cfg && cfg.mailer_autoconfirm === false) {
+    throw new Error('mailer_autoconfirm did not stick');
+  }
+  return true;
+}
+
+/**
+ * Wire the checkins → notify-checkin webhook.
+ *
+ * Deliberately NOT `supabase_functions.http_request`, which is what the
+ * dashboard's Webhooks UI generates. That helper lives in a
+ * `supabase_functions` schema which only exists once someone has used
+ * that UI — on a brand-new project it is absent and the trigger fails
+ * with `schema "supabase_functions" does not exist`. Depending on it
+ * would mean depending on the manual step this wizard exists to remove.
+ *
+ * So we own the trigger function and call pg_net directly. The payload is
+ * built to match the shape notify-checkin already parses, so the edge
+ * function is identical whether it was wired by the wizard or by hand in
+ * the dashboard.
+ *
+ * No Authorization header: the function is deployed --no-verify-jwt (the
+ * dashboard's own webhooks are called the same way), so it needs none —
+ * and this avoids writing a service-role key into a function body that
+ * any sufficiently privileged role could read back.
+ */
+export async function createWebhook(api, ref) {
+  const url = `https://${ref}.supabase.co/functions/v1/notify-checkin`;
+  const sql = `
+    create extension if not exists pg_net;
+
+    create or replace function public.roamkeep_notify_checkin()
+      returns trigger
+      language plpgsql
+      security definer
+      set search_path = public, net
+    as $fn$
+    begin
+      perform net.http_post(
+        url     := '${url}',
+        headers := jsonb_build_object('Content-Type', 'application/json'),
+        body    := jsonb_build_object(
+                     'type',       'INSERT',
+                     'table',      'checkins',
+                     'schema',     'public',
+                     'record',     to_jsonb(new),
+                     'old_record', null
+                   ),
+        timeout_milliseconds := 5000
+      );
+      return new;
+    exception when others then
+      -- Push is best-effort: a webhook problem must never block the
+      -- check-in itself from being written.
+      return new;
+    end;
+    $fn$;
+
+    -- Trigger-only: fires from the trigger below, never as an RPC. Supabase's
+    -- default privileges grant EXECUTE on every new public function to anon and
+    -- authenticated by name, so revoking PUBLIC alone leaves it exposed at
+    -- /rest/v1/rpc/roamkeep_notify_checkin (Supabase advisor 0028/0029). Revoke
+    -- the client roles explicitly. Not exploitable either way — Postgres
+    -- refuses to run a trigger function called directly — but this keeps a
+    -- provisioned family's advisor clean.
+    revoke all on function public.roamkeep_notify_checkin() from public, anon, authenticated;
+
+    drop trigger if exists on_checkin_notify on public.checkins;
+    create trigger on_checkin_notify
+      after insert on public.checkins
+      for each row
+      execute function public.roamkeep_notify_checkin();`;
+  await api.query(ref, sql);
+}
+
+export async function verifyWebhook(api, ref) {
+  const rows = await api.query(ref, `
+    select count(*)::int as n from pg_trigger
+    where tgname = 'on_checkin_notify' and not tgisinternal;`);
+  const r = Array.isArray(rows) ? rows[0] : rows;
+  if (Number(r?.n ?? 0) < 1) throw new Error('webhook trigger not found after creation');
+  return true;
+}
+
+/**
+ * Does the edge function exist yet?
+ *
+ * Deploying one needs an eszip bundle, which is the supabase CLI's job —
+ * reimplementing it here would be fragile and is the one place shelling
+ * out is genuinely simpler. The wizard checks, and tells the user the
+ * exact command if it's missing, rather than pretending to do it.
+ */
+export async function checkFunction(api, ref) {
+  try {
+    const fns = await api.listFunctions(ref);
+    return Array.isArray(fns) && fns.some((f) => f.slug === 'notify-checkin');
+  } catch (e) {
+    if (e instanceof ApiError && e.status === 404) return false;
+    throw e;
+  }
+}
+
+/** Pull the anon key so the wizard can print a setup link. */
+export async function getAnonKey(api, ref) {
+  const keys = await api.getApiKeys(ref);
+  if (!Array.isArray(keys)) throw new Error('unexpected api-keys response');
+  const anon = keys.find((k) => k.name === 'anon' || k.name === 'anon key');
+  if (!anon?.api_key) throw new Error('anon key not present in response');
+  return anon.api_key;
+}
+
+/**
+ * End-to-end proof, not just "the API returned 200".
+ *
+ * Inserts nothing and sends no push: it calls the deployed function with
+ * a synthetic webhook payload for a keep id that cannot exist, so the
+ * recipient query returns empty and the function short-circuits. A 200
+ * with "no recipients" proves the function is deployed, reachable,
+ * parsing the payload and able to query the database.
+ */
+export async function probeFunction(ref) {
+  const payload = {
+    type: 'INSERT', table: 'checkins', schema: 'public', old_record: null,
+    record: {
+      id: '00000000-0000-0000-0000-000000000001',
+      keep_id: '00000000-0000-0000-0000-0000000000ff',
+      member_id: '00000000-0000-0000-0000-000000000002',
+      member_name: 'setup-probe', member_avatar: '🧪',
+      type: 'arrived', place: 'setup-probe',
+      created_at: new Date().toISOString(),
+    },
+  };
+  const res = await fetch(`https://${ref}.supabase.co/functions/v1/notify-checkin`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  });
+  const text = await res.text();
+  return { ok: res.ok, status: res.status, body: text.slice(0, 200) };
+}

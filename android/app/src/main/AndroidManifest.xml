@@ -1,0 +1,198 @@
+<?xml version="1.0" encoding="utf-8" ?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
+    <!--
+      BACKUP IS OFF, DELIBERATELY. Do not restore Capacitor's default of
+      allowBackup="true".
+
+      Everything this app keeps locally lives in SharedPreferences: the
+      backend pointer (rk_backend — project URL + anon key) and PrefsStore's
+      headless context, which is access_token, refresh_token, user_id,
+      keep_id, member_id and the family's saved places. Android Auto Backup
+      includes SharedPreferences by default, so with backup on, a family's
+      place list and live session tokens were being copied to Google Drive.
+
+      Nothing about that breaks the privacy policy's claims — the developer
+      still has no route into anyone's project — but a reader of "your
+      location goes to your family's database and nowhere else" would not
+      expect their saved places in Google's backup, and the page does not
+      mention it. Off is the answer that needs no footnote.
+
+      The visible symptom that led here: a REINSTALL silently restored
+      rk_backend, so the app booted already-connected and went straight to
+      the sign-in screen. A "fresh install" that never shows the Connect
+      screen looks like a routing bug and is not one.
+
+      The cost is that a user re-links after a phone swap. Accepted by the
+      owner, 2026-08-16.
+
+      Two attributes because they cover different API levels: allowBackup
+      governs cloud backup, and from API 31 dataExtractionRules governs both
+      cloud backup and device-to-device transfer, which allowBackup alone
+      does not disable.
+    -->
+    <application
+        android:allowBackup="false"
+        android:dataExtractionRules="@xml/data_extraction_rules"
+        android:fullBackupContent="@xml/backup_rules"
+        android:icon="@mipmap/ic_launcher"
+        android:label="@string/app_name"
+        android:roundIcon="@mipmap/ic_launcher_round"
+        android:supportsRtl="true"
+        android:theme="@style/AppTheme">
+        <activity
+            android:configChanges="orientation|keyboardHidden|keyboard|screenSize|locale|smallestScreenSize|screenLayout|uiMode|navigation"
+            android:name=".MainActivity"
+            android:label="@string/title_activity_main"
+            android:theme="@style/AppTheme.NoActionBarLaunch"
+            android:launchMode="singleTask"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+
+            <!-- Setup links. Without these the appUrlOpen listener in
+                 app.js never fires and links only work by QR or paste.
+
+                 Android App Links: autoVerify makes Android fetch
+                 https://get.roamkeep.app/.well-known/assetlinks.json and,
+                 if this app's signing fingerprint is listed, open the link
+                 here instead of in a browser. Verification is silent when
+                 it fails — the link just opens the landing page instead,
+                 which is a reasonable fallback rather than a broken state.
+
+                 NOTE: Play App Signing re-signs with Google's key, so the
+                 Play build's fingerprint differs from the sideload one.
+                 Both must be listed in assetlinks.json — see
+                 landing/README.md. -->
+            <intent-filter android:autoVerify="true">
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data android:scheme="https" android:host="get.roamkeep.app" />
+            </intent-filter>
+
+            <!-- Custom scheme: the fallback path, and what a QR carries if
+                 App Link verification hasn't happened yet. Needs no
+                 server-side proof. -->
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data android:scheme="@string/custom_url_scheme" />
+            </intent-filter>
+        </activity>
+
+        <provider
+            android:name="androidx.core.content.FileProvider"
+            android:authorities="${applicationId}.fileprovider"
+            android:exported="false"
+            android:grantUriPermissions="true">
+            <meta-data android:name="android.support.FILE_PROVIDER_PATHS" android:resource="@xml/file_paths" />
+        </provider>
+
+        <!-- Native geofence receiver. Target of the PendingIntent we
+             hand to GeofencingClient.addGeofences(). Android delivers
+             ENTER/EXIT broadcasts here even when the app process is
+             dead; we goAsync() and POST the check-in directly to
+             Supabase. Explicit-intent target, so exported=false. -->
+        <receiver android:name="com.roamkeep.app.geofence.GeofenceReceiver" android:exported="false" />
+
+        <!-- Fires when a self-pause expires, to restart tracking without
+             waiting for the app to be opened. Targeted by an explicit
+             PendingIntent, so it needs no intent-filter. -->
+        <receiver android:name="com.roamkeep.app.geofence.PauseExpiryReceiver" android:exported="false" />
+
+        <!-- Push is content-free: the relay only sends {"t":"sync"}, and
+             this service reads the actual check-in back out of the
+             family's own Supabase to build the notification on-device.
+
+             It EXTENDS the Capacitor plugin's MessagingService (so
+             onNewToken still reaches the JS registration listener), and
+             the plugin's own <service> is removed below — two services
+             sharing the MESSAGING_EVENT filter would leave it undefined
+             which one FCM delivers to. -->
+        <service
+            android:name="com.roamkeep.app.geofence.RoamkeepMessagingService"
+            android:exported="false">
+            <intent-filter>
+                <action android:name="com.google.firebase.MESSAGING_EVENT" />
+            </intent-filter>
+        </service>
+        <service
+            android:name="com.capacitorjs.plugins.pushnotifications.MessagingService"
+            tools:node="remove" />
+
+        <!-- Native breadcrumb logging. Target of the PendingIntent we
+             hand to FusedLocationProviderClient.requestLocationUpdates().
+             The OS delivers location batches here even when the app
+             process is dead, so the trail keeps recording while the
+             WebView (and its JS breadcrumb path) is suspended in the
+             background. Explicit-intent target, so exported=false. -->
+        <receiver android:name="com.roamkeep.app.geofence.LocationUpdateReceiver" android:exported="false">
+            <intent-filter>
+                <action android:name="com.roamkeep.app.LOCATION_UPDATE" />
+            </intent-filter>
+        </receiver>
+
+        <!-- Foreground service that keeps the app in an active process
+             state so background location isn't throttled by App Standby
+             buckets on idle devices. START_STICKY; restarted on boot. -->
+        <service
+            android:name="com.roamkeep.app.geofence.LocationForegroundService"
+            android:exported="false"
+            android:foregroundServiceType="location"
+        />
+
+        <!-- Re-arms the whole tracking pipeline (foreground service +
+             geofences) after events that silently tear it down: device
+             reboot (BOOT_COMPLETED / LOCKED_BOOT_COMPLETED) and app
+             updates (MY_PACKAGE_REPLACED — every APK install kills the
+             process and nothing else restarts the service until the
+             next manual app open). -->
+        <receiver android:name="com.roamkeep.app.geofence.BootReceiver" android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.BOOT_COMPLETED" />
+                <action android:name="android.intent.action.LOCKED_BOOT_COMPLETED" />
+                <action android:name="android.intent.action.QUICKBOOT_POWERON" />
+                <action android:name="android.intent.action.MY_PACKAGE_REPLACED" />
+            </intent-filter>
+        </receiver>
+    </application>
+
+    <!-- Permissions -->
+
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
+    <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
+
+    <!-- Background location. Two native mechanisms ride on these:
+           1. GeofenceReceiver needs ACCESS_BACKGROUND_LOCATION on
+              Android 10+ so Google Play Services delivers ENTER/EXIT
+              broadcasts while the app isn't visible — the primary path
+              for arrived/left check-ins.
+           2. LocationForegroundService (this app) runs a
+              persistent-notification foreground service that holds the
+              FusedLocationProvider updates (LocationUpdateReceiver),
+              keeping the app out of the App Standby throttle so the
+              breadcrumb trail + live pin keep updating in the background.
+              FOREGROUND_SERVICE + FOREGROUND_SERVICE_LOCATION are
+              required for its "location" service type; POST_NOTIFICATIONS
+              (Android 13+) gates its notification.
+         WAKE_LOCK keeps the service alive between GPS samples. -->
+    <uses-permission android:name="android.permission.ACCESS_BACKGROUND_LOCATION" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_LOCATION" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
+    <!-- Lets the app ask to be exempted from Doze battery optimisation.
+         Play policy allows this for apps whose core function is
+         continuous background location; the request is user-initiated
+         from the first-run setup screen and always declinable. -->
+    <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
+
+    <!-- Needed to re-register geofences after device reboot (they are
+         cleared on boot and must be re-added by the app, via BootReceiver). -->
+    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
+</manifest>

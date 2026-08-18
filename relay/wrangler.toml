@@ -1,0 +1,48 @@
+name = "roamkeep-relay"
+main = "src/index.js"
+compatibility_date = "2026-01-15"
+
+# No KV, no D1, no R2, no Durable Objects — the relay is stateless by
+# design. There is nowhere for it to keep anything even if it wanted to.
+
+# Workers logs are OFF. The relay handles push tokens, and the privacy
+# claim is that it retains nothing — that claim is only true while this
+# stays false. Do not turn it on to debug.
+#
+# Accepted cost: the relay cannot see its own health, so a fleet-wide push
+# failure produces no signal here. Diagnose from the family side instead —
+# notify-checkin logs sent/dead/limited on their own Supabase.
+[observability]
+enabled = false
+
+# GLOBAL throughput guard: one counter for the entire relay, keyed on a
+# constant (see RATE_LIMIT_KEY in src/index.js). Nothing about any caller
+# — no IP, no token, no device — contributes to the key, which is what
+# keeps the "stores nothing" claim unqualified.
+#
+# This is a QUOTA GUARD, not an abuse guard. It stops a runaway or a flood
+# from silently burning the daily Workers quota and taking push down for
+# everyone. It cannot protect one device from targeted wake-up spam; that
+# was the per-device design, rejected because it put a counter about a
+# device into Cloudflare's backing store.
+#
+# ⚠ SIZING — RAISE THIS AS FAMILIES ARE ADDED.
+# 1000/min is roughly 10x a plausible peak for a few hundred families.
+# Undersize it and you recreate the per-IP bug at a larger scale:
+# unrelated families throttled together, silently, because push is
+# best-effort. Rough guide: a family generates ~50 wake-ups/day, heavily
+# clustered around school-run times.
+#
+# "unsafe" is just how the rate-limiting binding is declared; it is a
+# stable Cloudflare feature. The Worker tolerates the binding being
+# absent, so `wrangler dev` and the offline tests still run.
+[[unsafe.bindings]]
+name = "RATE_LIMITER"
+type = "ratelimit"
+namespace_id = "1001"
+simple = { limit = 1000, period = 60 }
+
+# FCM_SERVICE_ACCOUNT is a SECRET, never committed:
+#   wrangler secret put FCM_SERVICE_ACCOUNT
+# Paste the entire JSON from Firebase Console → Project settings →
+# Service accounts → Generate new private key.

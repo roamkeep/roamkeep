@@ -1,0 +1,88 @@
+// Top-level build file where you can add configuration options common to all sub-projects/modules.
+
+buildscript {
+    
+    repositories {
+        google()
+        mavenCentral()
+    }
+    dependencies {
+        classpath 'com.android.tools.build:gradle:8.7.2'
+        classpath 'com.google.gms:google-services:4.4.2'
+
+        // NOTE: Do not place your application dependencies here; they belong
+        // in the individual module build.gradle files
+    }
+}
+
+apply from: "variables.gradle"
+
+allprojects {
+    repositories {
+        google()
+        mavenCentral()
+    }
+
+    // Swap ML Kit's BUNDLED barcode scanner for the Play-Services-backed
+    // one. The barcode plugin pulls com.google.mlkit:barcode-scanning,
+    // which ships the detection model and its native libs inside the APK
+    // — that alone took the universal APK from 2 MB to 23 MB.
+    //
+    // We only ever call scan(), which hands off to Google's code-scanner
+    // activity and fetches its module from Play Services on demand, so
+    // the bundled model was pure dead weight. The play-services variant
+    // exposes the same com.google.mlkit.vision.barcode API, so the plugin
+    // still compiles; the model is downloaded once, on first use.
+    //
+    // Applied to allprojects because the dependency is declared by the
+    // plugin module, not by :app.
+    configurations.all {
+        resolutionStrategy.eachDependency { details ->
+            if (details.requested.group == 'com.google.mlkit'
+                    && details.requested.name == 'barcode-scanning') {
+                details.useTarget 'com.google.android.gms:play-services-mlkit-barcode-scanning:18.3.1'
+                details.because 'bundled detection model is ~20MB of APK we never use'
+            }
+        }
+    }
+}
+
+// Force Java / Kotlin JVM target to 21 across every submodule,
+// including third-party Capacitor plugins that forgot to declare
+// compileOptions. Why 21 and not 17:
+//   - The user's JDK is 21 (Android Studio Ladybug+ embedded JBR).
+//   - capacitor.build.gradle (auto-generated) already sets VERSION_21.
+//   - The Kotlin compiler in newer Capacitor plugins (e.g.
+//     @capacitor/geolocation 7.x) defaults its jvmTarget to the JDK's
+//     major version, so forcing javac lower than Kotlin causes the
+//     "Inconsistent JVM-target compatibility" error.
+// Without this block, plugins that ship without compileOptions fall
+// back to VERSION_1_8, which JDK 21 refuses to emit.
+subprojects {
+    afterEvaluate { project ->
+        if (project.hasProperty('android')) {
+            project.android {
+                compileOptions {
+                    sourceCompatibility JavaVersion.VERSION_21
+                    targetCompatibility JavaVersion.VERSION_21
+                }
+            }
+        }
+        project.tasks.withType(JavaCompile).configureEach {
+            sourceCompatibility = JavaVersion.VERSION_21
+            targetCompatibility = JavaVersion.VERSION_21
+        }
+        // Same for Kotlin tasks (matched by type name so this works
+        // even in subprojects that don't have kotlin-gradle-plugin on
+        // their buildscript classpath).
+        project.tasks.matching { it.name ==~ /compile.*Kotlin/ }.configureEach {
+            if (it.hasProperty('kotlinOptions')) {
+                it.kotlinOptions.jvmTarget = '21'
+            }
+        }
+    }
+}
+
+task clean(type: Delete) {
+    delete rootProject.buildDir
+}

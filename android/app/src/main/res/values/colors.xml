@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Brand teal. Must stay identical to the #s-load background in
+         styles.css and the fill in assets/splash.svg, so the system
+         splash -> WebView handoff shows no colour flash. -->
+    <color name="splash_background">#0E7C7B</color>
+
+    <!-- The app's own surface, identical to the `surface` token in
+         styles.css (a literal double hyphen cannot appear in an XML
+         comment, which is why it is not written out here).
+         Under enforced edge-to-edge (Android 16) the strips behind the
+         status and navigation bars show the WINDOW background, not the
+         WebView, so this is what the user sees around the app chrome. It
+         has to match the header or the seam is visible.
+
+         Pinned here rather than inherited from the DayNight parent on
+         purpose: the web layer has no dark mode at all (zero
+         prefers-color-scheme rules in styles.css), so a device in dark
+         mode would otherwise paint those strips near-black around a white
+         app — and the dark status-bar icons set in styles.xml would
+         disappear into them. -->
+    <color name="app_surface">#FAFBFC</color>
+</resources>

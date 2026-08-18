@@ -1,0 +1,15 @@
+<!--
+  Adaptive-icon FOREGROUND layer (Android 8+).
+
+  Transparent background; the mark is deliberately smaller than in
+  icon.svg because Android masks the outer ring of an adaptive icon —
+  only the centre 66/108 of the canvas is guaranteed visible. The mark
+  is sized to sit inside that safe zone at every mask shape.
+-->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" width="1024" height="1024">
+  <g transform="translate(169,148.4) scale(6.86)">
+    <path fill="#FFFFFF"
+          d="M26,18 L35,18 L35,26 L44,26 L44,18 L56,18 L56,26 L65,26 L65,18 L74,18 L74,60 L50,88 L26,60 Z"/>
+    <path fill="#FF6B5B" d="M40,58 L40,44 A10,10 0 0 1 60,44 L60,58 Z"/>
+  </g>
+</svg>

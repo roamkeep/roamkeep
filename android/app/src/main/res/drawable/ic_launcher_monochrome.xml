@@ -1,0 +1,25 @@
+<!--
+  Monochrome layer for Android 13+ themed icons. The launcher tints this
+  a single colour, so the coral window can't survive as a fill — it is
+  punched out as a hole instead (evenOdd), which keeps the "lit window"
+  read in a themed icon.
+
+  Geometry matches assets/icon.svg; the group transform centres the mark
+  inside the 66/108 adaptive safe zone.
+-->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <group
+        android:translateX="14"
+        android:translateY="11.6"
+        android:scaleX="0.8"
+        android:scaleY="0.8">
+        <path
+            android:fillColor="#FFFFFF"
+            android:fillType="evenOdd"
+            android:pathData="M26,18 L35,18 L35,26 L44,26 L44,18 L56,18 L56,26 L65,26 L65,18 L74,18 L74,60 L50,88 L26,60 Z M40,58 L40,44 A10,10 0 0 1 60,44 L60,58 Z" />
+    </group>
+</vector>

@@ -1,0 +1,34 @@
+{
+  "name": "roamkeep",
+  "version": "0.3.0",
+  "private": true,
+  "description": "Roamkeep \u2014 private family location sharing. PWA + Capacitor Android shell.",
+  "scripts": {
+    "build": "node build.js",
+    "build:pwa": "node build.js --bake",
+    "icons": "node tools/gen-icons.js && npx @capacitor/assets generate --android",
+    "sync": "npm run build && cap sync android",
+    "android:open": "cap open android",
+    "android:run": "npm run sync && cap run android",
+    "android:release": "npm run sync && cd android && .\\gradlew.bat assembleRelease",
+    "android:bundle": "npm run sync && cd android && .\\gradlew.bat bundleRelease",
+    "link": "node tools/setup-link.js"
+  },
+  "devDependencies": {
+    "@capacitor/assets": "^3.0.5",
+    "@capacitor/cli": "^7.0.0",
+    "esbuild": "^0.28.1",
+    "qrcode": "^1.5.4",
+    "typescript": "^6.0.3"
+  },
+  "dependencies": {
+    "@capacitor-mlkit/barcode-scanning": "^7.5.0",
+    "@capacitor/android": "^7.0.0",
+    "@capacitor/app": "^7.1.2",
+    "@capacitor/core": "^7.0.0",
+    "@capacitor/geolocation": "^7.0.0",
+    "@capacitor/preferences": "^7.0.4",
+    "@capacitor/push-notifications": "^7.0.6",
+    "@capacitor/status-bar": "^7.0.0"
+  }
+}

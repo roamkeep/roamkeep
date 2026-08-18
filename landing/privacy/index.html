@@ -1,0 +1,209 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Roamkeep — Privacy Policy</title>
+<meta name="theme-color" content="#0E7C7B">
+<!--
+  Published at https://get.roamkeep.app/privacy — this URL goes in the
+  Play Console listing and must stay reachable for as long as the app is
+  distributed. Google re-checks it.
+
+  Every factual claim on this page is a claim about code that is
+  source-available, so each one has to stay true of the code. In
+  particular: the relay's "logs nothing, stores nothing" depends on
+  `[observability]` remaining disabled in relay/wrangler.toml and on there
+  being no console.* calls in relay/src/index.js. Do not change either
+  without changing this page first.
+-->
+<style>
+  :root {
+    --primary: #0E7C7B; --primary-2: #0B5F5E;
+    --surface: #FAFBFC; --surface-2: #F1F5F9; --sand: #E2E8F0;
+    --ink: #0F172A; --muted: #64748B;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: -apple-system, 'Segoe UI', Roboto, sans-serif;
+    background: var(--surface); color: var(--ink);
+    padding: 24px 20px 60px; line-height: 1.62;
+  }
+  main { max-width: 680px; margin: 0 auto; }
+  .mark { width: 54px; height: 54px; display: block; margin: 10px auto 16px; color: var(--primary); }
+  h1 { font-size: 25px; text-align: center; margin-bottom: 4px; }
+  .sub { text-align: center; color: var(--muted); font-size: 13px; margin-bottom: 30px; }
+  h2 {
+    font-size: 16.5px; margin: 30px 0 9px; padding-top: 18px;
+    border-top: 1px solid var(--sand);
+  }
+  h2:first-of-type { border-top: none; padding-top: 0; }
+  p, li { font-size: 14.5px; color: #253449; margin-bottom: 11px; }
+  ul { padding-left: 22px; }
+  strong { color: var(--ink); }
+  .lede {
+    background: #fff; border: 1px solid var(--sand); border-left: 3px solid var(--primary);
+    border-radius: 12px; padding: 16px 18px; margin-bottom: 8px;
+  }
+  .lede p:last-child { margin-bottom: 0; }
+  table { width: 100%; border-collapse: collapse; margin: 6px 0 14px; font-size: 13.5px; }
+  th, td { text-align: left; padding: 9px 10px; border-bottom: 1px solid var(--sand); vertical-align: top; }
+  th { color: var(--muted); font-weight: 600; font-size: 12px; text-transform: uppercase; letter-spacing: .03em; }
+  code { background: var(--surface-2); padding: 1px 5px; border-radius: 4px; font-size: 12.5px; }
+  a { color: var(--primary); }
+  footer { margin-top: 34px; text-align: center; color: var(--muted); font-size: 12px; }
+  @media (prefers-color-scheme: dark) {
+    :root { --surface: #0B1220; --surface-2: #16202F; --sand: #24314A; --ink: #E8EEF6; --muted: #94A3B8; }
+    body { background: var(--surface); color: var(--ink); }
+    p, li { color: #C7D3E2; }
+    .lede { background: #111B2B; }
+  }
+</style>
+</head>
+<body>
+<main>
+
+<svg class="mark" viewBox="0 0 64 64" fill="none" aria-hidden="true">
+  <path d="M32 6 L52 14 v18 c0 13-9 21-20 26-11-5-20-13-20-26V14z" fill="currentColor" opacity=".16"/>
+  <path d="M32 6 L52 14 v18 c0 13-9 21-20 26-11-5-20-13-20-26V14z" stroke="currentColor" stroke-width="3.2" stroke-linejoin="round"/>
+  <circle cx="32" cy="29" r="6.5" fill="currentColor"/>
+</svg>
+
+<h1>Privacy Policy</h1>
+<p class="sub">Roamkeep · <code>com.roamkeep.app</code> · last updated 12 August 2026</p>
+
+<div class="lede">
+  <p><strong>Roamkeep has no servers.</strong> Every family runs its own private
+  database, which they create and control. Your location is sent to that
+  database and nowhere else.</p>
+  <p>The developer of Roamkeep cannot see your location, your saved places,
+  your family members, or your messages — not because of a promise, but
+  because there is no system under the developer's control that receives
+  them.</p>
+</div>
+
+<h2>Who is responsible for your data</h2>
+<p>When your family sets up Roamkeep, you create your own project on
+<a href="https://supabase.com">Supabase</a>, a third-party hosting provider.
+<strong>Your family is the controller of that data.</strong> You choose the
+region it is stored in, you hold the credentials, and you can delete the
+entire project at any time, which erases everything at once.</p>
+<p>The developer of Roamkeep has no account access, no credentials, and no
+technical route into your project.</p>
+
+<h2>What Roamkeep collects, and where it goes</h2>
+<table>
+  <tr><th>Data</th><th>Why</th><th>Where it is stored</th></tr>
+  <tr>
+    <td><strong>Precise location</strong>, including in the background</td>
+    <td>To show your position on your family's map, and to send arrive/leave
+        alerts for places your family has saved</td>
+    <td>Your family's own database</td>
+  </tr>
+  <tr>
+    <td><strong>Location history</strong> (a breadcrumb trail)</td>
+    <td>The map trail and the History timeline</td>
+    <td>Your family's own database, <strong>automatically deleted after 7 days</strong></td>
+  </tr>
+  <tr>
+    <td><strong>Email address</strong></td>
+    <td>To sign in</td>
+    <td>Your family's own database</td>
+  </tr>
+  <tr>
+    <td><strong>Display name and avatar</strong></td>
+    <td>So your family can tell members apart</td>
+    <td>Your family's own database</td>
+  </tr>
+  <tr>
+    <td><strong>Battery level</strong></td>
+    <td>So your family can see when someone's phone is about to die</td>
+    <td>Your family's own database</td>
+  </tr>
+  <tr>
+    <td><strong>Device notification token</strong></td>
+    <td>To wake your phone when something needs your attention</td>
+    <td>Your family's own database, and briefly the relay described below</td>
+  </tr>
+</table>
+<p>Roamkeep contains <strong>no analytics, no advertising, no trackers, and no
+crash reporting</strong>. Nothing is sent to the developer.</p>
+
+<h2>Why the app needs background location</h2>
+<p>Roamkeep's main purpose is to tell your family when you arrive home, or at
+school, or at any place they have saved — and to show your position on the
+family map. Those things have to keep working when the app is closed, or the
+app cannot do the one job it exists to do.</p>
+<p>Roamkeep asks for this permission explicitly, explains it in the app before
+asking, and shows a permanent notification in your phone's status bar
+whenever it is recording your location. <strong>You can pause your own
+tracking at any time from inside the app.</strong></p>
+
+<h2>The notification relay</h2>
+<p>There is exactly one piece of infrastructure the developer runs: a small
+relay that wakes up phones when a notification is due. It exists because
+notification delivery on Android has to be signed with a key belonging to
+the published app, which a family's own database cannot hold.</p>
+<p><strong>The relay never receives the content of a notification.</strong> It
+receives a list of device tokens and sends each one a fixed, meaningless
+wake-up signal. Your phone then fetches the actual details from
+<em>your family's own database</em> and writes the notification text itself,
+on the device.</p>
+<p>The relay therefore sees device tokens, how many there are, and when. It
+cannot see names, places, coordinates, messages, or even what kind of event
+occurred — every wake-up is identical. <strong>It stores nothing and logs
+nothing.</strong></p>
+<p>The relay's complete source code is published, and this claim can be
+checked against it.</p>
+
+<h2>Who can see your location</h2>
+<p>Only the members of your Keep. The database enforces this with row-level
+security, so it is a property of the data itself rather than of the app: a
+modified or malicious client still cannot read another family's rows.</p>
+<p>Roamkeep does not sell data, does not share data with advertisers, and has
+no third-party SDKs that receive your data.</p>
+
+<h2>Children</h2>
+<p>Roamkeep is designed for families and is intended to be set up by a parent
+or guardian, who invites the rest of the household. Members marked as
+children cannot disable their own tracking; adults can. Roamkeep is not
+directed at children as an audience and children cannot create a Keep of
+their own without an invitation.</p>
+<p>Because your family holds all of the data, a parent can delete a child's
+location history, remove them from the Keep, or delete the entire database
+at any time, without asking anyone.</p>
+
+<h2>Keeping and deleting your data</h2>
+<ul>
+  <li><strong>Location history</strong> is deleted automatically after 7 days.</li>
+  <li><strong>Leaving a Keep</strong> removes your membership and your location history.</li>
+  <li><strong>Deleting the Supabase project</strong> destroys everything your
+      family ever recorded, immediately and permanently.</li>
+  <li><strong>Disconnecting a device</strong> (Settings → Disconnect this
+      device) clears the app's stored credentials and stops all tracking on
+      that phone.</li>
+</ul>
+<p>Because the developer holds no copy of your data, there is no deletion
+request to submit and nobody to ask. Deleting it is entirely in your hands.</p>
+
+<h2>Security</h2>
+<p>All traffic between the app and your database is encrypted in transit
+(HTTPS). Access is controlled by row-level security enforced by the database.
+Setup links carry your family's server address in the part of a URL that
+browsers never transmit to a web server, so it does not appear in anyone's
+access logs.</p>
+
+<h2>Changes to this policy</h2>
+<p>If this policy changes materially, the date at the top of this page will
+change and the change will be described in the app's release notes. Because
+the app is source-available, any change to what the software actually does is
+publicly visible.</p>
+
+<h2>Contact</h2>
+<p>Questions about this policy: <a href="mailto:privacy@roamkeep.app">privacy@roamkeep.app</a></p>
+
+<footer>Roamkeep · private family location sharing · you own your data</footer>
+
+</main>
+</body>
+</html>

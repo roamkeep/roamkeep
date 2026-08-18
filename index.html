@@ -1,0 +1,402 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+  <title>Roamkeep</title>
+  <link rel="manifest" href="manifest.json">
+  <link rel="stylesheet" href="styles.css">
+  <link rel="icon" href="icon-192.png" type="image/png">
+  <meta name="theme-color" content="#0E7C7B">
+  <meta name="mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <meta name="apple-mobile-web-app-title" content="Roamkeep">
+</head>
+<body>
+
+<!-- Brand mark, defined once and referenced with <use> wherever the logo
+     appears. The keep body inherits currentColor so it works on both the
+     teal splash and light surfaces; the window keeps its coral. -->
+<svg width="0" height="0" style="position:absolute" aria-hidden="true" focusable="false">
+  <symbol id="rk-mark" viewBox="0 0 100 100">
+    <path fill="currentColor" d="M26,18 L35,18 L35,26 L44,26 L44,18 L56,18 L56,26 L65,26 L65,18 L74,18 L74,60 L50,88 L26,60 Z"/>
+    <path fill="#FF6B5B" d="M40,58 L40,44 A10,10 0 0 1 60,44 L60,58 Z"/>
+  </symbol>
+</svg>
+
+<!-- LOADING — continues the native splash: same teal, same mark, so the
+     system-splash to WebView handoff reads as one screen. The trail draws
+     itself in and the keep's window lights up on arrival. -->
+<div id="s-load" class="screen on">
+  <svg class="load-mark" viewBox="0 0 100 100" role="img" aria-label="Roamkeep">
+    <path class="lm-trail" d="M6,92 C22,90 28,76 41,71"/>
+    <path class="lm-keep" d="M26,18 L35,18 L35,26 L44,26 L44,18 L56,18 L56,26 L65,26 L65,18 L74,18 L74,60 L50,88 L26,60 Z"/>
+    <path class="lm-win" d="M40,58 L40,44 A10,10 0 0 1 60,44 L60,58 Z"/>
+  </svg>
+  <div class="load-title">Roamkeep</div>
+  <div class="load-sub" id="load-msg">Starting…</div>
+</div>
+
+<!-- ERROR -->
+<div id="s-err" class="screen">
+  <div class="err-screen-icon"><span class="ic" data-icon="alert-triangle" data-icon-size="44"></span></div>
+  <h2>Something went wrong</h2>
+  <p>Roamkeep failed to start. Check your internet connection and try again.</p>
+  <div id="err-msg"></div>
+  <button class="btn-retry" data-action="reload">Retry</button>
+</div>
+
+<!-- CONNECT (first run — choose which family server this device talks to) -->
+<div id="s-connect" class="screen">
+  <div class="card">
+    <div class="brand">
+      <svg class="brand-icon-svg" aria-hidden="true"><use href="#rk-mark"/></svg>
+      <h1>Roamkeep</h1>
+      <p>Connect to your family's own server</p>
+    </div>
+
+    <p class="note">Roamkeep doesn't run a server. Each family keeps their
+      location data on <strong>their own private Supabase project</strong> —
+      nobody else, including us, can see it.</p>
+
+    <button class="btn btn-g" id="connect-scan" data-action="connect-scan">
+      <span class="ic" data-icon="qr"></span> Scan setup QR code
+    </button>
+
+    <div class="or-sep"><span>or paste your setup link</span></div>
+
+    <div class="field">
+      <label for="connect-link">Setup link</label>
+      <input id="connect-link" type="text" class="code-inp-wide"
+             placeholder="https://get.roamkeep.app/s#…"
+             autocomplete="off" autocorrect="off" spellcheck="false">
+    </div>
+    <button class="btn" id="connect-paste-go" data-action="connect-paste-go">Connect →</button>
+
+    <div class="err" id="connect-err" style="display:none"></div>
+
+    <div class="info-card" style="margin-top:18px">
+      <strong>ℹ️ Don't have a link?</strong>
+      Whoever set up your family's Keep can share one from the app
+      (Invite), or create a new server with the Roamkeep setup tool.
+    </div>
+  </div>
+</div>
+
+<!-- AUTH -->
+<div id="s-auth" class="screen">
+  <div class="card">
+    <div class="brand">
+      <svg class="brand-icon-svg" aria-hidden="true"><use href="#rk-mark"/></svg>
+      <h1>Roamkeep</h1>
+      <p>Private location sharing for families</p>
+    </div>
+    <div class="tabs">
+      <button class="tab on" data-action="auth-tab-in">Sign In</button>
+      <button class="tab" data-action="auth-tab-up">New Account</button>
+    </div>
+    <div class="err" id="auth-err"></div>
+
+    <div class="tp on" id="tp-in">
+      <div class="field">
+        <label for="si-e">Email</label>
+        <input id="si-e" type="email" placeholder="you@example.com" autocomplete="email" inputmode="email">
+      </div>
+      <div class="field">
+        <label for="si-p">Password</label>
+        <input id="si-p" type="password" placeholder="Your password" autocomplete="current-password">
+      </div>
+      <button class="btn btn-g" id="si-btn" data-action="sign-in">Sign In →</button>
+    </div>
+
+    <div class="tp" id="tp-up">
+      <div class="field">
+        <label for="su-e">Email</label>
+        <input id="su-e" type="email" placeholder="you@example.com" autocomplete="email" inputmode="email">
+      </div>
+      <div class="field">
+        <label for="su-p">Password (min 6 chars)</label>
+        <input id="su-p" type="password" placeholder="Choose a password" autocomplete="new-password">
+      </div>
+      <button class="btn btn-g" id="su-btn" data-action="sign-up">Create Account →</button>
+      <p class="note note-centered">One account per family member.</p>
+    </div>
+  </div>
+</div>
+
+<!-- KEEP -->
+<div id="s-keep" class="screen">
+  <div class="card">
+    <div class="brand">
+      <span class="brand-icon">🏰</span>
+      <h1>Your Keep</h1>
+      <p>Create a Keep or join your family's</p>
+    </div>
+    <div class="tabs">
+      <button class="tab on" data-action="keep-tab-cr">Create Keep</button>
+      <button class="tab" data-action="keep-tab-jo">Join Keep</button>
+    </div>
+    <div class="err" id="keep-err"></div>
+
+    <div class="tp on" id="tp-cr">
+      <div class="field">
+        <label for="cr-name">Your Display Name</label>
+        <input id="cr-name" type="text" placeholder="Mum, Dad, Jake…" maxlength="20" autocomplete="off">
+      </div>
+      <div class="av-label">Your Avatar</div>
+      <div class="av-row" id="cr-avs"></div>
+      <div class="field">
+        <label for="cr-fam">Family Name</label>
+        <input id="cr-fam" type="text" placeholder="The Millers" maxlength="24" autocomplete="off">
+      </div>
+      <p class="note">A private join code is created for family to join with. It expires after 72 hours — rotate a fresh one anytime from Invite.</p>
+      <button class="btn btn-g" id="cr-btn" data-action="create-keep">🏰 Create Our Keep</button>
+    </div>
+
+    <div class="tp" id="tp-jo">
+      <div class="field">
+        <label for="jo-name">Your Display Name</label>
+        <input id="jo-name" type="text" placeholder="Mum, Dad, Jake…" maxlength="20" autocomplete="off">
+      </div>
+      <div class="av-label">Your Avatar</div>
+      <div class="av-row" id="jo-avs"></div>
+      <div class="field">
+        <label for="jo-code">Family Code</label>
+        <input id="jo-code" type="text" class="code-inp" placeholder="Family code" maxlength="16"
+               autocomplete="off" autocorrect="off" autocapitalize="characters" spellcheck="false">
+      </div>
+      <button class="btn btn-g" id="jo-btn" data-action="join-keep">🏰 Join the Keep</button>
+    </div>
+
+    <button class="lnk-btn" data-action="sign-out">← Sign out</button>
+  </div>
+</div>
+
+<!-- APP -->
+<div id="s-app" class="screen">
+  <div class="hdr">
+    <div class="hdr-l">
+      <svg class="ib-icon-svg" aria-hidden="true"><use href="#rk-mark"/></svg>
+      <div>
+        <h2>Roamkeep</h2>
+        <div class="hdr-sub" id="hdr-sub">—</div>
+      </div>
+    </div>
+    <div class="hdr-r">
+      <div class="live" id="live-badge" data-action="refresh-fix" role="button" tabindex="0">
+        <div class="live-dot" id="live-dot"></div>
+        <span id="live-lbl">Live</span>
+      </div>
+      <button class="sos-btn" id="sos-hdr" data-action="trigger-sos">SOS</button>
+      <button class="icon-btn" id="invite-btn" data-action="open-invite" aria-label="Invite family" style="display:none"><span class="ic" data-icon="share"></span></button>
+      <button class="icon-btn" data-action="sign-out" aria-label="Sign out"><span class="ic" data-icon="log-out"></span></button>
+    </div>
+  </div>
+
+  <div class="app-body">
+    <div id="map-wrap">
+      <canvas id="map-canvas"></canvas>
+      <div class="map-ctrl">
+        <button class="map-btn" data-action="map-zoom-in" aria-label="Zoom in"><span class="ic" data-icon="zoom-in"></span></button>
+        <button class="map-btn" data-action="map-zoom-out" aria-label="Zoom out"><span class="ic" data-icon="zoom-out"></span></button>
+        <button class="map-btn" data-action="map-center" aria-label="Centre on me"><span class="ic" data-icon="locate-fixed"></span></button>
+      </div>
+      <div class="map-attrib">© OpenStreetMap contributors</div>
+      <div id="trail-pill" class="trail-pill" style="display:none">
+        <span id="trail-pill-lbl"></span>
+        <button class="trail-pill-x" data-action="clear-trail" aria-label="Hide trail">✕</button>
+      </div>
+      <div id="map-pins"></div>
+      <div id="map-pop" class="map-pop"></div>
+    </div>
+
+    <div class="sidebar" id="sidebar">
+      <div class="stabs">
+        <button class="stab on" data-action="s-tab" data-tab="family">Family</button>
+        <button class="stab" data-action="s-tab" data-tab="places">Places</button>
+        <button class="stab" data-action="s-tab" data-tab="timeline">History</button>
+        <button class="stab" data-action="s-tab" data-tab="activity">Activity</button>
+        <button class="stab" data-action="s-tab" data-tab="sos">SOS</button>
+      </div>
+      <div class="sbody">
+        <div class="sp on" id="sp-family">
+          <div class="sec-h">Your Keep 🏰</div>
+          <div id="members-list"></div>
+          <div class="sec-h" style="margin-top:18px">Settings</div>
+          <div class="setting-row">
+            <span class="setting-lbl">🔔 Notify me when family arrive or leave a place</span>
+            <label class="switch" for="notify-toggle">
+              <input id="notify-toggle" type="checkbox" data-action="toggle-notify">
+              <span class="switch-slider"></span>
+            </label>
+          </div>
+
+          <div class="setting-block" id="pause-block" style="display:none">
+            <div class="setting-lbl">⏸️ Pause my location</div>
+            <p class="note">Temporarily stop sharing your location with the family. It always turns back on automatically — the family sees “Location paused”, never a frozen pin.</p>
+            <div class="seg" id="pause-opts">
+              <button class="seg-btn" data-action="pause-me" data-mins="60">1 hour</button>
+              <button class="seg-btn" data-action="pause-me" data-mins="120">2 hours</button>
+              <button class="seg-btn" data-action="pause-me" data-evening="1">This evening</button>
+            </div>
+            <div id="pause-status" class="pause-status"></div>
+          </div>
+
+          <div class="setting-block">
+            <div class="setting-lbl">📡 Location tracking</div>
+            <div class="seg" id="track-modes">
+              <button class="seg-btn" data-action="set-track-mode" data-mode="auto">Auto</button>
+              <button class="seg-btn" data-action="set-track-mode" data-mode="live">Live</button>
+              <button class="seg-btn" data-action="set-track-mode" data-mode="balanced">Balanced</button>
+              <button class="seg-btn" data-action="set-track-mode" data-mode="saver">Saver</button>
+            </div>
+            <p class="note" id="track-desc"></p>
+          </div>
+
+          <div class="setting-block">
+            <div class="setting-lbl">🔌 Family server</div>
+            <p class="note" id="backend-host">—</p>
+            <button class="btn" data-action="disconnect-backend">Disconnect this device</button>
+          </div>
+
+          <div class="setting-block">
+            <div class="setting-lbl">🏰 Background setup</div>
+            <p class="note">Location, battery and notification permissions that let your Keep stay up to date while the app is closed.</p>
+            <button class="btn" data-action="open-setup">Check setup</button>
+          </div>
+
+          <div class="setting-block">
+            <div class="diag-head">
+              <span class="setting-lbl">🩺 Tracking diagnostics</span>
+              <label class="switch" for="diag-toggle">
+                <input id="diag-toggle" type="checkbox" data-action="toggle-diag">
+                <span class="switch-slider"></span>
+              </label>
+            </div>
+            <div id="diag-body" style="display:none">
+              <div id="diag-rows"></div>
+              <button class="diag-refresh" data-action="refresh-diag">Refresh</button>
+            </div>
+          </div>
+        </div>
+
+        <div class="sp" id="sp-places">
+          <div class="sec-h">Saved Places 📍</div>
+          <p class="note">Family members get an auto check-in when they arrive or leave these places — even with the app closed.</p>
+          <button class="btn btn-g" data-action="add-place-here"><span class="ic" data-icon="plus"></span> Add place at my location</button>
+          <div id="places-list"></div>
+        </div>
+
+        <div class="sp" id="sp-timeline">
+          <div class="sec-h">History 🗓️</div>
+          <p class="note">Where everyone's been over the past week — stays at saved places and the trips in between. Tap a trip to see it on the map.</p>
+          <div class="tl-members" id="tl-members"></div>
+          <div class="tl-days" id="tl-days"></div>
+          <div id="tl-feed"></div>
+        </div>
+
+        <div class="sp" id="sp-activity">
+          <div class="sec-h">Recent Activity</div>
+          <p class="note">Arrivals and departures are logged automatically when family members enter or leave a saved place.</p>
+          <div id="ci-feed"></div>
+        </div>
+
+        <div class="sp" id="sp-sos">
+          <div class="sos-panel">
+            <div class="sos-big" id="sos-big" data-action="trigger-sos" role="button" tabindex="0">SOS</div>
+            <div class="sos-msg" id="sos-msg">Tap to send an emergency alert to all family members</div>
+            <button class="cancel-sos" id="cancel-sos" data-action="cancel-sos">✕ Cancel Alert</button>
+          </div>
+          <div class="info-card">
+            <strong>ℹ️ About SOS</strong>
+            Only authenticated family members can see this alert. Your name and location are shared instantly.
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="bnav" id="bnav">
+    <button class="bnav-btn on" data-action="mob-nav" data-nav="family"><span class="ic" data-icon="users"></span>Family</button>
+    <button class="bnav-btn" data-action="mob-nav" data-nav="places"><span class="ic" data-icon="map-pin"></span>Places</button>
+    <button class="bnav-btn" data-action="mob-nav" data-nav="timeline"><span class="ic" data-icon="history"></span>History</button>
+    <button class="bnav-btn" data-action="mob-nav" data-nav="activity"><span class="ic" data-icon="activity"></span>Activity</button>
+    <button class="bnav-btn" data-action="mob-nav" data-nav="sos"><span class="ic" data-icon="alert-triangle"></span>SOS</button>
+  </div>
+</div>
+
+<!-- PLACE EDITOR SHEET -->
+<div class="sheet-scrim" id="place-sheet-scrim" data-action="cancel-place"></div>
+<div class="sheet" id="place-sheet" role="dialog" aria-modal="true" aria-labelledby="pe-title">
+  <div class="sheet-handle" aria-hidden="true"></div>
+  <div class="sheet-body">
+    <div class="sec-h" id="pe-title">New Place</div>
+    <div class="field">
+      <label for="pe-name">Name</label>
+      <input id="pe-name" type="text" maxlength="40" placeholder="Home, School, Gran's house…" autocomplete="off">
+    </div>
+    <div class="av-label">Icon</div>
+    <div class="av-row" id="pe-icons"></div>
+    <div class="field">
+      <label for="pe-radius">Radius: <span id="pe-radius-lbl">100</span>m</label>
+      <input id="pe-radius" type="range" min="25" max="500" step="5" value="100">
+    </div>
+    <div class="pe-coord" id="pe-coord"></div>
+    <button class="btn btn-g" id="pe-save" data-action="save-place"><span class="ic" data-icon="save"></span> Save place</button>
+    <button class="lnk-btn" data-action="cancel-place">Cancel</button>
+  </div>
+</div>
+
+<!-- INVITE SHEET (owner only) -->
+<div class="sheet-scrim" id="invite-scrim" data-action="close-invite"></div>
+<div class="sheet" id="invite-sheet" role="dialog" aria-modal="true" aria-labelledby="inv-title">
+  <div class="sheet-handle" aria-hidden="true"></div>
+  <div class="sheet-body">
+    <div class="sec-h" id="inv-title">Invite family 🏰</div>
+    <p class="note">Share this code with a family member. They create an account, tap <strong>Join Keep</strong>, and enter it. Codes expire after 72 hours — rotate a fresh one whenever you need.</p>
+    <div class="invite-code" id="inv-code">——</div>
+    <div class="note" id="inv-expiry">—</div>
+    <button class="btn btn-g" data-action="share-invite"><span class="ic" data-icon="share"></span> Share invite</button>
+    <button class="btn" id="inv-rotate" data-action="rotate-code">🔄 Rotate code</button>
+    <button class="lnk-btn" data-action="close-invite">Close</button>
+  </div>
+</div>
+
+<!-- SETUP SHEET (first run, and any time a requirement is missing) -->
+<div class="sheet-scrim" id="setup-scrim" data-action="close-setup"></div>
+<div class="sheet" id="setup-sheet" role="dialog" aria-modal="true" aria-labelledby="setup-title">
+  <div class="sheet-handle" aria-hidden="true"></div>
+  <div class="sheet-body">
+    <div class="sec-h" id="setup-title">Finish setting up 🏰</div>
+    <!-- Prominent disclosure. Android requires location use to be
+         explained before the permission is requested, and Play requires
+         it in-app for background location. -->
+    <p class="note">Roamkeep collects location data to share your place on the
+      map with your Keep and to let your family know when you arrive at or
+      leave a saved place — <strong>including when the app is closed or not
+      in use</strong>. Only members of your Keep can ever see it.</p>
+    <div id="setup-rows"></div>
+    <p class="note" id="setup-foot"></p>
+    <button class="btn btn-g" data-action="close-setup">Done</button>
+  </div>
+</div>
+
+<!-- TOASTS -->
+<div class="toasts" id="toasts"></div>
+
+<!-- INSTALL BANNER -->
+<div class="install-banner" id="install-banner">
+  <svg class="ib-icon-svg" aria-hidden="true"><use href="#rk-mark"/></svg>
+  <div class="ib-body">
+    <div class="ib-title">Install Roamkeep</div>
+    <div class="ib-sub">Add to your home screen</div>
+  </div>
+  <button class="ib-btn" data-action="install-pwa">Install</button>
+  <button class="ib-x" data-action="dismiss-install" aria-label="Dismiss"><span class="ic" data-icon="x"></span></button>
+</div>
+
+<script src="supabase.js"></script>
+<script src="app.js"></script>
+</body>
+</html>

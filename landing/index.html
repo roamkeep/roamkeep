@@ -1,0 +1,152 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Join a Roamkeep</title>
+<meta name="theme-color" content="#0E7C7B">
+<meta name="robots" content="noindex">
+<!--
+  Landing page for setup links.
+
+  If Roamkeep is installed, Android App Links intercept the URL and this
+  page never loads. It exists for the case where it isn't.
+
+  THE FRAGMENT NEVER REACHES THE SERVER. Everything after '#' — the
+  family's project URL and anon key — is a URL fragment, and browsers do
+  not send fragments in the HTTP request. This page reads it in the
+  browser only, to show a "you're joining a Keep" confirmation and to hand
+  it back for pasting. It is never transmitted anywhere, and there is no
+  script on this page that could.
+-->
+<style>
+  :root {
+    --primary: #0E7C7B; --primary-2: #0B5F5E; --sos: #FF6B5B;
+    --surface: #FAFBFC; --surface-2: #F1F5F9; --sand: #E2E8F0;
+    --ink: #0F172A; --muted: #64748B;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: -apple-system, 'Segoe UI', Roboto, sans-serif;
+    background: var(--surface); color: var(--ink);
+    min-height: 100vh; display: flex; align-items: center;
+    justify-content: center; padding: 24px; line-height: 1.5;
+  }
+  .card {
+    background: #fff; border: 1px solid var(--sand); border-radius: 18px;
+    max-width: 420px; width: 100%; padding: 30px 26px;
+    box-shadow: 0 10px 40px rgba(15, 23, 42, .07);
+  }
+  .mark { width: 62px; height: 62px; display: block; margin: 0 auto 14px; color: var(--primary); }
+  h1 { font-size: 22px; text-align: center; margin-bottom: 6px; }
+  .sub { text-align: center; color: var(--muted); font-size: 13.5px; margin-bottom: 22px; }
+  .step { display: flex; gap: 12px; padding: 13px 0; border-top: 1px solid var(--sand); }
+  .n {
+    flex-shrink: 0; width: 25px; height: 25px; border-radius: 50%;
+    background: var(--primary); color: #fff; font-size: 12.5px;
+    font-weight: 700; display: flex; align-items: center; justify-content: center;
+  }
+  .step h2 { font-size: 14px; font-weight: 600; margin-bottom: 2px; }
+  .step p { font-size: 12.5px; color: var(--muted); }
+  .btn {
+    display: block; width: 100%; text-align: center; margin-top: 20px;
+    background: var(--primary); color: #fff; text-decoration: none;
+    padding: 13px; border-radius: 11px; font-weight: 700; font-size: 14.5px;
+    border: none; cursor: pointer; font-family: inherit;
+  }
+  .btn:active { background: var(--primary-2); }
+  .btn.ghost { background: var(--surface-2); color: var(--ink); margin-top: 9px; }
+  .note {
+    font-size: 11.5px; color: var(--muted); margin-top: 18px;
+    padding-top: 15px; border-top: 1px solid var(--sand);
+  }
+  .link-box {
+    display: none; margin-top: 13px; padding: 11px;
+    background: var(--surface-2); border-radius: 10px;
+    font-family: ui-monospace, Menlo, Consolas, monospace;
+    font-size: 10.5px; word-break: break-all; color: var(--ink);
+    max-height: 108px; overflow-y: auto;
+  }
+  .bad { color: var(--sos); font-size: 13px; text-align: center; }
+</style>
+</head>
+<body>
+<div class="card">
+  <svg class="mark" viewBox="0 0 100 100" role="img" aria-label="Roamkeep">
+    <path fill="currentColor" d="M26,18 L35,18 L35,26 L44,26 L44,18 L56,18 L56,26 L65,26 L65,18 L74,18 L74,60 L50,88 L26,60 Z"/>
+    <path fill="#FF6B5B" d="M40,58 L40,44 A10,10 0 0 1 60,44 L60,58 Z"/>
+  </svg>
+
+  <h1 id="title">You've been invited to a Keep</h1>
+  <p class="sub" id="sub">Roamkeep is private family location sharing. Your family runs their own server — nobody else can see your location.</p>
+
+  <div id="steps">
+    <div class="step">
+      <div class="n">1</div>
+      <div><h2>Install Roamkeep</h2><p>Free on Google Play.</p></div>
+    </div>
+    <div class="step">
+      <div class="n">2</div>
+      <div><h2>Open this link again</h2><p>It connects the app to your family's server and fills in your join code.</p></div>
+    </div>
+    <div class="step">
+      <div class="n">3</div>
+      <div><h2>Create your account</h2><p>Then you're in.</p></div>
+    </div>
+  </div>
+
+  <a class="btn" id="play" href="https://play.google.com/store/apps/details?id=com.roamkeep.app">Get Roamkeep on Google Play</a>
+  <button class="btn ghost" id="copy" type="button">Copy setup link</button>
+  <div class="link-box" id="linkbox"></div>
+
+  <p class="note">
+    This page can't see your family's details. They're in the part of the
+    link after the <code>#</code>, which your browser never sends to a
+    server — so they aren't in this site's logs.
+  </p>
+</div>
+
+<script>
+(function () {
+  'use strict';
+  // Fragment only. Read in the browser, never sent anywhere: there is no
+  // fetch/XHR/beacon on this page, deliberately.
+  var frag = location.hash ? location.hash.slice(1) : '';
+  var p;
+  try { p = new URLSearchParams(frag); } catch (e) { p = null; }
+  var hasConfig = !!(p && p.get('u') && p.get('k'));
+
+  if (!hasConfig) {
+    // Someone reached the page without a setup link.
+    document.getElementById('title').textContent = 'Roamkeep';
+    document.getElementById('sub').textContent =
+      'Private family location sharing. To join a family you need their setup link — ask whoever set up your Keep to share one from the app.';
+    document.getElementById('steps').innerHTML =
+      '<p class="bad" style="padding:14px 0">No setup link found in this address.</p>';
+    document.getElementById('copy').style.display = 'none';
+    return;
+  }
+
+  if (p.get('c')) {
+    document.getElementById('sub').textContent =
+      'Your invite code is included in this link — the app will fill it in for you.';
+  }
+
+  document.getElementById('copy').addEventListener('click', function () {
+    var box = document.getElementById('linkbox');
+    var url = location.href;
+    var done = function () {
+      this.textContent = 'Copied — paste it in the app';
+    }.bind(this);
+    if (navigator.clipboard) {
+      navigator.clipboard.writeText(url).then(done, function () {
+        box.textContent = url; box.style.display = 'block';
+      });
+    } else {
+      box.textContent = url; box.style.display = 'block';
+    }
+  });
+})();
+</script>
+</body>
+</html>

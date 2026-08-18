@@ -1,0 +1,143 @@
+<?xml version="1.0" encoding="utf-8"?>
+<ScrollView xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:fillViewport="true">
+
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:orientation="vertical"
+        android:padding="20dp">
+
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="Replays a GPX or KML route into the OS test location provider. No network access — this app has no INTERNET permission."
+            android:textSize="13sp"
+            android:paddingBottom="18dp" />
+
+        <Button
+            android:id="@+id/devOptions"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="1. Developer options → Select mock location app" />
+
+        <Button
+            android:id="@+id/pick"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="8dp"
+            android:text="2. Pick a route (.gpx / .kml)" />
+
+        <TextView
+            android:id="@+id/routeInfo"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:paddingTop="8dp"
+            android:paddingBottom="12dp"
+            android:textSize="13sp"
+            android:typeface="monospace" />
+
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="3. Hold a position — do this BEFORE opening Roamkeep. Until something is being injected the phone reports where it really is, and Roamkeep will file that."
+            android:textStyle="bold"
+            android:textSize="13sp"
+            android:paddingTop="4dp"
+            android:paddingBottom="8dp" />
+
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="horizontal">
+
+            <EditText
+                android:id="@+id/holdLat"
+                android:layout_width="0dp"
+                android:layout_weight="1"
+                android:layout_height="wrap_content"
+                android:inputType="numberDecimal|numberSigned"
+                android:importantForAutofill="no"
+                android:hint="latitude" />
+
+            <EditText
+                android:id="@+id/holdLng"
+                android:layout_width="0dp"
+                android:layout_weight="1"
+                android:layout_height="wrap_content"
+                android:inputType="numberDecimal|numberSigned"
+                android:importantForAutofill="no"
+                android:hint="longitude" />
+        </LinearLayout>
+
+        <Button
+            android:id="@+id/useRouteStart"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="4dp"
+            android:text="Fill from the start of the loaded route" />
+
+        <Button
+            android:id="@+id/hold"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="4dp"
+            android:text="Hold this position" />
+
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="4. Play the route. Speed sets the injected Location.speed, which is what Roamkeep classifies walk vs drive from. Try 5 for a walk, 45 for a drive."
+            android:textStyle="bold"
+            android:textSize="13sp"
+            android:paddingTop="18dp"
+            android:paddingBottom="6dp" />
+
+        <EditText
+            android:id="@+id/speed"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:inputType="numberDecimal"
+            android:text="45"
+            android:importantForAutofill="no"
+            android:hint="45" />
+
+        <CheckBox
+            android:id="@+id/loop"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="4dp"
+            android:text="Loop (out and back, forever)" />
+
+        <Button
+            android:id="@+id/start"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="10dp"
+            android:text="Start the route" />
+
+        <Button
+            android:id="@+id/stop"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="6dp"
+            android:text="Stop" />
+
+        <TextView
+            android:id="@+id/status"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:paddingTop="18dp"
+            android:textSize="14sp"
+            android:text="Stopped" />
+
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:paddingTop="24dp"
+            android:textSize="12sp"
+            android:text="Test providers are removed when playback stops, so the device stops lying about where it is as soon as you press Stop or swipe the app away." />
+    </LinearLayout>
+</ScrollView>
