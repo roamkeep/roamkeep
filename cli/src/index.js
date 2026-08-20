@@ -2,9 +2,16 @@
 //
 // create-roamkeep-server — stand up a family's own Roamkeep backend.
 //
-//   npx create-roamkeep-server
-//   npx create-roamkeep-server --project <ref>   # use an existing project
-//   npx create-roamkeep-server --from 4          # resume from a step
+//   cd cli && npm install && npm start
+//   npm start -- --project <ref>   # use an existing project
+//   npm start -- --from 4          # resume from a step
+//
+// ⚠ NOT PUBLISHED TO NPM. `npx create-roamkeep-server` does not work and
+// never has — the registry returns 404. This file used to print that
+// command as its own resume advice, which sent owners to a package that
+// does not exist at the exact moment they needed to continue. Do not
+// reintroduce it; SELF below prints whatever actually launched the process,
+// including the npx form if the package is ever published.
 //
 // WHY THIS EXISTS
 // ---------------
@@ -17,6 +24,7 @@
 // existing owner's in-app Invite — so the FIRST device on a brand-new
 // project had no way in. The last step here prints that first link.
 
+import path from 'node:path';
 import { intro, outro, text, select, confirm, spinner, isCancel, cancel, note, log } from '@clack/prompts';
 import color from 'picocolors';
 import QRCode from 'qrcode';
@@ -30,6 +38,30 @@ const arg = (name) => {
   return i > -1 ? process.argv[i + 1] : null;
 };
 const FROM = Number(arg('from') || 1);
+
+/**
+ * How to invoke this program again — derived from how it was just invoked.
+ *
+ * Every "re-run with…" message below uses this. They used to hardcode
+ * `npx create-roamkeep-server`, which has never been published: an owner
+ * testing the setup path was told to resume with a command that answers
+ * 404, at the one moment they had no other instruction to hand.
+ *
+ * Deriving it means the advice cannot drift from reality, and it stays
+ * correct if the package is ever published — run through npx and the npx
+ * form is what gets printed back.
+ */
+const SELF = (() => {
+  const entry = process.argv[1] || '';
+  // Installed as a bin (npx, or a global install).
+  if (/[\\/]\.bin[\\/]/.test(entry)) return 'npx create-roamkeep-server';
+  // `npm start` from a clone, which is what docs/OWNER_SETUP.md tells
+  // owners to use. Printing the same shape they already typed.
+  if (process.env.npm_lifecycle_event === 'start') return 'npm start --';
+  // Run directly: node src/index.js, from wherever they happen to be.
+  const rel = path.relative(process.cwd(), entry) || 'src/index.js';
+  return `node ${rel.split(path.sep).join('/')}`;
+})();
 
 function bail(msg) {
   cancel(msg);
@@ -184,7 +216,7 @@ async function main() {
         w.stop(`${color.green('✓')} Database is up`);
       } catch (e) {
         w.stop(`${color.red('✗')} ${e.message}`);
-        bail(`The project exists (${ref}) but did not come up. Check the dashboard, then re-run:\n  npx create-roamkeep-server --project ${ref} --from 3`);
+        bail(`The project exists (${ref}) but did not come up. Check the dashboard, then re-run:\n  ${SELF} --project ${ref} --from 3`);
       }
     } else {
       ref = choice;
@@ -255,7 +287,7 @@ async function main() {
       'one — it will happily deploy somewhere else and report success.\n' +
       `The file supabase/.temp/linked-project.json should say ${ref}.\n\n` +
       'Then re-run this to confirm and get your setup QR:\n\n' +
-      color.cyan(`  npx create-roamkeep-server --project ${ref} --from 9`) + '\n\n' +
+      color.cyan(`  ${SELF} --project ${ref} --from 9`) + '\n\n' +
       'Everything else already works without it — you just will not get\n' +
       'push notifications until it is deployed.',
       'One manual step left',

@@ -215,6 +215,28 @@ console.log('\nwizard: resume advice');
   const keyCall = src.slice(src.indexOf(`step(${keyStep}, 'Reading the project API keys'`), -1).slice(0, 800);
   check('the anon-key read is exempt from --from, so a resume past it still prints the link',
     /\{\s*always:\s*true\s*\}/.test(keyCall));
+
+  // The wizard told owners to resume with `npx create-roamkeep-server`, a
+  // package that has never been published — the registry answers 404. It
+  // failed at the worst possible moment: mid-setup, with the wizard's own
+  // output as the only instruction to hand.
+  //
+  // Comments may name it (the header explains why not to use it, and SELF
+  // returns it when genuinely running under npx). A hardcoded occurrence in
+  // a string that reaches the user may not.
+  {
+    const strings = src
+      .split('\n')
+      .filter((l) => !/^\s*(\/\/|\*|\/\*)/.test(l))      // drop comment lines
+      .join('\n');
+    const hardcoded = [...strings.matchAll(/npx create-roamkeep-server/g)].length;
+    // One legitimate occurrence: the SELF branch that returns it.
+    check('resume advice is derived, not a hardcoded npx command',
+      hardcoded <= 1,
+      hardcoded > 1 ? `${hardcoded} occurrences outside comments — use SELF` : '');
+    check('SELF derives the invocation from how the process was launched',
+      /const SELF = \(\(\) =>/.test(src) && /npm_lifecycle_event/.test(src));
+  }
 }
 
 console.log('\nwizard: every source file parses');
