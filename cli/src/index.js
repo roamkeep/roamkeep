@@ -337,22 +337,21 @@ async function main() {
   // that nobody is going to bill them for it — a better ask than a README
   // section. And it is outside the Play package, so it cannot run into
   // Google's payments policy on in-app donations.
-  note(
-    'Roamkeep is free, has no paid features and no hosted tier. If it is
-' +
-    'useful to your family, you can help cover the push relay and keep
-' +
-    'development going:
-
-' +
-    `  ${color.cyan('https://github.com/sponsors/roamkeep')}
-` +
-    `  ${color.cyan('https://ko-fi.com/roamkeep')}
-
-` +
+  //
+  // Built from an array rather than concatenated strings with escaped
+  // newlines: the escapes did not survive being patched in through a shell
+  // and left literal line breaks inside string literals, which stopped the
+  // whole wizard from parsing. Nothing here needs an escape sequence now.
+  note([
+    'Roamkeep is free, has no paid features and no hosted tier. If it is',
+    'useful to your family, you can help cover the push relay and keep',
+    'development going:',
+    '',
+    '  ' + color.cyan('https://github.com/sponsors/roamkeep'),
+    '  ' + color.cyan('https://ko-fi.com/roamkeep'),
+    '',
     'Entirely optional — nothing here is gated behind it.',
-    'If you want to support it',
-  );
+  ].join('\n'), 'If you want to support it');
 
   outro(color.green('Done.'));
 }

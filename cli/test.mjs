@@ -217,5 +217,33 @@ console.log('\nwizard: resume advice');
     /\{\s*always:\s*true\s*\}/.test(keyCall));
 }
 
+console.log('\nwizard: every source file parses');
+
+// The suite read src/index.js as TEXT for the --from checks above and never
+// asked Node whether it was valid JavaScript. So it reported 39/39 on a
+// wizard that would not start: a patch had left literal newlines inside
+// string literals, and `npm start` died with SyntaxError on line 341.
+//
+// Passing tests on a program that cannot load is the worst kind of green.
+// `node --check` parses without executing, which matters here because
+// importing index.js would launch the wizard.
+{
+  const files = fs.readdirSync(path.join(HERE, 'src'))
+    .filter((f) => f.endsWith('.js'))
+    .map((f) => path.join('src', f))
+    .concat(['test.mjs']);
+
+  for (const rel of files) {
+    let err = '';
+    try {
+      execFileSync(process.execPath, ['--check', path.join(HERE, rel)],
+        { stdio: ['ignore', 'ignore', 'pipe'] });
+    } catch (e) {
+      err = String(e.stderr || e.message).split('\n').find((l) => /Error/.test(l)) || 'failed to parse';
+    }
+    check(`${rel} parses`, !err, err);
+  }
+}
+
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);
