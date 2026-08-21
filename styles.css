@@ -212,6 +212,10 @@ body {
   -webkit-user-select: none; user-select: none;
 }
 .av.on { border-color: var(--moss); transform: scale(1.12); }
+/* Bound the picker height so the longer avatar set scrolls inside its
+   own box instead of pushing the primary button off-screen. */
+.av-row.scroll { max-height: 138px; overflow-y: auto; padding: 5px;
+  background: var(--surface); border-radius: 12px; }
 .btn {
   width: 100%; padding: 14px;
   border: none; border-radius: 12px;
@@ -410,6 +414,16 @@ body {
 }
 .setting-block .setting-lbl { font-size: 14px; font-weight: 600; }
 .setting-block .note { margin: 6px 0 10px; }
+/* Resting row for an editable setting (label + value + pencil). */
+.set-line { display: flex; align-items: center; gap: 10px; }
+.set-line .grow { flex: 1; min-width: 0; }
+.set-val { font-size: 13px; color: var(--stone); margin-top: 2px; }
+/* Two-button footer (Cancel / Save) for inline editors + sheets. */
+.row-btns { display: flex; gap: 8px; }
+.row-btns .btn { margin: 0; }
+.btn.sm { padding: 10px; font-size: 14px; }
+.btn-ghost { background: #fff; border: 1px solid var(--surface-3); color: var(--ink-2); }
+.btn-ghost:active { background: var(--surface-2); }
 /* Segmented control for the tracking mode. */
 .seg {
   display: flex; gap: 4px; padding: 3px;
@@ -930,3 +944,13 @@ input[type=range]::-moz-range-thumb {
 }
 .mc-act:active { background: var(--surface-2); }
 .mc-act.danger { color: var(--sos-2); border-color: var(--sos-soft); }
+
+/* Pencil to edit a member's profile — sits in the meta column. Teal tint
+   so it reads as a distinct affordance from the (whole-card) focus tap. */
+.mc-edit {
+  width: 32px; height: 32px; flex: 0 0 auto; margin-top: 3px;
+  border-radius: 50%; border: 1px solid var(--primary-soft);
+  background: var(--primary-soft); font-size: 14px; cursor: pointer;
+  display: flex; align-items: center; justify-content: center;
+}
+.mc-edit:active { transform: scale(.94); }

@@ -145,7 +145,7 @@
         <input id="cr-name" type="text" placeholder="Mum, Dad, Jake…" maxlength="20" autocomplete="off">
       </div>
       <div class="av-label">Your Avatar</div>
-      <div class="av-row" id="cr-avs"></div>
+      <div class="av-row scroll" id="cr-avs"></div>
       <div class="field">
         <label for="cr-fam">Family Name</label>
         <input id="cr-fam" type="text" placeholder="The Millers" maxlength="24" autocomplete="off">
@@ -160,7 +160,7 @@
         <input id="jo-name" type="text" placeholder="Mum, Dad, Jake…" maxlength="20" autocomplete="off">
       </div>
       <div class="av-label">Your Avatar</div>
-      <div class="av-row" id="jo-avs"></div>
+      <div class="av-row scroll" id="jo-avs"></div>
       <div class="field">
         <label for="jo-code">Family Code</label>
         <input id="jo-code" type="text" class="code-inp" placeholder="Family code" maxlength="16"
@@ -224,6 +224,27 @@
           <div class="sec-h">Your Keep 🏰</div>
           <div id="members-list"></div>
           <div class="sec-h" style="margin-top:18px">Settings</div>
+
+          <div class="setting-block" id="family-name-block" style="display:none">
+            <div class="set-line" id="family-name-view">
+              <div class="grow">
+                <div class="setting-lbl">🏰 Family name</div>
+                <div class="set-val" id="family-name-val">—</div>
+              </div>
+              <button class="icon-btn" data-action="edit-family-name" aria-label="Edit family name">✏️</button>
+            </div>
+            <div id="family-name-edit" style="display:none">
+              <div class="field" style="margin:2px 0 8px">
+                <label for="family-name-input">🏰 Family name — shown at the top of everyone’s map</label>
+                <input id="family-name-input" type="text" maxlength="40" autocomplete="off">
+              </div>
+              <div class="row-btns">
+                <button class="btn btn-ghost sm" data-action="cancel-family-name">Cancel</button>
+                <button class="btn btn-g sm" id="family-name-save" data-action="save-family-name">Save name</button>
+              </div>
+            </div>
+          </div>
+
           <div class="setting-row">
             <span class="setting-lbl">🔔 Notify me when family arrive or leave a place</span>
             <label class="switch" for="notify-toggle">
@@ -360,6 +381,23 @@
     <button class="btn btn-g" data-action="share-invite"><span class="ic" data-icon="share"></span> Share invite</button>
     <button class="btn" id="inv-rotate" data-action="rotate-code">🔄 Rotate code</button>
     <button class="lnk-btn" data-action="close-invite">Close</button>
+  </div>
+</div>
+
+<!-- PROFILE EDIT SHEET (own row always; owner on any row) -->
+<div class="sheet-scrim" id="profile-scrim" data-action="cancel-profile"></div>
+<div class="sheet" id="profile-sheet" role="dialog" aria-modal="true" aria-labelledby="pf-title">
+  <div class="sheet-handle" aria-hidden="true"></div>
+  <div class="sheet-body">
+    <div class="sec-h" id="pf-title">Edit profile</div>
+    <div class="field">
+      <label for="pf-name">Display name</label>
+      <input id="pf-name" type="text" maxlength="40" placeholder="Mum, Dad, Jake…" autocomplete="off">
+    </div>
+    <div class="av-label">Avatar</div>
+    <div class="av-row scroll" id="pf-avs"></div>
+    <button class="btn btn-g" id="pf-save" data-action="save-profile">Save changes</button>
+    <button class="lnk-btn" data-action="cancel-profile">Cancel</button>
   </div>
 </div>
 

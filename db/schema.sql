@@ -850,6 +850,99 @@ $$;
 REVOKE ALL ON FUNCTION resume_member(uuid) FROM PUBLIC, anon;
 GRANT EXECUTE ON FUNCTION resume_member(uuid) TO authenticated;
 
+-- rename_keep: owner-only. Change the family name shown at the top of the
+-- map. `keeps` has no UPDATE RLS policy (creation/rotation are the only
+-- keep writes), so this DEFINER path is the only way to rename. Same
+-- length rule as create_keep / the keeps_name_len constraint.
+CREATE OR REPLACE FUNCTION rename_keep(p_keep_id uuid, p_name text)
+RETURNS TABLE (keep_name text)
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public
+AS $$
+DECLARE
+  v_uid uuid := auth.uid();
+  v_is_owner boolean;
+BEGIN
+  IF v_uid IS NULL THEN
+    RAISE EXCEPTION 'not_authenticated';
+  END IF;
+  IF length(trim(coalesce(p_name, ''))) = 0 OR length(p_name) > 40 THEN
+    RAISE EXCEPTION 'invalid_family_name';
+  END IF;
+
+  SELECT EXISTS (
+    SELECT 1 FROM keep_members
+     WHERE keep_id = p_keep_id AND user_id = v_uid AND role = 'owner'
+  ) INTO v_is_owner;
+  IF NOT v_is_owner THEN
+    RAISE EXCEPTION 'not_owner';
+  END IF;
+
+  UPDATE keeps SET name = trim(p_name) WHERE id = p_keep_id;
+  RETURN QUERY SELECT trim(p_name);
+END;
+$$;
+REVOKE ALL ON FUNCTION rename_keep(uuid, text) FROM PUBLIC, anon;
+GRANT EXECUTE ON FUNCTION rename_keep(uuid, text) TO authenticated;
+
+-- update_member_profile: edit a member's display name + avatar. Allowed
+-- for the member themselves OR an owner of that keep (owners set up a
+-- child, fix a typo). name/avatar are NOT guard-protected columns, so no
+-- roamkeep.priv flag is needed; this DEFINER path exists because the
+-- owner-edits-another-member case is cross-row (RLS "update own row"
+-- forbids it) and to give one validated path for both cases. Same length
+-- rules as create_keep / the nm_name_len / nm_avatar_len constraints.
+CREATE OR REPLACE FUNCTION update_member_profile(
+  p_member_id uuid,
+  p_name text,
+  p_avatar text
+)
+RETURNS void
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public
+AS $$
+DECLARE
+  v_uid uuid := auth.uid();
+  v_keep_id uuid;
+  v_target_uid uuid;
+  v_is_owner boolean;
+BEGIN
+  IF v_uid IS NULL THEN
+    RAISE EXCEPTION 'not_authenticated';
+  END IF;
+  IF length(trim(coalesce(p_name, ''))) = 0 OR length(p_name) > 40 THEN
+    RAISE EXCEPTION 'invalid_display_name';
+  END IF;
+  IF length(coalesce(p_avatar, '')) < 1 OR length(p_avatar) > 8 THEN
+    RAISE EXCEPTION 'invalid_avatar';
+  END IF;
+
+  SELECT keep_id, user_id INTO v_keep_id, v_target_uid
+    FROM keep_members WHERE id = p_member_id;
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'member_not_found';
+  END IF;
+
+  IF v_target_uid <> v_uid THEN
+    SELECT EXISTS (
+      SELECT 1 FROM keep_members
+       WHERE keep_id = v_keep_id AND user_id = v_uid AND role = 'owner'
+    ) INTO v_is_owner;
+    IF NOT v_is_owner THEN
+      RAISE EXCEPTION 'not_authorized';
+    END IF;
+  END IF;
+
+  UPDATE keep_members
+     SET name = trim(p_name), avatar = p_avatar
+   WHERE id = p_member_id;
+END;
+$$;
+REVOKE ALL ON FUNCTION update_member_profile(uuid, text, text) FROM PUBLIC, anon;
+GRANT EXECUTE ON FUNCTION update_member_profile(uuid, text, text) TO authenticated;
+
 
 -- ── REALTIME PUBLICATION ──────────────────────────────────
 -- Supabase Realtime only streams tables in the supabase_realtime

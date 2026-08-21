@@ -34,7 +34,12 @@
   // Assigned once a backend is resolved; every consumer reads these.
   let SB_URL = '';
   let SB_KEY = '';
-  const AVATARS = ['🧑', '👩', '👨', '👧', '👦', '🧓', '👴', '👵', '🧒', '🐶', '🐱', '🦊'];
+  // Avatar choices — one array feeds the create, join AND profile-edit
+  // pickers. Faces grouped first (they fill the round chip cleanly); the
+  // two full-body Australians (kangaroo, croc) sit last since no face
+  // variant exists. Every entry is ≤ 8 code points (nm_avatar_len).
+  const AVATARS = ['🧑', '👩', '👨', '👧', '👦', '🧓', '👴', '👵', '🧒', '🧔', '👱', '👩‍🦰', '👨‍🦰', '🧕',
+    '🐶', '🐱', '🦊', '🐷', '🐮', '🐻', '🐼', '🐨', '🐻‍❄️', '🦁', '🐯', '🐰', '🐵', '🐸', '🐔', '🐧', '🦉', '🦄', '🐢', '🦘', '🐊'];
   const TILE_SIZE = 256;
   const DEFAULT_CENTRE = { lat: -33.87, lng: 151.21, zoom: 13 };
 
@@ -66,6 +71,7 @@
     placePicker: null,         // { lat, lng } while picking icon/name for a new place
     placeIcon: '🏠',
     placeRadius: 100,
+    profileEdit: null,         // { memberId } while the edit-profile sheet is open
     trail: [],                 // breadcrumb points {lat,lng,recorded_at} for trailMemberId
     trailMemberId: null,       // whose trail is currently shown (null = none)
     trailLabel: '24h',         // window label in the trail pill ('24h' or a timeline day)
@@ -342,6 +348,8 @@
     if (code.includes('invalid_avatar')) return 'Please choose an avatar.';
     if (code.includes('not_authenticated')) return 'Please sign in again.';
     if (code.includes('not_owner')) return 'Only an owner can do that.';
+    if (code.includes('not_authorized')) return 'You can only edit your own profile — ask an owner.';
+    if (code.includes('member_not_found')) return 'That member is no longer in the Keep.';
     if (code.includes('not_adult')) return 'Only an adult can do that.';
     if (code.includes('last_owner')) return 'A Keep needs at least one owner. Make someone else an owner first.';
     if (code.includes('owner_must_be_adult')) return 'An owner must be an adult. Remove their owner role first.';
@@ -1490,8 +1498,11 @@
   // (Breadcrumbs are distance-gated, so a stationary phone emits none and
   // the time gap grows.)
   const TRIP_GAP_MS = 10 * 60 * 1000;
-  // Distinct, map-legible colours cycled per trip.
-  const TRAIL_COLORS = ['#3a6f9a', '#c0504d', '#4e9a4e', '#d08a2c', '#7a4a9a', '#2c8c8c'];
+  // Distinct, map-legible colours cycled per trip. 12 hues so a busy day
+  // of many trips gets its own colour far longer before any repeat; all
+  // kept clear of the place-circle green and the blue radius preview.
+  const TRAIL_COLORS = ['#3a6f9a', '#c0504d', '#4e9a4e', '#d08a2c', '#7a4a9a', '#2c8c8c',
+    '#b5563f', '#3f7d5a', '#8c4a7a', '#5a7a2c', '#2c6f8c', '#9a7a3a'];
   const ARROW_SPACING_PX = 55;   // draw a direction arrow ~every this many px
 
   // Split the (oldest → newest) breadcrumb list into trips on time gaps.
@@ -2551,6 +2562,18 @@
         el('div', { class: 'mc-ago', text: timeAgo(m.last_seen) })
       ]);
 
+      // Pencil to edit name + avatar. Your own row always; anyone else only
+      // for an owner (the server enforces the same rule). Its own data-action
+      // means a tap edits rather than focuses the card.
+      if (isMe || viewerOwner) {
+        meta.appendChild(el('button', {
+          class: 'mc-edit',
+          dataset: { action: 'open-profile-edit', id: m.id },
+          text: '✏️',
+          'aria-label': isMe ? 'Edit my profile' : 'Edit ' + m.name
+        }));
+      }
+
       const card = el('div', {
         class: 'mc' + (m.sos ? ' sos-c' : '') + (isMe ? ' me-c' : '') + (paused ? ' paused-c' : ''),
         dataset: { action: 'focus-member', id: m.id }
@@ -2598,6 +2621,130 @@
     const invBtn = $('invite-btn');
     if (invBtn) invBtn.style.display = viewerOwner ? '' : 'none';
     renderPauseBlock();
+    renderFamilyNameSetting();
+  }
+
+  // ── FAMILY NAME (owner only) ───────────────────────────────────
+  // A rename of the keep. `keeps` has no client UPDATE policy, so this
+  // goes through the owner-gated rename_keep RPC. The whole Settings block
+  // is hidden for non-owners (like the Invite button), and the pencil
+  // swaps the resting row for an inline field in place.
+  function renderFamilyNameSetting() {
+    const block = $('family-name-block');
+    if (!block) return;
+    if (!amOwner()) { block.style.display = 'none'; return; }
+    block.style.display = '';
+    const val = $('family-name-val');
+    if (val) val.textContent = S.keepName || '—';
+    showFamilyNameEdit(false);
+  }
+
+  function showFamilyNameEdit(editing) {
+    const view = $('family-name-view');
+    const edit = $('family-name-edit');
+    if (view) view.style.display = editing ? 'none' : '';
+    if (edit) edit.style.display = editing ? '' : 'none';
+  }
+
+  function editFamilyName() {
+    const input = $('family-name-input');
+    if (input) input.value = S.keepName || '';
+    showFamilyNameEdit(true);
+    if (input) setTimeout(() => input.focus(), 50);
+  }
+
+  function cancelFamilyName() { showFamilyNameEdit(false); }
+
+  async function saveFamilyName() {
+    const input = $('family-name-input');
+    const name = (input ? input.value : '').trim();
+    if (!name) { toast('Please enter a family name', 'err'); return; }
+    const btn = $('family-name-save');
+    if (btn) btn.disabled = true;
+    try {
+      const { data, error } = await S.sb.rpc('rename_keep', { p_keep_id: S.keepId, p_name: name });
+      if (error) throw error;
+      const row = Array.isArray(data) ? data[0] : data;
+      S.keepName = (row && row.keep_name) || name;
+      const sub = $('hdr-sub'); if (sub) sub.textContent = S.keepName;
+      const val = $('family-name-val'); if (val) val.textContent = S.keepName;
+      showFamilyNameEdit(false);
+      toast('✅ Family name updated', 'ok');
+    } catch (e) {
+      toast(mapRpcError(e), 'err');
+    } finally { if (btn) btn.disabled = false; }
+  }
+
+  // ── PROFILE EDIT (own row always; owner on any row) ────────────
+  // Edit a member's display name + avatar via the owner-or-self
+  // update_member_profile RPC. Reuses the bottom-sheet + avatar-picker
+  // pattern; the picker seeds S.selAv to the current avatar and reuses the
+  // existing `pick-avatar` action (scoped to its own .av-row).
+  function openProfileEditor(t) {
+    const id = t.dataset.id;
+    const m = S.members.find(x => x.id === id);
+    if (!m) return;
+    S.profileEdit = { memberId: id };
+    S.selAv = m.avatar;
+
+    const title = $('pf-title');
+    if (title) title.textContent = (id === S.myId) ? 'Edit my profile' : 'Edit ' + m.name + '’s profile';
+    const nameIn = $('pf-name');
+    if (nameIn) { nameIn.value = m.name; setTimeout(() => nameIn.focus(), 250); }
+
+    const host = $('pf-avs');
+    if (host) {
+      clear(host);
+      AVATARS.forEach(a => host.appendChild(el('div', {
+        class: 'av' + (a === m.avatar ? ' on' : ''),
+        dataset: { action: 'pick-avatar', avatar: a },
+        text: a
+      })));
+    }
+
+    closeDrawer();
+    const sheet = $('profile-sheet');
+    const scrim = $('profile-scrim');
+    if (sheet) { sheet.classList.remove('full'); sheet.classList.add('half', 'open'); }
+    if (scrim) scrim.classList.add('on');
+    document.body.classList.add('sheet-open');
+  }
+
+  function cancelProfile() {
+    const sheet = $('profile-sheet');
+    const scrim = $('profile-scrim');
+    if (sheet) sheet.classList.remove('open', 'half', 'full');
+    if (scrim) scrim.classList.remove('on');
+    document.body.classList.remove('sheet-open');
+    S.profileEdit = null;
+  }
+
+  async function saveProfile() {
+    const edit = S.profileEdit;
+    if (!edit) return;
+    const nameIn = $('pf-name');
+    const name = (nameIn ? nameIn.value : '').trim();
+    if (!name) { toast('Please enter a display name', 'err'); return; }
+    const avatar = S.selAv;
+    const btn = $('pf-save');
+    if (btn) btn.disabled = true;
+    try {
+      const { error } = await S.sb.rpc('update_member_profile', {
+        p_member_id: edit.memberId, p_name: name, p_avatar: avatar
+      });
+      if (error) throw error;
+      // Optimistic local patch — the realtime channel also fires an UPDATE,
+      // but we don't want a visual wait for it.
+      const m = S.members.find(x => x.id === edit.memberId);
+      if (m) { m.name = name; m.avatar = avatar; }
+      cancelProfile();
+      renderMembers();
+      renderPins();
+      drawMap();
+      toast('✅ Profile updated', 'ok');
+    } catch (e) {
+      toast(mapRpcError(e), 'err');
+    } finally { if (btn) btn.disabled = false; }
   }
 
   // Self-pause block (Family → Settings). Visible only to adults — a child
@@ -3649,6 +3796,12 @@
     'set-member-role': (t) => setMemberRole(t),
     'set-member-type': (t) => setMemberType(t),
     'remove-member': (t) => removeMember(t),
+    'open-profile-edit': (t) => openProfileEditor(t),
+    'save-profile': saveProfile,
+    'cancel-profile': cancelProfile,
+    'edit-family-name': editFamilyName,
+    'save-family-name': saveFamilyName,
+    'cancel-family-name': cancelFamilyName,
     'map-zoom-in': () => mapZoom(1),
     'map-zoom-out': () => mapZoom(-1),
     'map-center': mapCenter,
