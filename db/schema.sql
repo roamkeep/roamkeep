@@ -121,6 +121,31 @@ CREATE TABLE IF NOT EXISTS location_history (
   recorded_at timestamptz NOT NULL DEFAULT now()
 );
 
+-- Schema version marker + compatibility metadata (v12).
+--
+-- Exactly one row, enforced by the primary key: `id boolean PRIMARY KEY
+-- DEFAULT true CHECK (id)` admits only the value true, so a second INSERT
+-- conflicts rather than creating a silently divergent second row.
+--
+-- roamkeep_schema_version() below returns a NUMBER, never a verdict — a
+-- database that answered "compatible: yes/no" would bake the client
+-- policy of the day into every family's server, and changing that policy
+-- later would become a migration for all of them. Returning `12` lets
+-- each build decide for itself, per feature. Don't add a boolean here.
+--
+-- project_url is the project's own https://<ref>.supabase.co. The webhook
+-- trigger functions need it to reach their Edge Functions, and this file
+-- cannot know it when pasted into a SQL editor — it is set by the
+-- provisioning wizard, by set_project_url() on the owner's next app open,
+-- or by hand.
+CREATE TABLE IF NOT EXISTS roamkeep_meta (
+  id             boolean PRIMARY KEY DEFAULT true CHECK (id),
+  schema_version integer NOT NULL,
+  min_app_build  integer NOT NULL DEFAULT 0,   -- advisory only, never a hard block
+  project_url    text,
+  updated_at     timestamptz NOT NULL DEFAULT now()
+);
+
 -- Patch columns onto databases that predate the migration that added
 -- them (no-op on a fresh install where they're already inline above).
 ALTER TABLE keep_members
@@ -288,6 +313,17 @@ ALTER TABLE location_history   ENABLE ROW LEVEL SECURITY;
 -- No policies on keep_join_attempts → default deny for clients; only the
 -- DEFINER join RPC (running as owner) reads/writes it.
 ALTER TABLE keep_join_attempts ENABLE ROW LEVEL SECURITY;
+ALTER TABLE roamkeep_meta      ENABLE ROW LEVEL SECURITY;
+
+-- ROAMKEEP_META — readable by everyone including anon, because the
+-- version check runs at connect time, BEFORE sign-in, and so cannot
+-- require a session. Nothing sensitive lives here: it is the schema's own
+-- version number. No write policy for anyone — the row is written by the
+-- provisioning wizard (service role) or by set_project_url() below.
+DROP POLICY IF EXISTS "Anyone can read schema metadata" ON roamkeep_meta;
+CREATE POLICY "Anyone can read schema metadata"
+  ON roamkeep_meta FOR SELECT TO anon, authenticated
+  USING (true);
 
 -- KEEPS — members-only read (prevents keep-code enumeration). Creation
 -- goes exclusively through create_keep (SECURITY DEFINER). v8 DROPPED the
@@ -444,6 +480,72 @@ CREATE TRIGGER trg_guard_member_cols
 -- create/join are atomic — they bypass row visibility during the race
 -- between inserting the keep and checking membership. v8 adds role/type
 -- management, the time-boxed pause, code rotation, and the owner kick.
+
+-- v12: the compatibility check. Returns the version NUMBER so the client
+-- decides what to do with it — see the roamkeep_meta comment above.
+CREATE OR REPLACE FUNCTION roamkeep_schema_version()
+RETURNS TABLE (schema_version integer, min_app_build integer)
+LANGUAGE sql
+SECURITY DEFINER
+SET search_path = public
+STABLE
+AS $$
+  SELECT m.schema_version, m.min_app_build FROM roamkeep_meta m
+$$;
+
+-- Deliberately anon-callable, unlike every other function in this file:
+-- the check runs before sign-in. Stated explicitly so it reads as a
+-- decision rather than as something the v10 advisor cleanup missed.
+REVOKE ALL ON FUNCTION public.roamkeep_schema_version() FROM public;
+GRANT EXECUTE ON FUNCTION public.roamkeep_schema_version() TO anon, authenticated;
+
+-- v12: let the owner's app tell the database its own URL, so a family who
+-- upgraded by pasting this file into the SQL editor still gets working
+-- webhooks without a manual step.
+--
+-- Two constraints, both load-bearing:
+--   * Owner only, checked against keep_members.role rather than trusted
+--     from the caller.
+--   * The value must look like a Supabase project URL. The database POSTs
+--     to whatever is stored here, so an unconstrained client-writable
+--     endpoint would be an SSRF hole. The regex lives HERE, in the
+--     client-callable path, and deliberately NOT as a CHECK on the column
+--     — a self-hoster on a custom domain must still be able to set one by
+--     direct SQL from the dashboard.
+--
+-- Write-once: it never overwrites a value already present, so the
+-- wizard's value always wins over a client's.
+CREATE OR REPLACE FUNCTION set_project_url(p_url text)
+RETURNS boolean
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public
+AS $$
+DECLARE
+  v_is_owner boolean;
+BEGIN
+  IF p_url IS NULL OR p_url !~ '^https://[a-z0-9]+\.supabase\.co$' THEN
+    RETURN false;
+  END IF;
+
+  SELECT EXISTS (
+    SELECT 1 FROM keep_members
+    WHERE user_id = auth.uid() AND role = 'owner'
+  ) INTO v_is_owner;
+
+  IF NOT v_is_owner THEN
+    RETURN false;
+  END IF;
+
+  UPDATE roamkeep_meta
+     SET project_url = p_url, updated_at = now()
+   WHERE project_url IS NULL;
+
+  RETURN FOUND;
+END$$;
+
+REVOKE ALL ON FUNCTION public.set_project_url(text) FROM public, anon;
+GRANT EXECUTE ON FUNCTION public.set_project_url(text) TO authenticated;
 
 CREATE OR REPLACE FUNCTION create_keep(
   p_family_name text,
@@ -994,5 +1096,21 @@ BEGIN
     RAISE NOTICE 'pg_cron not enabled — skipping retention jobs. Enable the extension and re-run.';
   END IF;
 END$$;
+
+-- ── SCHEMA VERSION STAMP ──────────────────────────────────
+-- LAST statement in the file, deliberately. If anything above fails, the
+-- version is left untouched, so a half-applied schema reports the OLD
+-- version and clients correctly refuse rather than assuming they got what
+-- they asked for.
+--
+-- GREATEST(), not a plain assignment: this file is also re-run as the
+-- upgrade path, and it must never walk a database BACKWARDS if someone
+-- runs an older checkout of it against a newer database.
+
+INSERT INTO roamkeep_meta (id, schema_version) VALUES (true, 12)
+  ON CONFLICT (id) DO UPDATE
+    SET schema_version = GREATEST(roamkeep_meta.schema_version, 12),
+        updated_at = now();
+
 
 -- ── DONE ──────────────────────────────────────────────────

@@ -235,6 +235,44 @@ tracking service has been doing.
 
 ---
 
+## Keeping your server up to date
+
+Roamkeep updates itself on everyone's phone through the Play Store. The
+**database** does not — it is yours, and only you can update it. Every so
+often a new version of the app needs something new in the database, and
+until you run the update those phones will show:
+
+> **Your family's server needs updating**
+
+That screen is deliberate. The alternative was the app quietly half-working
+— arrive/leave alerts and trails simply stopping, with nothing on any screen
+to say why.
+
+To update, from the Roamkeep folder:
+
+```bash
+cd cli; npm start -- --upgrade abcdefgh12345678
+```
+
+Use your own project ref (the `abcdefgh12345678` part of your Supabase URL).
+It prints the version it moved you from and to. It is additive and safe to
+run more than once — **nothing your family has recorded is touched**.
+
+If you would rather do it by hand: open your project's SQL editor, paste in
+`db/schema.sql` from the Roamkeep folder, and run it. Then run this once, so
+the database knows its own address and can send notifications:
+
+```sql
+update roamkeep_meta set project_url = 'https://abcdefgh12345678.supabase.co';
+```
+
+The wizard does that step for you, which is the main reason to prefer it.
+
+Once the update is done, anyone stuck on that screen just needs to open the
+app again — no reinstall, nothing lost.
+
+---
+
 ## If something goes wrong
 
 **The wizard failed partway.** Every step is safe to repeat. Re-run it with

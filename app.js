@@ -43,6 +43,33 @@
   const TILE_SIZE = 256;
   const DEFAULT_CENTRE = { lat: -33.87, lng: 151.21, zoom: 13 };
 
+  // ── SCHEMA COMPATIBILITY ───────────────────────────────────────
+  //
+  // Every family runs their own Supabase, and their database is upgraded
+  // by their owner while every member's app updates on Google's schedule.
+  // So there is always a window where a MIX of app versions is talking to
+  // one database. Without a check, a build that needs something the
+  // database lacks doesn't say so — it fails at whichever call site needs
+  // the missing thing, and on the native path (SupabaseRest, no screen)
+  // that failure is a Log.w and nothing else: alerts and trails just stop.
+  //
+  // NEEDS_SCHEMA is the minimum version THIS build requires. Raise it in
+  // the same commit that starts using a new table, column or RPC.
+  const NEEDS_SCHEMA = 11;
+
+  // What to assume when roamkeep_meta / roamkeep_schema_version() is
+  // absent. Every database provisioned before v12 is at 11 (the last
+  // migration before the marker existed), so absence is a KNOWN version,
+  // not an error — and treating it as one is what lets this release ship
+  // without locking anyone out.
+  const SCHEMA_PRE_META = 11;
+
+  // Deliberately equal to SCHEMA_PRE_META in this release: the gate ships
+  // INERT. A gate that demanded its own migration would lock every member
+  // out until their owner acted — the mechanism's first act in the world
+  // would be an outage it caused. It proves itself in the field first, and
+  // the release that actually needs something new is the first to raise it.
+
   // ── STATE ──────────────────────────────────────────────────────
   const S = {
     sb: null,
@@ -78,7 +105,12 @@
     trackingMode: 'auto',      // auto | live | balanced | saver
     tlMemberId: null,          // timeline: selected member (defaults to self)
     tlDayOffset: 0,            // timeline: 0 = today … HISTORY_DAYS-1
-    tlTrips: []                // timeline: current day's trips, kept for tap-to-draw
+    tlTrips: [],               // timeline: current day's trips, kept for tap-to-draw
+    // The database's own schema version, read once at connect. Kept even
+    // when the check passes: this is what a future per-feature fallback
+    // reads (`if (S.schemaVersion >= N) … else …`) if we ever switch from
+    // refusing to degrading.
+    schemaVersion: null
   };
 
   const PLACE_ICONS = ['🏠', '🏫', '🏢', '🛒', '🏋️', '🏥', '⛪', '🌳', '🍴', '📍'];
@@ -3979,6 +4011,126 @@
     } finally { clearTimeout(t); }
   }
 
+  // Is this error "the function isn't there" as opposed to "I couldn't
+  // reach the server"? PostgREST reports a missing RPC as PGRST202
+  // ("Could not find the function … in the schema cache"), NOT Postgres's
+  // own 42883 — both are accepted here because the RPC can also be
+  // reached directly.
+  function isMissingDbObject(error) {
+    const code = (error && error.code) || '';
+    if (code === 'PGRST202' || code === '42883' || code === '42P01') return true;
+    return /does not exist|could not find the function/i.test((error && error.message) || '');
+  }
+
+  // Read the database's schema version.
+  //
+  // Returns { version, minApp } when it positively determined one, or
+  // NULL when it could not tell. The distinction is the whole point:
+  //
+  //   * A missing function is not a failure, it is the answer. Every
+  //     database provisioned before v12 lacks it, so absence means
+  //     SCHEMA_PRE_META — a known version.
+  //   * A genuine outage — offline, project asleep, DNS, 5xx, a bad key —
+  //     means we learned NOTHING. Reporting that as a version would
+  //     render a train tunnel as "your family's server needs updating":
+  //     confident, wrong, and unactionable, since no amount of the owner
+  //     running migrations will fix it.
+  //
+  // Collapsing the two is harmless only while NEEDS_SCHEMA equals
+  // SCHEMA_PRE_META (nothing can fail the comparison) and becomes a bug
+  // the moment a release raises the bar. Keep them apart.
+  async function readSchemaVersion() {
+    try {
+      const { data, error } = await S.sb.rpc('roamkeep_schema_version');
+      if (error) {
+        if (isMissingDbObject(error)) {
+          return { version: SCHEMA_PRE_META, minApp: 0 };
+        }
+        console.warn('schema version unreadable', error.code || '', error.message || '');
+        return null;
+      }
+      const row = Array.isArray(data) ? data[0] : data;
+      // Present but empty/garbled: the table exists and says nothing
+      // useful. Treat as unknown rather than inventing a number.
+      if (!row || typeof row.schema_version !== 'number') return null;
+      return { version: row.schema_version, minApp: row.min_app_build || 0 };
+    } catch (e) {
+      console.warn('schema version check threw', e);
+      return null;
+    }
+  }
+
+  // Our own build number, for the advisory min_app_build banner.
+  // Native only — the PWA has no build number and is always current,
+  // because it is served fresh rather than installed.
+  async function currentAppBuild() {
+    if (!isNative()) return null;
+    try {
+      const App = window.Capacitor.Plugins && window.Capacitor.Plugins.App;
+      if (!App || !App.getInfo) return null;
+      const info = await App.getInfo();
+      const b = parseInt(info && info.build, 10);
+      return isNaN(b) ? null : b;
+    } catch (_) { return null; }
+  }
+
+  // Blocks startup when the database is older than this build needs.
+  // Returns true when it is safe to carry on.
+  async function checkSchemaCompatible() {
+    const info = await readSchemaVersion();
+
+    // Never block on ignorance. If we could not read a version, carry on
+    // — the app then fails, if at all, at the call that actually needs
+    // the missing thing, which is a smaller and more honest failure than
+    // telling a family their server is broken because a tunnel ate the
+    // request.
+    if (!info) return true;
+
+    const { version, minApp } = info;
+    S.schemaVersion = version;
+
+    if (version < NEEDS_SCHEMA) {
+      const el = $('outdated-detail');
+      if (el) {
+        el.textContent = 'This app needs database version ' + NEEDS_SCHEMA +
+          '. Your family’s server is on version ' + version + '.';
+      }
+      show('s-outdated');
+      return false;
+    }
+
+    // The other direction, and deliberately advisory. A hard block here
+    // could strand a family whose Play update hasn't rolled out yet, and
+    // unlike the schema direction there is nothing their owner can do
+    // about it. An installed app that refuses can never be talked out of
+    // refusing by a later database change — the decision lives in the
+    // binary — so keep the database's power over installed apps to a
+    // banner.
+    const build = await currentAppBuild();
+    const banner = $('update-banner');
+    if (banner) {
+      const stale = !!(minApp && build !== null && build < minApp);
+      banner.style.display = stale ? 'block' : 'none';
+    }
+    return true;
+  }
+
+  // Tell the database its own URL, so the webhook triggers can reach the
+  // Edge Functions. Only the owner can, only when it isn't already set,
+  // and the RPC re-checks both — this is a convenience, not the authority.
+  //
+  // Exists because a family who upgraded by pasting schema.sql into the
+  // dashboard never told the database its project URL, and without it
+  // their check-in webhook silently no-ops.
+  async function ensureProjectUrl() {
+    if (!S.sb || !SB_URL) return;
+    try {
+      await S.sb.rpc('set_project_url', { p_url: SB_URL.replace(/\/+$/, '') });
+    } catch (_) {
+      // Older database without the RPC, or not the owner. Both fine.
+    }
+  }
+
   async function applySetupConfig(cfg, opts) {
     setConnectErr('');
     const btnIds = ['connect-scan', 'connect-paste-go'];
@@ -4155,6 +4307,14 @@
         detectSessionInUrl: false
       }
     });
+    // Before anything reads or writes a table: is this database new
+    // enough for this build? Runs pre-auth deliberately —
+    // roamkeep_schema_version() is anon-callable precisely so the answer
+    // arrives before we have asked anyone to sign in to a database we
+    // then refuse to use.
+    setMsg('Checking your family server…');
+    if (!(await checkSchemaCompatible())) return;
+
     setMsg('Checking session…');
 
     S.sb.auth.onAuthStateChange((event, session) => {
@@ -4185,6 +4345,9 @@
               S.keepCode = m.keeps.code;
               S.keepName = m.keeps.name;
               S.myId = m.id;
+              // Fire-and-forget: no-ops unless this user is the owner and
+              // the URL is still unset. Never gates the app opening.
+              ensureProjectUrl();
               launchApp();
             } else {
               initAvPickers();

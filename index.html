@@ -47,6 +47,39 @@
   <button class="btn-retry" data-action="reload">Retry</button>
 </div>
 
+<!-- DATABASE TOO OLD (this build needs a newer schema than the family's
+     server has). Shown before sign-in, because the version check is
+     anon-callable on purpose — there is no point asking someone to sign
+     in to a database we are about to refuse. The copy does not name the
+     owner: pre-auth, RLS means we genuinely cannot read who they are, and
+     "whoever set this up" reaches them without pretending otherwise. -->
+<div id="s-outdated" class="screen">
+  <div class="card">
+    <div class="err-screen-icon"><span class="ic" data-icon="alert-triangle" data-icon-size="44"></span></div>
+    <h2>Your family's server needs updating</h2>
+    <p>Roamkeep on this phone is newer than your family's database, so it
+      can't safely use it yet. Nothing has been lost — the update takes a
+      couple of minutes.</p>
+
+    <div id="outdated-detail" class="note"></div>
+
+    <div class="info-card" style="margin-top:18px">
+      <strong>If someone else set up your family's Keep</strong>
+      Ask them to run the update. Everyone's app will start working again
+      as soon as they have — no reinstall needed.
+    </div>
+
+    <div class="info-card" style="margin-top:12px">
+      <strong>If you set it up, here's how</strong>
+      Run <code>npx roamkeep-setup --upgrade</code> and follow the prompts,
+      or open your Supabase project's SQL editor and run
+      <code>db/schema.sql</code> from the Roamkeep repository.
+    </div>
+
+    <button class="btn-retry" data-action="reload">I've updated it — retry</button>
+  </div>
+</div>
+
 <!-- CONNECT (first run — choose which family server this device talks to) -->
 <div id="s-connect" class="screen">
   <div class="card">
@@ -175,6 +208,14 @@
 
 <!-- APP -->
 <div id="s-app" class="screen">
+  <!-- Advisory only. The database can say "builds below N are past it"
+       (roamkeep_meta.min_app_build) and this is all that happens: a
+       banner. Never a block — a family whose Play update hasn't rolled
+       out yet can do nothing about it, and unlike the schema direction
+       there is no owner action that fixes it. -->
+  <div id="update-banner" class="update-banner" style="display:none">
+    ⬆️ A newer version of Roamkeep is available — please update when you can.
+  </div>
   <div class="hdr">
     <div class="hdr-l">
       <svg class="ib-icon-svg" aria-hidden="true"><use href="#rk-mark"/></svg>

@@ -53,26 +53,85 @@ export async function applySchema(api, ref) {
 }
 
 /**
+ * The schema_version that ../db/schema.sql stamps as its last statement.
+ *
+ * Keep this in step with that file. It is the only number the wizard
+ * needs: asserting it is strictly stronger than counting tables, because
+ * the stamp only lands if everything before it in the file succeeded.
+ */
+export const SCHEMA_VERSION = 12;
+
+/**
+ * The database's own schema version, or null if it predates the marker.
+ *
+ * Two queries rather than one, because a `select … from roamkeep_meta`
+ * fails at PARSE time when the table is absent — CASE and COALESCE do not
+ * save you, since the planner resolves the relation before any of that
+ * runs. So: ask whether it exists, then read it.
+ */
+export async function readSchemaVersion(api, ref) {
+  const t = await api.query(ref,
+    `select to_regclass('public.roamkeep_meta') is not null as present;`);
+  const present = (Array.isArray(t) ? t[0] : t)?.present;
+  if (!present) return null;
+  const rows = await api.query(ref, `select schema_version from roamkeep_meta limit 1;`);
+  const r = Array.isArray(rows) ? rows[0] : rows;
+  const v = Number(r?.schema_version);
+  return Number.isFinite(v) ? v : null;
+}
+
+/**
  * Confirm the schema actually took, rather than trusting a 200.
- * Checks the tables and the RPCs the app cannot work without.
+ *
+ * Asserts the version stamp as well as the tables and RPCs the app cannot
+ * work without. The stamp is the load-bearing check — schema.sql sets it
+ * last, so seeing the expected number proves the whole file ran, and it
+ * does not need editing every time a table is added.
  */
 export async function verifySchema(api, ref) {
   const sql = `
     select
       (select count(*) from information_schema.tables
         where table_schema='public'
-          and table_name in ('keeps','keep_members','checkins','keep_places','location_history')) as tables,
+          and table_name in ('keeps','keep_members','checkins','keep_places',
+                             'location_history','roamkeep_meta')) as tables,
       (select count(*) from information_schema.routines
         where routine_schema='public'
-          and routine_name in ('create_keep','join_keep_by_code','rotate_keep_code','remove_member')) as rpcs;`;
+          and routine_name in ('create_keep','join_keep_by_code','rotate_keep_code',
+                               'remove_member','roamkeep_schema_version')) as rpcs;`;
   const rows = await api.query(ref, sql);
   const r = Array.isArray(rows) ? rows[0] : rows;
   const tables = Number(r?.tables ?? 0);
   const rpcs = Number(r?.rpcs ?? 0);
-  if (tables < 5 || rpcs < 4) {
-    throw new Error(`schema incomplete — ${tables}/5 tables, ${rpcs}/4 RPCs`);
+  if (tables < 6 || rpcs < 5) {
+    throw new Error(`schema incomplete — ${tables}/6 tables, ${rpcs}/5 RPCs`);
   }
-  return { tables, rpcs };
+  const version = await readSchemaVersion(api, ref);
+  if (version !== SCHEMA_VERSION) {
+    throw new Error(
+      `schema version is ${version === null ? 'unset' : version}, expected ${SCHEMA_VERSION} ` +
+      `— the schema file may not have run to completion`);
+  }
+  return { tables, rpcs, version };
+}
+
+/**
+ * Tell the database its own URL.
+ *
+ * The webhook trigger function POSTs to its Edge Function and cannot know
+ * the project ref from inside Postgres, so it is stored in roamkeep_meta.
+ * The app's set_project_url() RPC is write-once and owner-only; the wizard
+ * writes directly and is therefore authoritative — if a client guessed
+ * wrong, re-running the wizard corrects it.
+ *
+ * `ref` reaches here from CLI input and is interpolated into SQL, so it is
+ * checked against the shape Supabase actually issues rather than trusted.
+ */
+export async function setProjectUrl(api, ref) {
+  if (!/^[a-z0-9]+$/.test(ref)) throw new Error(`refusing to use an odd project ref: ${ref}`);
+  const url = `https://${ref}.supabase.co`;
+  await api.query(ref, `update roamkeep_meta set project_url = '${url}', updated_at = now();`);
+  return url;
 }
 
 /**

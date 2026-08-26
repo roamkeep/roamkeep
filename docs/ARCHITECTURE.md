@@ -219,6 +219,58 @@ are the readable source. The Android release build runs R8
 `app/build/outputs/mapping/release/mapping.txt` — keep it per release
 if you want to de-obfuscate a crash trace.
 
+### Schema changes: expand → migrate → contract, never skip to contract
+
+Other families now run their own Supabase, so a database change is no
+longer one person's migration. The owner updates the database; every
+member's app updates on Google's schedule. You therefore never get "old
+app + old DB" cleanly followed by "new app + new DB" — you get **a mix of
+app versions against one database, for days**. Ordering the owner's
+migration correctly does not save you.
+
+- **Expand.** New tables, columns and RPCs are added *additively*. Nothing
+  renamed, dropped, or signature-changed. Old apps keep working untouched.
+- **Migrate.** Ship the app version that uses the new things.
+- **Contract.** Remove the old thing only when nothing still calls it. In
+  this model that is months, or never.
+
+The v9 `nests`→`keeps` rename was a contract done as a big bang, and was
+only safe because the author was the sole deployment. That precedent is
+the one **not** to repeat.
+
+Since **v12** the database publishes its own version (`roamkeep_meta`,
+read via `roamkeep_schema_version()`), and the client refuses to start
+against a database older than `NEEDS_SCHEMA` in `app.js` — showing the
+`s-outdated` screen instead of failing at whichever call site happens to
+need the missing thing. On the native path that failure mode is invisible
+(`SupabaseRest` has no screen; a rejected write is a `Log.w`), which is
+exactly why the gate exists.
+
+Rules that follow from it:
+
+- Every migration sets `schema_version` **as its last statement**, so a
+  half-applied migration reports the old number.
+- Every release that starts using something new raises `NEEDS_SCHEMA` in
+  the same commit, and `SCHEMA_VERSION` in `cli/src/steps.js` tracks what
+  `db/schema.sql` stamps.
+- `roamkeep_schema_version()` returns a **number, never a verdict**. A
+  database that answered "compatible: yes/no" would bake one client's
+  policy into every family's server, and changing that policy later would
+  become a migration for all of them. The number is also what a future
+  per-feature fallback would read (`if (S.schemaVersion >= N) … else …`)
+  if the app ever switches from refusing to degrading.
+- **"Couldn't read the version" is not "the version is old."** A missing
+  function is a known answer (pre-v12); a network failure is not an
+  answer at all and must never block, or a tunnel becomes "your family's
+  server needs updating". Collapsing the two is harmless only while
+  `NEEDS_SCHEMA` equals `SCHEMA_PRE_META` and becomes a bug the moment a
+  release raises the bar.
+- `min_app_build` (the other direction) stays **advisory** — a banner,
+  never a block. An installed app that refuses can never be talked out of
+  refusing by a later database change, and unlike the schema direction
+  there is nothing the owner can do about a member whose Play update has
+  not rolled out.
+
 **Every behavioural change bumps three things together** (the convention
 across all prior PRs):
 - `android/app/build.gradle` → `versionCode` (+1) and `versionName`

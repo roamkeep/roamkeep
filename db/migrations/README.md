@@ -18,6 +18,26 @@ that's already on an older version.
 | `familynest-schema-v8_1-fix-rls-recursion.sql` | Breaks the membership-policy recursion introduced by v8. |
 | `familynest-schema-v8_2-owner-only-member-type.sql` | Restricts `set_member_type` to the Keep owner. |
 | `familynest-schema-v9-keeps-rename.sql` | **Breaking.** Renames `nest*` → `keep*` throughout — tables, `nest_id` columns, functions, indexes, cron job. Must be followed immediately by `../schema.sql`, and every client must be on 4.5.0+. |
+| `familynest-schema-v10-advisor-cleanup.sql` | Revokes `anon` EXECUTE on every SECURITY DEFINER RPC. `REVOKE … FROM PUBLIC` alone does not do this — Supabase's default privileges grant execute to `anon` *by name*, so it has to be revoked explicitly. |
+| `familynest-schema-v11-profile-edits.sql` | `rename_keep` + `update_member_profile` RPCs — editable family name, display name and avatar. |
+| `familynest-schema-v12-meta.sql` | `roamkeep_meta` (schema version, `min_app_build`, `project_url`) + `roamkeep_schema_version()` + `set_project_url()`. Sets **schema_version 12**. Purely additive — every installed app keeps working after it is applied. |
+
+## Schema versions and app compatibility
+
+From v12 the database publishes its own version, and every migration sets
+it **as its last statement** so a half-applied migration reports the old
+number rather than claiming a state it did not reach.
+
+| schema_version | Set by | Minimum app |
+|---|---|---|
+| 12 | `familynest-schema-v12-meta.sql` | 4.7.0 (the gate ships inert — 4.7.0 runs fine against a pre-v12 database too) |
+
+`roamkeep_schema_version()` returns a **number, not a verdict**. That is
+deliberate and should stay that way: a database that answered
+"compatible: yes/no" would bake one client's policy into every family's
+server, and changing that policy later would become a migration for all
+of them. Returning the number lets each build decide for itself, and lets
+a future build decide *per feature* with no server change.
 
 ## For a fresh project, don't run these
 

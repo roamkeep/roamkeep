@@ -5,6 +5,8 @@
 //   cd cli && npm install && npm start
 //   npm start -- --project <ref>   # use an existing project
 //   npm start -- --from 4          # resume from a step
+//   npm start -- --upgrade <ref>   # bring an EXISTING family's database
+//                                  # up to the current schema
 //
 // ⚠ NOT PUBLISHED TO NPM. `npx create-roamkeep-server` does not work and
 // never has — the registry returns 404. This file used to print that
@@ -38,6 +40,15 @@ const arg = (name) => {
   return i > -1 ? process.argv[i + 1] : null;
 };
 const FROM = Number(arg('from') || 1);
+
+// `--upgrade <ref>` — the maintenance path for a project that already
+// exists. It is a separate mode rather than a flag threaded through the
+// provisioning flow because the two want opposite things: provisioning
+// creates a project, configures auth and prints a first setup link;
+// upgrading must not create anything, must not print a new link (the
+// family already has one, and a second one only confuses), and needs to
+// report what version it moved the database from and to.
+const UPGRADE = arg('upgrade');
 
 /**
  * How to invoke this program again — derived from how it was just invoked.
@@ -101,11 +112,97 @@ async function step(n, label, fn, manualFallback, opts = {}) {
   }
 }
 
+/**
+ * Bring an existing family's database up to the current schema.
+ *
+ * Re-runnable and non-destructive — every step it calls already is, which
+ * is what makes this mostly a new entry point rather than new logic.
+ *
+ * The version report is the point of it. "Applied the schema" tells an
+ * owner nothing they can check; "11 → 12" is something they can hold
+ * against what their family's app is asking for on its outdated screen.
+ */
+async function runUpgrade(api, ref) {
+  if (!/^[a-z0-9]+$/.test(ref)) {
+    bail(`That does not look like a Supabase project ref: ${ref}`);
+  }
+
+  note(
+    'This brings an existing Roamkeep database up to the schema this\n' +
+    'checkout ships. It is additive and non-destructive — no data is\n' +
+    'dropped, and it is safe to run more than once.\n\n' +
+    'Everyone in the family should update their app as well; the app tells\n' +
+    'them when it needs a newer database than they have.',
+    'Upgrading a family server',
+  );
+
+  const before = await steps.readSchemaVersion(api, ref).catch(() => null);
+  log.info(`Project: ${color.cyan(`https://${ref}.supabase.co`)}`);
+  log.info(`Current schema version: ${color.bold(before === null ? 'before versions were tracked' : before)}`);
+
+  if (before !== null && before > steps.SCHEMA_VERSION) {
+    bail(
+      `That database is on schema version ${before}, but this checkout only knows ` +
+      `about ${steps.SCHEMA_VERSION}. Pull the latest Roamkeep and try again — ` +
+      `running an older schema against a newer database is not something this ` +
+      `wizard will do.`);
+  }
+
+  await step(1, 'Enabling database extensions', () => steps.enableExtensions(api, ref));
+
+  const applied = await step(2, 'Applying the current schema', () => steps.applySchema(api, ref),
+    `Open the SQL editor for ${ref}, paste the contents of db/schema.sql, and run it.`);
+
+  if (!applied.ok) {
+    bail('The schema did not apply, so nothing else here would be meaningful. Fix the above and re-run.');
+  }
+
+  const verified = await step(3, 'Verifying the schema', () => steps.verifySchema(api, ref));
+
+  await step(4, 'Recording the project URL', () => steps.setProjectUrl(api, ref),
+    `Run this in the SQL editor for ${ref}:\n\n` +
+    color.cyan(`  update roamkeep_meta set project_url = 'https://${ref}.supabase.co';`) + '\n\n' +
+    'Without it the database cannot call its own Edge Function, so push\n' +
+    'notifications stay silent.');
+
+  await step(5, 'Re-wiring the check-in webhook', async () => {
+    await steps.createWebhook(api, ref);
+    await steps.verifyWebhook(api, ref);
+  }, 'Dashboard → Database → Webhooks → create one on table "checkins", event Insert,\n' +
+     'type "Supabase Edge Functions", function notify-checkin, method POST.');
+
+  const fn = await step(6, 'Checking the notification function', () => steps.checkFunction(api, ref));
+  if (!(fn.ok && fn.out === true)) {
+    note(
+      'The notify-checkin Edge Function is not deployed on this project.\n' +
+      'Everything else works without it — you just get no push\n' +
+      'notifications. To deploy, from the repo root:\n\n' +
+      color.cyan('  npx supabase login') + '\n' +
+      color.cyan(`  npx supabase link --project-ref ${ref}`) + '\n' +
+      color.cyan('  npx supabase functions deploy notify-checkin --no-verify-jwt'),
+      'Optional step still outstanding',
+    );
+  }
+
+  const after = verified.ok && verified.out ? verified.out.version
+    : await steps.readSchemaVersion(api, ref).catch(() => null);
+
+  note(
+    `Schema version: ${color.bold(before === null ? 'untracked' : before)} → ${color.bold(after ?? 'unknown')}\n\n` +
+    (after === steps.SCHEMA_VERSION
+      ? 'Your family server is up to date. Anyone stuck on the "server needs\nupdating" screen can reopen the app now.'
+      : 'The version is not what this checkout expects — look at the warnings\nabove before telling the family it is done.'),
+    'Result',
+  );
+
+  outro(color.green('Done.'));
+}
+
 async function main() {
   console.log('');
   intro(color.bgCyan(color.black(' create-roamkeep-server ')));
 
-  note(
+  if (!UPGRADE) note(
     'Roamkeep runs no servers. Your family gets its own private Supabase\n' +
     'project — your location data lives there, and nobody else (including\n' +
     'the people who wrote Roamkeep) can reach it.\n\n' +
@@ -146,6 +243,13 @@ async function main() {
     }
   }
   if (!orgs?.length) bail('That account has no organizations — create one at supabase.com first.');
+
+  // Maintenance mode diverges here: everything below creates or configures
+  // a project, and an upgrade must do neither.
+  if (UPGRADE) {
+    await runUpgrade(api, UPGRADE);
+    return;
+  }
 
   // ── 2. Project: new or existing ────────────────────────────────
   let ref = arg('project');
@@ -264,11 +368,18 @@ async function main() {
     color.cyan(`  node tools/setup-link.js --url ${projectUrl} --key <anon-key>`),
     { always: true });
 
+  // setProjectUrl belongs to this step rather than a step of its own: it
+  // is what the trigger needs in order to reach the Edge Function, and a
+  // separate number would have renumbered every "--from N" already in the
+  // docs and in this file's own resume advice.
   await step(8, 'Wiring the check-in webhook', async () => {
+    await steps.setProjectUrl(api, ref);
     await steps.createWebhook(api, ref);
     await steps.verifyWebhook(api, ref);
   }, 'Dashboard → Database → Webhooks → create one on table "checkins", event Insert,\n' +
-     'type "Supabase Edge Functions", function notify-checkin, method POST.');
+     'type "Supabase Edge Functions", function notify-checkin, method POST.\n' +
+     'Then, in the SQL editor:\n\n' +
+     `  update roamkeep_meta set project_url = 'https://${ref}.supabase.co';`);
 
   // ── 9. Edge function (needs the supabase CLI) ──────────────────
   const fn = await step(9, 'Checking the notification function', () => steps.checkFunction(api, ref));
