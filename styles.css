@@ -495,6 +495,12 @@ body {
 .mc-you { font-size: 11px; color: var(--primary); font-weight: 400; }
 .mc-main { flex: 1; min-width: 0; }
 .mc-st { font-size: 12px; color: var(--stone); margin-top: 1px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+/* Where they are. Same truncation as the status line above it — a long
+   place name must not push the battery and clock off the card. */
+.mc-where {
+  font-size: 12px; color: var(--ink-2); margin-top: 2px;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
 .mc-meta { text-align: right; flex-shrink: 0; }
 .batt { font-size: 11px; font-weight: 700; padding: 3px 7px; border-radius: 6px; display: inline-block; margin-bottom: 3px; }
 .batt.lo { background: var(--sos-soft); color: var(--sos-2); }
@@ -513,6 +519,23 @@ body {
 .ci-nm { font-weight: 600; font-size: 13px; }
 .ci-pl { font-size: 12px; color: #4a3018; margin: 2px 0; }
 .ci-tm { font-size: 11px; color: var(--stone); }
+
+/* SOS position: the two things that actually get someone there. */
+.ci-loc { margin: 6px 0 4px; }
+.ci-loc-hint { font-size: 11px; color: var(--stone); margin-bottom: 4px; }
+.ci-coords { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; }
+.ci-nav, .ci-copy {
+  border: 1px solid var(--sand); background: var(--surface);
+  border-radius: 8px; padding: 5px 9px;
+  font-size: 11.5px; color: var(--ink);
+  cursor: pointer; line-height: 1.2;
+}
+.ci-nav { background: var(--sos-soft); border-color: var(--sos-soft); color: var(--sos-2); font-weight: 700; }
+.ci-nav:active { background: var(--sos); color: #fff; }
+/* Coordinates are read digit by digit when someone is reading them
+   aloud, so a tabular font and generous tracking earn their space. */
+.ci-copy { font-family: ui-monospace, Menlo, Consolas, monospace; letter-spacing: .02em; }
+.ci-copy:active { background: var(--sand); }
 .ci-badge { font-size: 10px; padding: 2px 7px; border-radius: 20px; font-weight: 700; display: inline-block; margin-top: 3px; }
 .ci-badge.manual { background: var(--surface-3); color: var(--ink-2); }
 .ci-badge.arrived { background: var(--primary-soft); color: var(--primary-2); }
@@ -622,6 +645,16 @@ body {
 .pl-main { flex: 1; min-width: 0; }
 .pl-nm { font-weight: 600; font-size: 14px; }
 .pl-sub { font-size: 11px; color: var(--stone); margin-top: 1px; }
+/* Who this place notifies me about — shown on the row so it doesn't take
+   a tap to discover you muted someone here and forgot. */
+.pl-note { font-size: 11px; color: var(--stone); margin-top: 2px; }
+.pl-note:empty { display: none; }
+/* The bell carries the state, so it needs to read as "changed" rather
+   than just "a button". */
+.pl-btn.muted { opacity: 1; }
+/* Avatar in front of a name in the per-place notify sheet. */
+.pn-av { margin-right: 7px; }
+#pn-list .setting-row:last-child { border-bottom: none; }
 .pl-btn {
   background: transparent; border: none; cursor: pointer;
   font-size: 17px; padding: 6px; line-height: 1;

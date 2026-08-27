@@ -19,6 +19,7 @@ import android.os.PowerManager;
 import android.util.Log;
 
 import androidx.core.app.NotificationCompat;
+import androidx.core.app.NotificationManagerCompat;
 import androidx.core.content.ContextCompat;
 
 import com.google.android.gms.location.FusedLocationProviderClient;
@@ -143,6 +144,37 @@ public class LocationForegroundService extends Service {
     private volatile long dozeMsSinceFix = 0;
     private volatile long dozeEnteredMs = 0;
 
+    // ── The dismissable "permanent" notification ──────────────────────
+    //
+    // From Android 13 a user can SWIPE AWAY a foreground-service
+    // notification. setOngoing(true) no longer prevents it — that flag
+    // only ever stopped a clear-all, and 13 deliberately handed the
+    // dismissal back to the user. The service keeps running; only the
+    // notification goes.
+    //
+    // It is posted once, by startForeground() in onStartCommand, and
+    // onStartCommand does not fire again while the service is already
+    // alive. So once dismissed it stayed dismissed for the whole session
+    // — which quietly falsified the claim in landing/privacy that
+    // Roamkeep "shows a permanent notification whenever it is recording
+    // your location", and left tracking running with nothing on screen
+    // to say so.
+    //
+    // So: notice it is gone and put it back, at the next moment tracking
+    // actually happens. Re-posting the same id on an IMPORTANCE_LOW
+    // channel makes no sound, no vibration and no heads-up — it simply
+    // reappears in the shade alongside everything else.
+    //
+    // Deliberately NOT instant-on-dismiss (a deleteIntent that re-posts
+    // immediately). That reads as the app fighting the user's swipe. It
+    // comes back on the next location fix or the next 5-minute re-arm,
+    // because that is when the disclosure is due again.
+    private volatile long lastNotifRestoreJournalMs = 0;
+    private volatile int  restoresSinceJournal = 0;
+    // Journal restorations at most this often. One swipe is worth a line;
+    // a device that somehow flaps must not bury the rest of the journal.
+    private static final long RESTORE_JOURNAL_EVERY_MS = 30 * 60_000;
+
     // Did startForeground() actually succeed? A background start on Android
     // 12+ can be refused outright, and the failure used to go to logcat only
     // — the service kept running as an ordinary background service, which
@@ -159,6 +191,10 @@ public class LocationForegroundService extends Service {
         @Override public void run() {
             rearmsSinceFix++;
             applyProfile();   // re-registers the request; heals a stale callback
+            // The floor on how long a dismissed notification can stay
+            // gone: at worst one re-arm period, even if the device is
+            // sitting still and producing no fixes.
+            restoreNotificationIfDismissed();
             handler.postDelayed(this, REARM_MS);
         }
     };
@@ -261,6 +297,11 @@ public class LocationForegroundService extends Service {
             public void onLocationResult(LocationResult result) {
                 final List<android.location.Location> locs = result.getLocations();
                 if (locs == null || locs.isEmpty()) return;
+                // A fix means we are demonstrably recording location right
+                // now, which is precisely when the disclosure has to be on
+                // screen. Cheaper than it looks — a set membership test on
+                // the active notifications, and a no-op in the normal case.
+                restoreNotificationIfDismissed();
                 // Break in the silence. Everything needed to classify it goes
                 // on one line: how long, whether the re-arm kept running,
                 // whether we were promoted, HOW FAR the device actually
@@ -454,6 +495,61 @@ public class LocationForegroundService extends Service {
         ch.setDescription("Keeps the family map and trail up to date.");
         ch.setShowBadge(false);
         nm.createNotificationChannel(ch);
+    }
+
+    /**
+     * Put the tracking notification back if the user swiped it away.
+     *
+     * Checked rather than re-posted blindly: getActiveNotifications() is
+     * cheap, and a needless notify() every five minutes would churn the
+     * shade and could interrupt someone reading it.
+     *
+     * Silent by construction — same notification id, IMPORTANCE_LOW
+     * channel, PRIORITY_LOW, setShowBadge(false). Nothing about this
+     * makes a sound or a heads-up; it just reappears in the list.
+     *
+     * Does nothing unless we actually hold the foreground service. If
+     * startForeground failed (a background start Android refused), the
+     * notification is not ours to restore and posting one would claim we
+     * are tracking when we are not.
+     */
+    private void restoreNotificationIfDismissed() {
+        if (!promoted) return;
+        // Notifications switched off for the app entirely: there is no
+        // notification to restore and notify() would throw on every fix.
+        // Nothing to do here — the setup sheet is what asks for this
+        // permission, and it already flags the absence.
+        if (!NotificationManagerCompat.from(this).areNotificationsEnabled()) return;
+        NotificationManager nm = (NotificationManager) getSystemService(Context.NOTIFICATION_SERVICE);
+        if (nm == null) return;
+        try {
+            boolean present = false;
+            for (android.service.notification.StatusBarNotification sbn : nm.getActiveNotifications()) {
+                if (sbn.getId() == NOTIF_ID) { present = true; break; }
+            }
+            if (present) return;
+
+            createChannel();
+            nm.notify(NOTIF_ID, buildNotification());
+
+            // Rate-limited so one swipe reads clearly and a pathological
+            // loop cannot drown the journal — the count carries what the
+            // suppressed lines would have said.
+            restoresSinceJournal++;
+            long now = System.currentTimeMillis();
+            if (now - lastNotifRestoreJournalMs >= RESTORE_JOURNAL_EVERY_MS) {
+                new PrefsStore(this).journal(
+                        "fgs: tracking notification was dismissed — restored"
+                        + (restoresSinceJournal > 1 ? " (x" + restoresSinceJournal + ")" : ""));
+                lastNotifRestoreJournalMs = now;
+                restoresSinceJournal = 0;
+            }
+        } catch (Exception e) {
+            // getActiveNotifications can throw on some OEM builds, and
+            // notify() throws without POST_NOTIFICATIONS on API 33+.
+            // Neither is worth killing the tracking service over.
+            Log.w(TAG, "notification restore failed", e);
+        }
     }
 
     private Notification buildNotification() {

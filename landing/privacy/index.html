@@ -122,7 +122,7 @@ technical route into your project.</p>
   </tr>
   <tr>
     <td><strong>Device notification token</strong></td>
-    <td>To wake your phone when something needs your attention</td>
+    <td>To wake your phone when there is something for it to fetch</td>
     <td>Your family's own database, and briefly the relay described below</td>
   </tr>
 </table>
@@ -141,7 +141,8 @@ tracking at any time from inside the app.</strong></p>
 
 <h2>The notification relay</h2>
 <p>There is exactly one piece of infrastructure the developer runs: a small
-relay that wakes up phones when a notification is due. It exists because
+relay that wakes up phones when there is something for them to fetch —
+a notification, or a change to your family's saved places. It exists because
 notification delivery on Android has to be signed with a key belonging to
 the published app, which a family's own database cannot hold.</p>
 <p><strong>The relay never receives the content of a notification.</strong> It
@@ -151,8 +152,8 @@ wake-up signal. Your phone then fetches the actual details from
 on the device.</p>
 <p>The relay therefore sees device tokens, how many there are, and when. It
 cannot see names, places, coordinates, messages, or even what kind of event
-occurred — every wake-up is identical. <strong>It stores nothing and logs
-nothing.</strong></p>
+occurred — every wake-up is identical, and many of them produce no
+notification at all. <strong>It stores nothing and logs nothing.</strong></p>
 <p>The relay's complete source code is published, and this claim can be
 checked against it.</p>
 

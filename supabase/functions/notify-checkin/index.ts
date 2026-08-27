@@ -20,8 +20,22 @@
 // should wake up, and when.
 //
 // The mute rule still lives here, because it decides recipients rather
-// than content: arrived/left respect each member's notify_on_checkin,
-// while SOS deliberately ignores it — an emergency reaches everyone.
+// than content — but it is EXPRESSED IN SQL, not in this file. Since v13
+// it is per (viewer, subject, place) rather than one boolean per member,
+// and the same rule has to be readable from the opposite direction by the
+// device (my_checkin_feed). Two hand-written copies of a three-way
+// predicate would drift, so both call the one definition:
+//
+//   checkin_recipients(checkin_id) → the members to wake
+//   my_checkin_feed                → the rows a given member should see
+//
+// SOS ignores every mute, and so does a check-in with no place_id.
+//
+// The device-side filter is NOT redundant with this one. The wake-up is
+// content-free and untargeted, so an SOS — or an unmuted event about
+// someone else — wakes every phone, and the woken device then fetches
+// everything newer than its watermark. Filtering only here would leak
+// muted notifications through unrelated wakes.
 //
 // Webhook config (Supabase Dashboard → Database → Webhooks):
 //   Name:     notify-checkin
@@ -67,7 +81,16 @@ interface CheckinRow {
   member_avatar: string;
   type: 'arrived' | 'left' | 'manual' | 'sos';
   place: string;
+  // v13. NULL on manual/sos rows and on anything written before v13 —
+  // and NULL is never muted, which is what keeps old rows behaving.
+  place_id: string | null;
   created_at: string;
+}
+
+/** One row of checkin_recipients(). */
+interface Recipient {
+  member_id: string;
+  fcm_token: string;
 }
 
 interface WebhookPayload {
@@ -104,23 +127,19 @@ Deno.serve(async (req) => {
     { auth: { persistSession: false } },
   );
 
-  // Recipients: everyone else in the keep with a token. SOS is safety-
-  // critical, so it IGNORES the per-member notify_on_checkin mute — a
-  // muted family member still gets the emergency. arrived/left respect it.
-  let query = sb
-    .from('keep_members')
-    .select('id, fcm_token')
-    .eq('keep_id', row.keep_id)
-    .neq('id', row.member_id)
-    .not('fcm_token', 'is', null);
-  if (!isSos) query = query.eq('notify_on_checkin', true);
-  const { data: recipients, error } = await query;
+  // Recipients: decided by checkin_recipients() in the family's own
+  // database — everyone else in the keep with a token, minus anyone who
+  // has muted this person at this place, with SOS exempt from all of it.
+  // See the header: the rule is SQL so the device can read the same one
+  // from the other direction.
+  const { data, error } = await sb.rpc('checkin_recipients', { p_checkin: row.id });
 
   if (error) {
     console.error('recipients query failed', error);
     return new Response('db error', { status: 500 });
   }
-  if (!recipients?.length) return new Response('no recipients', { status: 200 });
+  const recipients = (data ?? []) as Recipient[];
+  if (!recipients.length) return new Response('no recipients', { status: 200 });
 
   const relayUrl = relayEndpoint();
   const dead: string[] = [];
@@ -148,7 +167,8 @@ Deno.serve(async (req) => {
       // `stale` is a list of INDICES into the batch we sent.
       for (const idx of (out?.stale ?? [])) {
         const r = batch[idx];
-        if (r) dead.push(r.id);
+        // checkin_recipients() names the column member_id, not id.
+        if (r) dead.push(r.member_id);
       }
     } catch (e) {
       console.warn('relay call failed', e);

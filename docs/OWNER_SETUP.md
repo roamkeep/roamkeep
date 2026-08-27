@@ -271,6 +271,37 @@ The wizard does that step for you, which is the main reason to prefer it.
 Once the update is done, anyone stuck on that screen just needs to open the
 app again — no reinstall, nothing lost.
 
+### Checking it actually took
+
+Paste this into the SQL editor after an update:
+
+```sql
+select (select schema_version from roamkeep_meta)                    as version,
+       (select project_url    from roamkeep_meta)                    as url,
+       (select count(*) from information_schema.columns
+         where table_name = 'checkins'
+           and column_name in ('place_id','lat','lng'))              as checkin_cols,
+       (select count(*) from information_schema.tables
+         where table_name = 'keep_notify_prefs')                     as prefs_table,
+       (select count(*) from information_schema.routines
+         where routine_name = 'checkin_recipients')                  as recipients_fn,
+       (select count(*) from information_schema.views
+         where table_name = 'my_checkin_feed')                       as feed_view,
+       (select count(*) from pg_trigger
+         where tgname in ('on_checkin_notify','on_place_notify')
+           and not tgisinternal)                                     as triggers;
+```
+
+A finished v13 reads `version 13`, `url` set to **this** project,
+`checkin_cols 3`, `prefs_table 1`, `recipients_fn 1`, `feed_view 1`,
+`triggers 2`.
+
+It counts objects rather than trusting `version` on purpose. The version
+number tells you which migration *last ran to completion* — it cannot
+tell you that the file which ran contained everything that version is
+supposed to contain. Re-running `db/schema.sql` fixes any shortfall; it
+is idempotent and touches no data.
+
 ---
 
 ## If something goes wrong

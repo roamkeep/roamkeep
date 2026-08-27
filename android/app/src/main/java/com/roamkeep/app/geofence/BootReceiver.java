@@ -1,6 +1,5 @@
 package com.roamkeep.app.geofence;
 
-import android.app.PendingIntent;
 import android.content.BroadcastReceiver;
 import android.content.Context;
 import android.content.Intent;
@@ -12,12 +11,7 @@ import androidx.work.NetworkType;
 import androidx.work.PeriodicWorkRequest;
 import androidx.work.WorkManager;
 
-import com.google.android.gms.location.Geofence;
-import com.google.android.gms.location.GeofencingClient;
-import com.google.android.gms.location.GeofencingRequest;
-import com.google.android.gms.location.LocationServices;
 
-import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.TimeUnit;
 
@@ -117,41 +111,14 @@ public class BootReceiver extends BroadcastReceiver {
      *  dead until the next app open). */
     static void reRegisterGeofences(Context context, PrefsStore prefs, String why) {
         List<PrefsStore.Place> places = prefs.getPlaces();
+        // Nothing stored means nothing to re-seed. Note this is NOT the
+        // same judgement GeofenceArmer makes about an empty list: there,
+        // empty means "the database says there are no places, prune".
+        // Here it means "we have never been told about any", and there is
+        // genuinely nothing to do until the app or a push tells us.
         if (places.isEmpty()) return;
 
-        GeofencingClient client = LocationServices.getGeofencingClient(context.getApplicationContext());
-        List<Geofence> list = new ArrayList<>();
-        for (PrefsStore.Place p : places) {
-            list.add(new Geofence.Builder()
-                    .setRequestId(p.id)
-                    .setCircularRegion(p.lat, p.lng, p.radius)
-                    .setExpirationDuration(Geofence.NEVER_EXPIRE)
-                    .setTransitionTypes(Geofence.GEOFENCE_TRANSITION_ENTER | Geofence.GEOFENCE_TRANSITION_EXIT)
-                    .build());
-        }
-        GeofencingRequest req = new GeofencingRequest.Builder()
-                // 0 = don't fire on initial state (e.g. already-inside)
-                .setInitialTrigger(0)
-                .addGeofences(list)
-                .build();
-
-        Intent receiver = new Intent(context.getApplicationContext(), GeofenceReceiver.class);
-        int flags = PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_MUTABLE;
-        PendingIntent pi = PendingIntent.getBroadcast(
-                context.getApplicationContext(), 0, receiver, flags);
-
-        try {
-            client.addGeofences(req, pi)
-                    .addOnSuccessListener(unused -> {
-                        Log.i(TAG, why + ": re-registered " + list.size() + " geofences");
-                        prefs.journal("geo: re-armed " + list.size() + " fence(s) (" + why + ")");
-                    })
-                    .addOnFailureListener(e -> {
-                        Log.w(TAG, why + ": re-register failed", e);
-                        prefs.journal("geo: RE-ARM FAILED (" + why + ") — " + e.getMessage());
-                    });
-        } catch (SecurityException e) {
-            Log.w(TAG, why + ": missing ACCESS_FINE_LOCATION?", e);
-        }
+        GeofenceArmer.Result r = GeofenceArmer.arm(context, places, why);
+        Log.i(TAG, why + ": re-registered " + r.armed + " geofences");
     }
 }

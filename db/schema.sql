@@ -137,7 +137,7 @@ CREATE TABLE IF NOT EXISTS location_history (
 -- trigger functions need it to reach their Edge Functions, and this file
 -- cannot know it when pasted into a SQL editor — it is set by the
 -- provisioning wizard, by set_project_url() on the owner's next app open,
--- or by hand.
+-- or by hand. The triggers no-op while it is NULL.
 CREATE TABLE IF NOT EXISTS roamkeep_meta (
   id             boolean PRIMARY KEY DEFAULT true CHECK (id),
   schema_version integer NOT NULL,
@@ -146,8 +146,46 @@ CREATE TABLE IF NOT EXISTS roamkeep_meta (
   updated_at     timestamptz NOT NULL DEFAULT now()
 );
 
+-- Per-person, per-place notification preferences (v13).
+--
+-- EXCEPTION ROWS ONLY: a row means "don't tell me", no row means "tell
+-- me". So an empty table is exactly today's behaviour, and the feature
+-- costs a family nothing until somebody uses it.
+--
+-- The three cascades are the whole garbage-collection story — delete a
+-- place or remove a member and the preferences referencing them go too.
+-- No cleanup job, and no way to accumulate rows pointing at nothing.
+CREATE TABLE IF NOT EXISTS keep_notify_prefs (
+  id                uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  keep_id           uuid NOT NULL REFERENCES keeps(id)        ON DELETE CASCADE,
+  member_id         uuid NOT NULL REFERENCES keep_members(id) ON DELETE CASCADE,  -- the viewer
+  subject_member_id uuid NOT NULL REFERENCES keep_members(id) ON DELETE CASCADE,
+  place_id          uuid NOT NULL REFERENCES keep_places(id)  ON DELETE CASCADE,
+  created_at        timestamptz NOT NULL DEFAULT now(),
+  UNIQUE (member_id, subject_member_id, place_id)
+);
+
 -- Patch columns onto databases that predate the migration that added
 -- them (no-op on a fresh install where they're already inline above).
+
+-- v13. checkins.place is a DISPLAY STRING (icon || ' ' || name), so
+-- matching a preference against it would be string comparison that a
+-- rename silently breaks. Added here rather than inline above because
+-- keep_places is created after checkins. Nullable and never backfilled:
+-- historical rows and manual/sos check-ins are NULL, and NULL is never
+-- muted.
+ALTER TABLE checkins
+  ADD COLUMN IF NOT EXISTS place_id uuid REFERENCES keep_places(id) ON DELETE SET NULL;
+
+-- v13. Where the member was when the row was written. Added for SOS:
+-- reading keep_members.lat/lng at render time answers "where are they
+-- NOW", so a week-old SOS in the activity log would show today's
+-- position — wrong in the one place being wrong matters most. Nullable
+-- and never backfilled; absence is normal, not an error.
+ALTER TABLE checkins
+  ADD COLUMN IF NOT EXISTS lat double precision,
+  ADD COLUMN IF NOT EXISTS lng double precision;
+
 ALTER TABLE keep_members
   ADD COLUMN IF NOT EXISTS fcm_token text,
   ADD COLUMN IF NOT EXISTS notify_on_checkin boolean NOT NULL DEFAULT true,
@@ -185,6 +223,14 @@ CREATE INDEX IF NOT EXISTS idx_checkins_member_time
 -- v8: "this user's join attempts in the last hour" — the rate limiter.
 CREATE INDEX IF NOT EXISTS idx_join_attempts_user_time
   ON keep_join_attempts(user_id, attempted_at DESC);
+
+-- v13: "which place was this check-in for" — the per-place mute join.
+CREATE INDEX IF NOT EXISTS idx_checkins_place
+  ON checkins(place_id) WHERE place_id IS NOT NULL;
+
+-- v13: the fan-out hot path — "does anyone mute this subject here?"
+CREATE INDEX IF NOT EXISTS idx_notify_prefs_fanout
+  ON keep_notify_prefs(keep_id, subject_member_id, place_id);
 
 
 -- ── REPLICA IDENTITY ──────────────────────────────────────
@@ -314,6 +360,39 @@ ALTER TABLE location_history   ENABLE ROW LEVEL SECURITY;
 -- DEFINER join RPC (running as owner) reads/writes it.
 ALTER TABLE keep_join_attempts ENABLE ROW LEVEL SECURITY;
 ALTER TABLE roamkeep_meta      ENABLE ROW LEVEL SECURITY;
+ALTER TABLE keep_notify_prefs  ENABLE ROW LEVEL SECURITY;
+
+-- KEEP_NOTIFY_PREFS — scoped to OWN rows, unlike the keep-wide read
+-- policies everywhere else in this file. Who you have quietly stopped
+-- hearing about is nobody else's business, including other members of
+-- your own Keep.
+DROP POLICY IF EXISTS "Members read own notify prefs" ON keep_notify_prefs;
+CREATE POLICY "Members read own notify prefs"
+  ON keep_notify_prefs FOR SELECT TO authenticated
+  USING (
+    keep_id IN (SELECT private_user_keep_ids())
+    AND member_id IN (SELECT id FROM keep_members WHERE user_id = auth.uid())
+  );
+
+DROP POLICY IF EXISTS "Members write own notify prefs" ON keep_notify_prefs;
+CREATE POLICY "Members write own notify prefs"
+  ON keep_notify_prefs FOR INSERT TO authenticated
+  WITH CHECK (
+    keep_id IN (SELECT private_user_keep_ids())
+    AND member_id IN (SELECT id FROM keep_members WHERE user_id = auth.uid())
+    -- Subject and place must belong to the SAME keep, or a member could
+    -- write a row referencing another family's ids.
+    AND subject_member_id IN (SELECT id FROM keep_members WHERE keep_id = keep_notify_prefs.keep_id)
+    AND place_id IN (SELECT id FROM keep_places WHERE keep_id = keep_notify_prefs.keep_id)
+  );
+
+DROP POLICY IF EXISTS "Members delete own notify prefs" ON keep_notify_prefs;
+CREATE POLICY "Members delete own notify prefs"
+  ON keep_notify_prefs FOR DELETE TO authenticated
+  USING (
+    keep_id IN (SELECT private_user_keep_ids())
+    AND member_id IN (SELECT id FROM keep_members WHERE user_id = auth.uid())
+  );
 
 -- ROAMKEEP_META — readable by everyone including anon, because the
 -- version check runs at connect time, BEFORE sign-in, and so cannot
@@ -546,6 +625,222 @@ END$$;
 
 REVOKE ALL ON FUNCTION public.set_project_url(text) FROM public, anon;
 GRANT EXECUTE ON FUNCTION public.set_project_url(text) TO authenticated;
+
+
+-- ── v13: THE MUTE RULE, STATED ONCE, READ TWO WAYS ────────
+--
+-- The two consumers ask opposite questions about the same rule:
+--   * The Edge Function: "given this check-in, who should be woken?"
+--     — one row in, many members out.
+--   * A device: "given me, which recent check-ins should I raise?"
+--     — one member in, many rows out.
+--
+-- Both are written out below so neither can drift from the other. SOS
+-- ignores every mute, and a check-in with no place_id (manual, or written
+-- before v13) is never muted either.
+
+CREATE OR REPLACE FUNCTION checkin_recipients(p_checkin uuid)
+RETURNS TABLE (member_id uuid, fcm_token text)
+LANGUAGE sql
+SECURITY DEFINER
+SET search_path = public
+STABLE
+AS $$
+  SELECT m.id, m.fcm_token
+  FROM checkins c
+  JOIN keep_members m ON m.keep_id = c.keep_id
+  WHERE c.id = p_checkin
+    AND m.id <> c.member_id
+    AND m.fcm_token IS NOT NULL
+    AND (
+      c.type = 'sos'
+      OR (
+        m.notify_on_checkin
+        AND (
+          c.place_id IS NULL
+          OR NOT EXISTS (
+            SELECT 1 FROM keep_notify_prefs p
+            WHERE p.member_id = m.id
+              AND p.subject_member_id = c.member_id
+              AND p.place_id = c.place_id
+          )
+        )
+      )
+    )
+$$;
+
+REVOKE ALL ON FUNCTION public.checkin_recipients(uuid) FROM public, anon, authenticated;
+GRANT EXECUTE ON FUNCTION public.checkin_recipients(uuid) TO service_role;
+
+-- The device's view of its own feed. security_invoker so the caller's JWT
+-- and RLS apply — which is what lets a phone filter server-side and hold
+-- NO local copy of anyone's preferences. A mute set mirrored into
+-- SharedPreferences would be a fourth instance of the native-state
+-- divergence bug documented in the project guide; this is the way
+-- around it.
+--
+-- Requires PG15+ (Supabase is well past it). A self-hoster on PG14 would
+-- need this as a SECURITY DEFINER function filtering on auth.uid(),
+-- reachable over GET /rest/v1/rpc/ so the device's fetch path still works.
+DROP VIEW IF EXISTS my_checkin_feed;
+CREATE VIEW my_checkin_feed
+WITH (security_invoker = true) AS
+  SELECT c.id, c.keep_id, c.member_name, c.member_avatar,
+         c.type, c.place, c.place_id, c.created_at
+  FROM checkins c
+  JOIN keep_members me
+    ON me.keep_id = c.keep_id
+   AND me.user_id = auth.uid()
+  WHERE c.member_id <> me.id
+    AND (
+      c.type = 'sos'
+      OR (
+        me.notify_on_checkin
+        AND (
+          c.place_id IS NULL
+          OR NOT EXISTS (
+            SELECT 1 FROM keep_notify_prefs p
+            WHERE p.member_id = me.id
+              AND p.subject_member_id = c.member_id
+              AND p.place_id = c.place_id
+          )
+        )
+      )
+    );
+
+GRANT SELECT ON my_checkin_feed TO authenticated;
+
+
+-- ── v13: WEBHOOK TRIGGERS ─────────────────────────────────
+--
+-- These live here, not only in the setup wizard, because most owners
+-- upgrade by re-pasting THIS FILE into the SQL editor. A trigger that
+-- only the wizard creates is a trigger half the deployments never get —
+-- which for place sync would mean the feature silently never working.
+--
+-- pg_net directly rather than supabase_functions.http_request: that
+-- helper's schema only exists once someone has used the dashboard's
+-- Webhooks UI, so depending on it would mean depending on the manual step
+-- this replaces.
+--
+-- Both read the project URL from roamkeep_meta and do nothing while it is
+-- NULL, so a partly configured database degrades to "no push" instead of
+-- erroring on every write.
+
+CREATE EXTENSION IF NOT EXISTS pg_net;
+
+-- keep_places → notify-places. INSERT, UPDATE and DELETE: a device needs
+-- to re-arm for a new place, re-arm for a moved or renamed one, and prune
+-- a deleted one. DELETE carries keep_id in old_record only because
+-- keep_places is REPLICA IDENTITY FULL (above).
+CREATE OR REPLACE FUNCTION public.roamkeep_notify_places()
+  RETURNS trigger
+  LANGUAGE plpgsql
+  SECURITY DEFINER
+  SET search_path = public, net
+AS $fn$
+DECLARE
+  v_url text;
+  v_row jsonb;
+  v_old jsonb;
+  -- AFTER triggers ignore the return value, but it must still be a valid
+  -- record — and COALESCE(NEW, OLD) is not one, since both are plpgsql
+  -- `record` and COALESCE needs a resolvable common type.
+  v_ret record;
+BEGIN
+  IF TG_OP = 'DELETE' THEN v_ret := OLD; ELSE v_ret := NEW; END IF;
+
+  SELECT project_url INTO v_url FROM roamkeep_meta;
+  IF v_url IS NULL THEN
+    RETURN v_ret;
+  END IF;
+
+  IF TG_OP = 'DELETE' THEN
+    v_row := NULL;
+    v_old := to_jsonb(OLD);
+  ELSE
+    v_row := to_jsonb(NEW);
+    v_old := CASE WHEN TG_OP = 'UPDATE' THEN to_jsonb(OLD) ELSE NULL END;
+  END IF;
+
+  PERFORM net.http_post(
+    url     := v_url || '/functions/v1/notify-places',
+    headers := jsonb_build_object('Content-Type', 'application/json'),
+    body    := jsonb_build_object(
+                 'type',       TG_OP,
+                 'table',      'keep_places',
+                 'schema',     'public',
+                 'record',     v_row,
+                 'old_record', v_old
+               ),
+    timeout_milliseconds := 5000
+  );
+  RETURN v_ret;
+EXCEPTION WHEN OTHERS THEN
+  -- Sync is best-effort. A webhook problem must never stop someone
+  -- adding or deleting a place.
+  RETURN v_ret;
+END;
+$fn$;
+
+-- Trigger-only: never RPC-callable. Supabase's default privileges grant
+-- EXECUTE to anon and authenticated BY NAME, so revoking PUBLIC alone
+-- leaves it exposed at /rest/v1/rpc/ (advisor 0028/0029). See the v10
+-- migration — this is the same trap, and it applies to every new function.
+REVOKE ALL ON FUNCTION public.roamkeep_notify_places() FROM public, anon, authenticated;
+
+DROP TRIGGER IF EXISTS on_place_notify ON public.keep_places;
+CREATE TRIGGER on_place_notify
+  AFTER INSERT OR UPDATE OR DELETE ON public.keep_places
+  FOR EACH ROW
+  EXECUTE FUNCTION public.roamkeep_notify_places();
+
+-- checkins → notify-checkin. Created here ONLY when it does not already
+-- exist, which is the whole point of the guard: a live family's copy was
+-- written by the setup wizard with the project URL baked into its body
+-- and is working. Replacing it with this roamkeep_meta-reading version
+-- would silently kill their push notifications for as long as
+-- project_url stayed NULL. New and dashboard-upgraded projects get a
+-- working trigger from this file; existing ones keep theirs untouched.
+DO $$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_proc p
+    JOIN pg_namespace n ON n.oid = p.pronamespace
+    WHERE n.nspname = 'public' AND p.proname = 'roamkeep_notify_checkin'
+  ) THEN
+    EXECUTE $body$
+      CREATE OR REPLACE FUNCTION public.roamkeep_notify_checkin()
+        RETURNS trigger
+        LANGUAGE plpgsql
+        SECURITY DEFINER
+        SET search_path = public, net
+      AS $fn$
+      DECLARE
+        v_url text;
+      BEGIN
+        SELECT project_url INTO v_url FROM roamkeep_meta;
+        IF v_url IS NULL THEN RETURN NEW; END IF;
+        PERFORM net.http_post(
+          url     := v_url || '/functions/v1/notify-checkin',
+          headers := jsonb_build_object('Content-Type', 'application/json'),
+          body    := jsonb_build_object(
+                       'type', 'INSERT', 'table', 'checkins', 'schema', 'public',
+                       'record', to_jsonb(NEW), 'old_record', NULL),
+          timeout_milliseconds := 5000
+        );
+        RETURN NEW;
+      EXCEPTION WHEN OTHERS THEN
+        RETURN NEW;
+      END;
+      $fn$;
+    $body$;
+    EXECUTE 'REVOKE ALL ON FUNCTION public.roamkeep_notify_checkin() FROM public, anon, authenticated';
+    EXECUTE 'DROP TRIGGER IF EXISTS on_checkin_notify ON public.checkins';
+    EXECUTE 'CREATE TRIGGER on_checkin_notify AFTER INSERT ON public.checkins '
+         || 'FOR EACH ROW EXECUTE FUNCTION public.roamkeep_notify_checkin()';
+  END IF;
+END$$;
 
 CREATE OR REPLACE FUNCTION create_keep(
   p_family_name text,
@@ -1068,6 +1363,12 @@ BEGIN
                  WHERE pubname = 'supabase_realtime' AND tablename = 'location_history') THEN
     ALTER PUBLICATION supabase_realtime ADD TABLE location_history;
   END IF;
+  -- v13: so a second device belonging to the same person picks up a
+  -- notification-preference change without a manual refresh.
+  IF NOT EXISTS (SELECT 1 FROM pg_publication_tables
+                 WHERE pubname = 'supabase_realtime' AND tablename = 'keep_notify_prefs') THEN
+    ALTER PUBLICATION supabase_realtime ADD TABLE keep_notify_prefs;
+  END IF;
 END$$;
 
 -- ── RETENTION ─────────────────────────────────────────────
@@ -1107,9 +1408,9 @@ END$$;
 -- upgrade path, and it must never walk a database BACKWARDS if someone
 -- runs an older checkout of it against a newer database.
 
-INSERT INTO roamkeep_meta (id, schema_version) VALUES (true, 12)
+INSERT INTO roamkeep_meta (id, schema_version) VALUES (true, 13)
   ON CONFLICT (id) DO UPDATE
-    SET schema_version = GREATEST(roamkeep_meta.schema_version, 12),
+    SET schema_version = GREATEST(roamkeep_meta.schema_version, 13),
         updated_at = now();
 
 

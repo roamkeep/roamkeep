@@ -492,108 +492,39 @@ public class NativeGeofencePlugin extends Plugin {
     @PluginMethod
     public void armPlaces(PluginCall call) {
         JSArray arr = call.getArray("places");
-        JSObject res = new JSObject();
         if (arr == null) { call.reject("places array required"); return; }
 
-        PrefsStore prefs = new PrefsStore(getContext());
-        List<Geofence> fences = new ArrayList<>();
-        java.util.Set<String> wanted = new java.util.HashSet<>();
-        int stored = 0;
+        // Parse here; arm in GeofenceArmer. The arming logic moved out so
+        // that BootReceiver and RoamkeepMessagingService — neither of
+        // which has a Capacitor bridge — can run the identical
+        // arm-and-prune. This method is now just the bridge adapter.
+        List<PrefsStore.Place> places = new ArrayList<>();
         try {
             for (int i = 0; i < arr.length(); i++) {
                 JSONObject o = arr.getJSONObject(i);
                 String id   = o.optString("id", null);
                 String name = o.optString("name", null);
                 if (id == null || name == null) continue;
-                wanted.add(id);
-                float radius = (float) o.optDouble("radius", 100);
-                double lat = o.optDouble("lat"), lng = o.optDouble("lng");
-                // Metadata first and unconditionally, so a device that
-                // can't arm yet is still repairable later.
-                prefs.putPlace(new PrefsStore.Place(
-                        id, name, o.optString("icon", "📍"), lat, lng, radius));
-                stored++;
-                fences.add(new Geofence.Builder()
-                        .setRequestId(id)
-                        .setCircularRegion(lat, lng, radius)
-                        .setExpirationDuration(Geofence.NEVER_EXPIRE)
-                        .setTransitionTypes(Geofence.GEOFENCE_TRANSITION_ENTER
-                                | Geofence.GEOFENCE_TRANSITION_EXIT)
-                        .build());
+                places.add(new PrefsStore.Place(
+                        id, name, o.optString("icon", "📍"),
+                        o.optDouble("lat"), o.optDouble("lng"),
+                        (float) o.optDouble("radius", 100)));
             }
         } catch (JSONException e) {
             call.reject("bad places payload", e);
             return;
         }
 
-        // The caller passes the COMPLETE current place list, so anything
-        // still registered that is not in it has been deleted. Prune it.
-        //
-        // Without this a deleted place lived on forever: addGeofences only
-        // replaces fences by requestId and never removes absent ones, and
-        // putPlace only writes. A place deleted on one device while another
-        // was backgrounded therefore kept firing arrived/left on that
-        // device — headless, from stale PrefsStore metadata, under its old
-        // name and icon — with nothing on screen to explain where a
-        // check-in for a place that no longer exists was coming from.
-        // The realtime DELETE path (syncNativeRemovePlace) only covers a
-        // device that happened to be in the foreground at the time.
-        //
-        // Also drop the stale inside-flag, or the prune itself would leave
-        // a place marked "inside" that can never be left.
-        List<String> dead = new ArrayList<>();
-        for (PrefsStore.Place p : prefs.getPlaces()) {
-            if (!wanted.contains(p.id)) dead.add(p.id);
-        }
-        if (!dead.isEmpty()) {
-            for (String id : dead) {
-                prefs.removePlace(id);
-                prefs.removeInsidePlace(id);
-            }
-            try {
-                LocationServices.getGeofencingClient(getContext()).removeGeofences(dead);
-            } catch (Exception e) {
-                Log.w(TAG, "removeGeofences(dead) failed", e);
-            }
-            prefs.journal("geo: pruned " + dead.size() + " deleted place(s)");
-        }
+        GeofenceArmer.Result r = GeofenceArmer.arm(getContext(), places, "app");
+        // Record what we just armed so a headless reconcile can tell
+        // whether anything actually changed since.
+        new PrefsStore(getContext()).setPlacesSignature(GeofenceArmer.signature(places));
 
-        if (fences.isEmpty()) {
-            res.put("armed", 0); res.put("stored", stored);
-            call.resolve(res);
-            return;
-        }
-        if (!haveFineLocation()) {
-            prefs.journal("geo: " + stored + " place(s) stored but NOT armed (no location permission)");
-            res.put("armed", 0); res.put("stored", stored);
-            call.resolve(res);
-            return;
-        }
-
-        final int n = fences.size();
-        final int storedCount = stored;   // lambda capture needs it final
-        final boolean bg = haveBackgroundLocation();
-        GeofencingRequest req = new GeofencingRequest.Builder()
-                .setInitialTrigger(0)
-                .addGeofences(fences)
-                .build();
-        try {
-            client().addGeofences(req, pendingIntent())
-                    .addOnSuccessListener(unused -> {
-                        prefs.journal("geo: armed " + n + " fence(s)"
-                                + (bg ? "" : " (foreground only — no background permission)"));
-                        JSObject ok = new JSObject();
-                        ok.put("armed", n); ok.put("stored", storedCount);
-                        call.resolve(ok);
-                    })
-                    .addOnFailureListener(e -> {
-                        Log.w(TAG, "armPlaces failed", e);
-                        prefs.journal("geo: ARM FAILED (" + n + " fence(s)) — " + e.getMessage());
-                        call.reject(e.getMessage(), e);
-                    });
-        } catch (SecurityException e) {
-            call.reject(e.getMessage(), e);
-        }
+        JSObject res = new JSObject();
+        res.put("armed", r.armed);
+        res.put("stored", r.stored);
+        res.put("pruned", r.pruned);
+        call.resolve(res);
     }
 
     @PluginMethod

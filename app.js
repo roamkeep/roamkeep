@@ -42,6 +42,9 @@
     '🐶', '🐱', '🦊', '🐷', '🐮', '🐻', '🐼', '🐨', '🐻‍❄️', '🦁', '🐯', '🐰', '🐵', '🐸', '🐔', '🐧', '🦉', '🦄', '🐢', '🦘', '🐊'];
   const TILE_SIZE = 256;
   const DEFAULT_CENTRE = { lat: -33.87, lng: 151.21, zoom: 13 };
+  // Zoom range. S.mZoom is fractional between these (pinch); the zoom
+  // buttons step whole levels.
+  const MIN_ZOOM = 2, MAX_ZOOM = 18;
 
   // ── SCHEMA COMPATIBILITY ───────────────────────────────────────
   //
@@ -55,7 +58,7 @@
   //
   // NEEDS_SCHEMA is the minimum version THIS build requires. Raise it in
   // the same commit that starts using a new table, column or RPC.
-  const NEEDS_SCHEMA = 11;
+  const NEEDS_SCHEMA = 13;
 
   // What to assume when roamkeep_meta / roamkeep_schema_version() is
   // absent. Every database provisioned before v12 is at 11 (the last
@@ -64,11 +67,13 @@
   // without locking anyone out.
   const SCHEMA_PRE_META = 11;
 
-  // Deliberately equal to SCHEMA_PRE_META in this release: the gate ships
-  // INERT. A gate that demanded its own migration would lock every member
-  // out until their owner acted — the mechanism's first act in the world
-  // would be an outage it caused. It proves itself in the field first, and
-  // the release that actually needs something new is the first to raise it.
+  // 4.7.0 shipped this equal to SCHEMA_PRE_META, so the gate was INERT on
+  // arrival — a gate that demanded its own migration would have locked
+  // every member out until their owner acted, making the mechanism's
+  // first act in the world an outage it caused. 4.8.0 is the first
+  // release to raise it, and it can only do that safely because 4.7.0 is
+  // already installed and will show the outdated screen rather than
+  // failing at whichever call needs keep_notify_prefs.
 
   // ── STATE ──────────────────────────────────────────────────────
   const S = {
@@ -87,6 +92,7 @@
     mLng: DEFAULT_CENTRE.lng,
     mZoom: DEFAULT_CENTRE.zoom,
     tiles: {},
+    pinching: false,           // true mid-pinch: suppresses tile fetches
     dragging: false,
     dragStart: null,
     viewStart: null,
@@ -108,9 +114,13 @@
     tlTrips: [],               // timeline: current day's trips, kept for tap-to-draw
     // The database's own schema version, read once at connect. Kept even
     // when the check passes: this is what a future per-feature fallback
-    // reads (`if (S.schemaVersion >= N) … else …`) if we ever switch from
-    // refusing to degrading.
-    schemaVersion: null
+    // reads (`if (S.schemaVersion >= 13) … else …`) if we ever switch
+    // from refusing to degrading.
+    schemaVersion: null,
+    placeNotifyFor: null,      // place id while the per-place notify sheet is open
+    // Per-place notification mutes, as a Set of 'subjectMemberId|placeId'.
+    // Exception rows only — presence means MUTED. See loadNotifyPrefs.
+    notifyPrefs: new Set()
   };
 
   const PLACE_ICONS = ['🏠', '🏫', '🏢', '🛒', '🏋️', '🏥', '⛪', '🌳', '🍴', '📍'];
@@ -945,6 +955,11 @@
     await loadTwice(loadMembers);
     await loadTwice(loadCheckins);
     await loadTwice(loadPlaces);
+    // After loadMembers (needs S.myId) and loadPlaces (the sheet lists
+    // places). Failure leaves the last known set alone and simply means
+    // nothing is muted this session — the server-side filters still hold,
+    // so the worst case is a toast that should have been suppressed.
+    await loadNotifyPrefs();
     warnIfEmpty();
     initMap();
     subscribeRT();
@@ -1093,9 +1108,9 @@
         S.channel = null;
         subscribeRT();
       }
-      // Flush tile cache — viewport may have moved hundreds of km
-      // since the last drawMap, and the cached tiles are now in the
-      // wrong place.
+      // Drop the tile cache. Not because the tiles are wrong — they are
+      // keyed zoom/x/y, so they never are — but because the viewport may
+      // have moved hundreds of km and none of them will be wanted again.
       S.tiles = {};
       // Restart the watcher (fire-and-forget; the new watcher will
       // push a fresh fix via pushLocation, which clears the stale
@@ -1118,6 +1133,9 @@
       // from a member row that had not arrived yet.
       await loadTwice(loadMembers);
       await Promise.all([loadTwice(loadCheckins), loadTwice(loadPlaces)]);
+      // Realtime is dropped while backgrounded, so a preference changed
+      // on this person's other device only arrives via this refetch.
+      await loadNotifyPrefs();
       warnIfEmpty();
     } catch (e) { console.warn('resume refetch', e); }
 
@@ -1260,6 +1278,47 @@
     return true;
   }
 
+  // ── PER-PLACE NOTIFICATION PREFERENCES ─────────────────────────
+  //
+  // EXCEPTION ROWS ONLY: a row means "don't tell me about this person at
+  // this place". No row means notify. So an empty set is exactly the
+  // behaviour that existed before the feature, and nothing needs
+  // migrating or defaulting.
+  //
+  // Held as a Set of 'subjectMemberId|placeId' — membership is the only
+  // question ever asked of it.
+  const prefKey = (subjectId, placeId) => subjectId + '|' + placeId;
+
+  const isMuted = (subjectId, placeId) =>
+    !!(S.notifyPrefs && S.notifyPrefs.has(prefKey(subjectId, placeId)));
+
+  async function loadNotifyPrefs() {
+    if (!S.myId) return false;
+    const { data, error } = await S.sb.from('keep_notify_prefs')
+      .select('subject_member_id,place_id')
+      .eq('member_id', S.myId);
+    // NEVER let a failed read overwrite good state. `= data || []` on a
+    // failed request is what once replaced a whole family with an empty
+    // list and then refilled it one realtime event at a time, showing a
+    // plausible but wrong household that healed itself over minutes.
+    // Here the equivalent would be silently un-muting everything.
+    if (error) { console.warn('loadNotifyPrefs', error); return false; }
+    S.notifyPrefs = new Set((data || []).map(r => prefKey(r.subject_member_id, r.place_id)));
+    return true;
+  }
+
+  // Should a check-in about `subjectId` at `placeId` reach me at all?
+  // Mirrors checkin_recipients() / my_checkin_feed in SQL — this copy
+  // exists only for the in-app toast, which never goes near the server.
+  function shouldAnnounce(ci) {
+    if (!ci || ci.member_id === S.myId) return false;
+    if (ci.type === 'sos') return true;              // never muteable
+    const me = myMember();
+    if (me && me.notify_on_checkin === false) return false;   // global mute
+    if (!ci.place_id) return true;                   // manual / pre-v13
+    return !isMuted(ci.member_id, ci.place_id);
+  }
+
   // ── REALTIME ───────────────────────────────────────────────────
   function subscribeRT() {
     S.channel = S.sb.channel('keep:' + S.keepId)
@@ -1304,7 +1363,15 @@
         if (!ci) return;
         S.checkins.unshift(ci);
         renderCheckins();
-        if (ci.member_id !== S.myId) toast('📍 ' + ci.member_name + ': ' + ci.place, 'ok');
+        // The activity list still shows everything — it is a log. Only
+        // the interruption is gated. Before v13 this toast consulted no
+        // preference at all, not even the existing global mute, so a
+        // member who had turned notifications off still got popped at
+        // whenever anyone moved while their app was open.
+        if (shouldAnnounce(ci)) {
+          toast((ci.type === 'sos' ? '🆘 ' : '📍 ') + ci.member_name + ': ' + ci.place,
+                ci.type === 'sos' ? 'bad' : 'ok');
+        }
       })
       .on('postgres_changes', {
         event: '*', schema: 'public', table: 'keep_places',
@@ -1331,7 +1398,30 @@
           syncNativeAddPlace(row);
         }
         renderPlaces();
+        // Member cards say where each person is IN TERMS OF PLACES, so a
+        // place added or removed changes what those lines should read —
+        // "1.4 km from Home" becomes "At School" the moment School
+        // exists. Without this they keep the old wording until something
+        // else happens to re-render them.
+        renderMembers();
         drawMap();
+      })
+      .on('postgres_changes', {
+        event: '*', schema: 'public', table: 'keep_notify_prefs',
+        filter: 'keep_id=eq.' + S.keepId
+      }, (p) => {
+        // RLS means only my own rows reach me, but the filter is on
+        // keep_id (that is all the realtime filter can express), so check
+        // member_id here too rather than trusting the stream's shape.
+        const row = p.eventType === 'DELETE' ? p.old : p.new;
+        if (!row || !S.myId || row.member_id !== S.myId) return;
+        const k = prefKey(row.subject_member_id, row.place_id);
+        if (p.eventType === 'DELETE') S.notifyPrefs.delete(k);
+        else S.notifyPrefs.add(k);
+        // Only redraws the summary counts; the sheet, if open, re-reads
+        // from the same Set.
+        renderPlaces();
+        if (S.placeNotifyFor) renderPlaceNotifySheet();
       })
       .on('postgres_changes', {
         event: 'INSERT', schema: 'public', table: 'location_history',
@@ -1414,15 +1504,58 @@
           Math.abs(clientY - lpStart.y) > LONG_PRESS_SLOP_PX) lpCancel();
     }
 
+    // ── Pan (one finger) and pinch-zoom (two) ────────────────────
+    //
+    // Both are implemented here rather than left to the browser, and that
+    // is deliberate: the viewport meta sets user-scalable=no and #map-wrap
+    // sets touch-action:none, because a browser pinch would scale the
+    // whole app shell — buttons, text, and this canvas as a stretched
+    // bitmap — instead of zooming the map. Neither should be relaxed.
     let t0 = null;
+    let pinch = null;   // { dist, zoom, ax, ay } while two fingers are down
+
+    const touchDist = (a, b) => Math.hypot(a.clientX - b.clientX, a.clientY - b.clientY);
+
+    // Re-base the one-finger pan origin. Needed whenever the finger count
+    // changes: without it, lifting one finger from a pinch makes the map
+    // leap, because the pan handler would carry on from coordinates that
+    // belong to a gesture that has already ended.
+    function rebasePan(touch) {
+      t0 = { x: touch.clientX, y: touch.clientY, lat: S.mLat, lng: S.mLng };
+    }
+
+    function beginPinch(e) {
+      const rect = wrap.getBoundingClientRect();
+      const [a, b] = [e.touches[0], e.touches[1]];
+      pinch = {
+        dist: Math.max(1, touchDist(a, b)),
+        zoom: S.mZoom,
+        ax: (a.clientX + b.clientX) / 2 - rect.left,
+        ay: (a.clientY + b.clientY) / 2 - rect.top
+      };
+      S.pinching = true;   // suppresses tile fetches until the gesture ends
+    }
+
+    function endPinch() {
+      if (!pinch) return;
+      pinch = null;
+      S.pinching = false;
+      // Now — and only now — fetch whatever level we landed on.
+      drawMap();
+    }
+
     wrap.addEventListener('touchstart', (e) => {
       // Don't hijack taps on interactive children (zoom buttons, pins).
       // Calling preventDefault on touchstart would cancel the synthesized
       // click event, so we leave those alone entirely.
       if (e.target.closest('[data-action]')) { t0 = null; lpCancel(); return; }
       if (e.touches.length === 1) {
-        t0 = { x: e.touches[0].clientX, y: e.touches[0].clientY, lat: S.mLat, lng: S.mLng };
+        rebasePan(e.touches[0]);
         lpArm(e.touches[0].clientX, e.touches[0].clientY);
+      } else if (e.touches.length === 2) {
+        // A second finger is never a long press.
+        lpCancel();
+        beginPinch(e);
       } else {
         lpCancel();
       }
@@ -1431,6 +1564,14 @@
     }, { passive: true });
 
     wrap.addEventListener('touchmove', (e) => {
+      if (pinch && e.touches.length >= 2) {
+        const d = Math.max(1, touchDist(e.touches[0], e.touches[1]));
+        // Distance ratio → zoom levels: each doubling is one level.
+        zoomAbout(pinch.zoom + Math.log2(d / pinch.dist), pinch.ax, pinch.ay);
+        drawMap();
+        e.preventDefault();
+        return;
+      }
       if (!t0 || e.touches.length !== 1) { lpCancel(); return; }
       lpMaybeCancel(e.touches[0].clientX, e.touches[0].clientY);
       const dx = e.touches[0].clientX - t0.x;
@@ -1442,8 +1583,32 @@
       e.preventDefault();
     }, { passive: false });
 
-    wrap.addEventListener('touchend', lpCancel);
-    wrap.addEventListener('touchcancel', lpCancel);
+    wrap.addEventListener('touchend', (e) => {
+      lpCancel();
+      if (pinch && e.touches.length < 2) {
+        endPinch();
+        // One finger still down → hand back to panning, from where that
+        // finger actually is.
+        if (e.touches.length === 1) rebasePan(e.touches[0]);
+        else t0 = null;
+      }
+    });
+    wrap.addEventListener('touchcancel', () => { lpCancel(); endPinch(); t0 = null; });
+
+    // Desktop parity. The map had no scroll-to-zoom at all before; it is
+    // a few lines once the fractional path exists, and it anchors on the
+    // cursor for the same reason the pinch anchors between the fingers.
+    wrap.addEventListener('wheel', (e) => {
+      if (e.target.closest('[data-action]')) return;
+      e.preventDefault();
+      const rect = wrap.getBoundingClientRect();
+      // deltaMode 1 is lines, 2 is pages; normalise both to something
+      // near a pixel count so a trackpad and a mouse wheel feel alike.
+      const unit = e.deltaMode === 1 ? 16 : e.deltaMode === 2 ? 100 : 1;
+      const step = Math.max(-1, Math.min(1, (-e.deltaY * unit) / 300));
+      zoomAbout(S.mZoom + step, e.clientX - rect.left, e.clientY - rect.top);
+      drawMap();
+    }, { passive: false });
 
     wrap.addEventListener('mousedown', (e) => {
       if (e.target.closest('[data-action]')) return;
@@ -1472,52 +1637,122 @@
     drawMap();
   }
 
+  /**
+   * Stand in for a missing tile with the matching quadrant of an ancestor
+   * we already hold, scaled up.
+   *
+   * Without this, crossing a zoom level mid-pinch paints beige until the
+   * gesture settles and the new level is fetched — the map appears to
+   * blink out exactly while you are looking at it. A blown-up parent is
+   * blurry for a few hundred milliseconds and continuous, which is the
+   * trade every slippy map makes.
+   *
+   * Only ever reads the cache; never triggers a fetch. That matters
+   * during a pinch, when fetching is deliberately suspended.
+   */
+  function drawFromParent(ctx, z, tx, ty, px, py, pw, ph) {
+    // Two levels is enough to cover a pinch through one boundary, and
+    // bounds how blurry the stand-in is allowed to get.
+    for (let up = 1; up <= 2; up++) {
+      const pz = z - up;
+      if (pz < MIN_ZOOM) return false;
+      const f = 1 << up;                       // 2 or 4
+      const ptx = Math.floor(tx / f), pty = Math.floor(ty / f);
+      const t = S.tiles[pz + '/' + ptx + '/' + pty];
+      if (!t || t === 'loading' || t === 'err') continue;
+      // Which sub-square of the ancestor covers this tile.
+      const sub = TILE_SIZE / f;
+      const sxp = (tx - ptx * f) * sub;
+      const syp = (ty - pty * f) * sub;
+      ctx.drawImage(t, sxp, syp, sub, sub, px, py, pw, ph);
+      return true;
+    }
+    return false;
+  }
+
   function drawMap() {
     const canvas = $('map-canvas');
     if (!canvas || !S.mapCtx) return;
     const ctx = S.mapCtx;
     const W = canvas.width, H = canvas.height;
-    const n = Math.pow(2, S.mZoom);
+
+    // S.mZoom is FRACTIONAL (pinch), but OSM tiles only exist at whole
+    // zoom levels. So the two are separated: tileZ is what we fetch,
+    // S.mZoom is what we draw at, and each tile is scaled by the
+    // difference. Without this a pinch could only jump a whole level at a
+    // time, which reads as broken rather than as zooming.
+    //
+    // Everything else — ll2px, px2ll, metresToPx — was already written in
+    // terms of Math.pow(2, S.mZoom) and needs no change to work
+    // fractionally. Only this loop assumed an integer.
+    const tileZ = Math.max(MIN_ZOOM, Math.min(MAX_ZOOM, Math.round(S.mZoom)));
+    const scale = Math.pow(2, S.mZoom - tileZ);
+    const TS = TILE_SIZE * scale;
+
+    const n = Math.pow(2, tileZ);
     const cx = (S.mLng + 180) / 360 * n;
     const cy = (1 - Math.log(Math.tan(S.mLat * Math.PI / 180) + 1 / Math.cos(S.mLat * Math.PI / 180)) / Math.PI) / 2 * n;
     ctx.clearRect(0, 0, W, H);
 
-    const sx = Math.floor(cx - W / 2 / TILE_SIZE);
-    const sy = Math.floor(cy - H / 2 / TILE_SIZE);
-    const ex = Math.ceil(cx + W / 2 / TILE_SIZE);
-    const ey = Math.ceil(cy + H / 2 / TILE_SIZE);
+    const sx = Math.floor(cx - W / 2 / TS);
+    const sy = Math.floor(cy - H / 2 / TS);
+    const ex = Math.ceil(cx + W / 2 / TS);
+    const ey = Math.ceil(cy + H / 2 / TS);
 
     for (let tx = sx; tx <= ex; tx++) {
       for (let ty = sy; ty <= ey; ty++) {
-        const px = Math.round((tx - cx) * TILE_SIZE + W / 2);
-        const py = Math.round((ty - cy) * TILE_SIZE + H / 2);
-        const k = S.mZoom + '/' + tx + '/' + ty;
+        // Ceil the destination size so neighbouring tiles overlap by a
+        // sub-pixel instead of leaving hairline seams at fractional scale.
+        const px = Math.round((tx - cx) * TS + W / 2);
+        const py = Math.round((ty - cy) * TS + H / 2);
+        const pw = Math.ceil(TS) + 1, ph = Math.ceil(TS) + 1;
+        const k = tileZ + '/' + tx + '/' + ty;
         const tile = S.tiles[k];
-        if (tile && tile !== 'loading' && tile !== 'err') {
-          ctx.drawImage(tile, px, py, TILE_SIZE, TILE_SIZE);
-        } else {
+        const have = tile && tile !== 'loading' && tile !== 'err';
+
+        // WHAT TO PAINT and WHAT TO FETCH are decided separately, and must
+        // stay that way. Folding the fetch into the "nothing to paint"
+        // branch means a tile covered by a blown-up ancestor is never
+        // requested — the map looks fine, permanently blurry, and never
+        // sharpens, because the fallback is doing its job too well.
+        if (have) {
+          ctx.drawImage(tile, px, py, pw, ph);
+        } else if (!drawFromParent(ctx, tileZ, tx, ty, px, py, pw, ph)) {
           ctx.fillStyle = '#e8e0d0';
-          ctx.fillRect(px, py, TILE_SIZE - 1, TILE_SIZE - 1);
-          if (!tile) {
-            S.tiles[k] = 'loading';
-            const img = new Image();
-            img.crossOrigin = 'anonymous';
-            const ttx = ((tx % n) + n) % n;
-            // Canonical host, no a/b/c rotation. The OSM Tile Usage Policy
-            // says to use exactly tile.openstreetmap.org and that other
-            // subdomains "may be slower or withdrawn without notice" — the
-            // rotation was an HTTP/1.1 trick for connection parallelism that
-            // HTTP/2 multiplexing makes unnecessary anyway, and the policy
-            // recommends HTTP/2.
-            img.src = 'https://tile.openstreetmap.org/' + S.mZoom + '/' + ttx + '/' + ty + '.png';
-            ((key, i) => {
-              i.onload = () => { S.tiles[key] = i; drawMap(); };
-              i.onerror = () => { S.tiles[key] = 'err'; };
-            })(k, img);
-          }
+          ctx.fillRect(px, py, pw, ph);
+        }
+
+        // Don't start fetches MID-GESTURE. A pinch crosses zoom levels in
+        // a few hundred milliseconds, and requesting every level it passes
+        // through would be asking tile.openstreetmap.org for tiles nobody
+        // ever sees — against the "only for the viewport being drawn" line
+        // in the usage policy (see NOTICE.md), and slower besides. Scaled
+        // copies of what we already hold carry the gesture; the real tiles
+        // are fetched once it settles.
+        if (!tile && !S.pinching) {
+          S.tiles[k] = 'loading';
+          const img = new Image();
+          img.crossOrigin = 'anonymous';
+          const ttx = ((tx % n) + n) % n;
+          // Canonical host, no a/b/c rotation. The OSM Tile Usage Policy
+          // says to use exactly tile.openstreetmap.org and that other
+          // subdomains "may be slower or withdrawn without notice" — the
+          // rotation was an HTTP/1.1 trick for connection parallelism that
+          // HTTP/2 multiplexing makes unnecessary anyway, and the policy
+          // recommends HTTP/2.
+          img.src = 'https://tile.openstreetmap.org/' + tileZ + '/' + ttx + '/' + ty + '.png';
+          ((key, i) => {
+            i.onload = () => { S.tiles[key] = i; drawMap(); };
+            i.onerror = () => { S.tiles[key] = 'err'; };
+          })(k, img);
         }
       }
     }
+    // The cache is keyed zoom/x/y, so a tile is never in the wrong place
+    // and never needs flushing on a zoom change — this eviction is purely
+    // a memory bound. (Zoom handlers used to flush the whole cache, which
+    // made zooming out and back in re-request everything and, with a
+    // pinch, would have done so many times a second.)
     const keys = Object.keys(S.tiles);
     if (keys.length > 200) keys.slice(0, 60).forEach(k => delete S.tiles[k]);
     drawPlaceCircles(ctx);
@@ -1659,10 +1894,36 @@
     }
   }
 
+  // The +/- buttons still step WHOLE levels — rounding first so that
+  // pressing "+" after a pinch that left us at 14.3 goes to 15, not 15.3.
   function mapZoom(d) {
-    S.mZoom = Math.max(2, Math.min(18, S.mZoom + d));
-    S.tiles = {};
+    setZoom(Math.round(S.mZoom) + d);
     drawMap();
+  }
+
+  const clampZoom = (z) => Math.max(MIN_ZOOM, Math.min(MAX_ZOOM, z));
+
+  function setZoom(z) { S.mZoom = clampZoom(z); }
+
+  /**
+   * Zoom while keeping one screen point over the same piece of ground.
+   *
+   * The buttons zoom about the centre, which is fine because the centre
+   * doesn't move. A pinch or a wheel must instead keep whatever is under
+   * the fingers (or the cursor) exactly where it is — otherwise the map
+   * slides out from under you as you zoom, which feels broken even though
+   * the zoom itself is correct.
+   *
+   * Done with the existing projection helpers rather than new maths: read
+   * the lat/lng under the anchor before, change the zoom, then shift the
+   * centre by however far that same lat/lng has moved.
+   */
+  function zoomAbout(z, ax, ay) {
+    const before = px2ll(ax, ay);
+    setZoom(z);
+    const after = px2ll(ax, ay);
+    S.mLat += before.lat - after.lat;
+    S.mLng += before.lng - after.lng;
   }
 
   function mapCenter() {
@@ -1671,7 +1932,6 @@
       S.mLat = me.lat;
       S.mLng = me.lng;
       S.mZoom = 15;
-      S.tiles = {};
       drawMap();
     }
   }
@@ -1995,7 +2255,7 @@
     const me = S.members.find(m => m.id === S.myId);
     if (me) { me.lat = lat; me.lng = lng; }
     if (_gpsFirst) {
-      S.mLat = lat; S.mLng = lng; S.mZoom = 15; S.tiles = {};
+      S.mLat = lat; S.mLng = lng; S.mZoom = 15;
       _gpsFirst = false;
     }
 
@@ -2117,6 +2377,10 @@
           member_avatar: myAv,
           type: 'arrived',
           place: p.icon + ' ' + p.name,
+          // v13: `place` is a display string composed right here, so it
+          // can't be matched back to a place after a rename. place_id is
+          // what the per-place mute rule joins on.
+          place_id: p.id,
           created_at: ts
         });
         await S.sb.from('keep_members').update({ last_place_id: p.id })
@@ -2131,6 +2395,7 @@
           member_avatar: myAv,
           type: 'left',
           place: p.icon + ' ' + p.name,
+          place_id: p.id,
           created_at: ts
         });
         // Clear last_place_id only if this was the one they were in.
@@ -2209,8 +2474,10 @@
       ]));
       return;
     }
+    const others = S.members.filter(m => m.id !== S.myId);
     for (const p of S.places) {
       const inside = S.insidePlaces.has(p.id);
+      const mutedHere = others.filter(m => isMuted(m.id, p.id));
       host.appendChild(el('div', {
         class: 'pl-item' + (inside ? ' here' : ''),
         dataset: { action: 'focus-place', id: p.id }
@@ -2218,8 +2485,17 @@
         el('div', { class: 'pl-ic', text: p.icon }),
         el('div', { class: 'pl-main' }, [
           el('div', { class: 'pl-nm', text: p.name }),
-          el('div', { class: 'pl-sub', text: (inside ? 'You are here · ' : '') + p.radius_m + 'm radius' })
+          el('div', { class: 'pl-sub', text: (inside ? 'You are here · ' : '') + p.radius_m + 'm radius' }),
+          // Say what the setting IS, on the row, so it doesn't take a tap
+          // to find out that you have muted someone here and forgotten.
+          el('div', { class: 'pl-note', text: placeNotifySummary(p, others, mutedHere) })
         ]),
+        el('button', {
+          class: 'pl-btn' + (mutedHere.length ? ' muted' : ''),
+          dataset: { action: 'place-notify', id: p.id },
+          'aria-label': 'Who to notify me about at ' + p.name,
+          text: mutedHere.length ? '🔕' : '🔔'
+        }),
         el('button', {
           class: 'pl-btn',
           dataset: { action: 'edit-place', id: p.id },
@@ -2234,6 +2510,125 @@
         })
       ]));
     }
+  }
+
+  // One line describing who this place will notify me about.
+  function placeNotifySummary(p, others, mutedHere) {
+    const me = myMember();
+    if (me && me.notify_on_checkin === false) return '🔕 All notifications are off';
+    if (!others.length) return '';
+    if (!mutedHere.length) return '🔔 Everyone';
+    if (mutedHere.length === others.length) return '🔕 Nobody';
+    // Naming them is more useful than a count while a family is small,
+    // and a family that outgrows it gets the count.
+    if (mutedHere.length <= 2) {
+      return '🔕 Not ' + mutedHere.map(m => m.name).join(' or ');
+    }
+    return '🔔 ' + (others.length - mutedHere.length) + ' of ' + others.length;
+  }
+
+  // ── PER-PLACE NOTIFY SHEET ─────────────────────────────────────
+  function openPlaceNotify(placeId) {
+    S.placeNotifyFor = placeId;
+    renderPlaceNotifySheet();
+    closeDrawer();
+    const sheet = $('pn-sheet');
+    const scrim = $('pn-scrim');
+    if (sheet) { sheet.classList.remove('full'); sheet.classList.add('half', 'open'); }
+    if (scrim) scrim.classList.add('on');
+    document.body.classList.add('sheet-open');
+  }
+
+  function closePlaceNotify() {
+    const sheet = $('pn-sheet');
+    const scrim = $('pn-scrim');
+    if (sheet) sheet.classList.remove('open', 'half', 'full');
+    if (scrim) scrim.classList.remove('on');
+    document.body.classList.remove('sheet-open');
+    S.placeNotifyFor = null;
+  }
+
+  function renderPlaceNotifySheet() {
+    const p = S.places.find(x => x.id === S.placeNotifyFor);
+    const host = $('pn-list');
+    if (!p || !host) return;
+
+    const title = $('pn-title');
+    if (title) title.textContent = p.icon + ' ' + p.name;
+
+    const me = myMember();
+    const globallyOff = !!(me && me.notify_on_checkin === false);
+    const warn = $('pn-global-off');
+    if (warn) warn.style.display = globallyOff ? 'block' : 'none';
+
+    clear(host);
+    const others = S.members.filter(m => m.id !== S.myId);
+    if (!others.length) {
+      host.appendChild(el('div', { class: 'empty' }, ['Nobody else in your Keep yet']));
+      return;
+    }
+    for (const m of others) {
+      const on = !isMuted(m.id, p.id);
+      const cb = el('input', {
+        type: 'checkbox',
+        id: 'pn-' + m.id,
+        dataset: { action: 'toggle-place-notify', id: m.id }
+      });
+      cb.checked = on;
+      cb.disabled = globallyOff;
+      host.appendChild(el('div', { class: 'setting-row' }, [
+        el('span', { class: 'setting-lbl' }, [
+          el('span', { class: 'pn-av', text: m.avatar || '🙂' }),
+          m.name
+        ]),
+        el('label', { class: 'switch', for: 'pn-' + m.id }, [
+          cb,
+          el('span', { class: 'switch-slider' })
+        ])
+      ]));
+    }
+  }
+
+  // Mute = INSERT a row, un-mute = DELETE it. Optimistic with rollback,
+  // same shape as toggleNotify.
+  async function togglePlaceNotify(t, subjectId) {
+    const placeId = S.placeNotifyFor;
+    if (!placeId || !S.myId) return;
+    const wantOn = !!t.checked;          // checked = notify me = no row
+    const k = prefKey(subjectId, placeId);
+    const member = S.members.find(m => m.id === subjectId);
+    const name = member ? member.name : 'them';
+
+    if (wantOn) S.notifyPrefs.delete(k); else S.notifyPrefs.add(k);
+    renderPlaces();
+
+    let error;
+    if (wantOn) {
+      ({ error } = await S.sb.from('keep_notify_prefs').delete()
+        .eq('member_id', S.myId)
+        .eq('subject_member_id', subjectId)
+        .eq('place_id', placeId));
+    } else {
+      ({ error } = await S.sb.from('keep_notify_prefs').insert({
+        keep_id: S.keepId,
+        member_id: S.myId,
+        subject_member_id: subjectId,
+        place_id: placeId
+      }));
+    }
+
+    if (error) {
+      // Put the Set and the switch back — a preference that looks saved
+      // and isn't is worse than one that visibly failed.
+      if (wantOn) S.notifyPrefs.add(k); else S.notifyPrefs.delete(k);
+      t.checked = !wantOn;
+      renderPlaces();
+      toast('Could not save that: ' + error.message, 'err');
+      return;
+    }
+    const place = S.places.find(x => x.id === placeId);
+    const where = place ? place.name : 'this place';
+    toast(wantOn ? '🔔 ' + name + ' at ' + where : '🔕 Muted ' + name + ' at ' + where, 'ok');
   }
 
   function initPlaceIconPicker() {
@@ -2302,7 +2697,7 @@
     document.body.classList.add('sheet-open');
 
     // Centre the map on the place so the preview ring is visible.
-    S.mLat = lat; S.mLng = lng; S.mZoom = Math.max(S.mZoom, 15); S.tiles = {};
+    S.mLat = lat; S.mLng = lng; S.mZoom = Math.max(S.mZoom, 15);
     drawMap();
   }
 
@@ -2394,7 +2789,7 @@
   function focusPlace(id) {
     const p = S.places.find(x => x.id === id);
     if (!p) return;
-    S.mLat = p.lat; S.mLng = p.lng; S.mZoom = 16; S.tiles = {};
+    S.mLat = p.lat; S.mLng = p.lng; S.mZoom = 16;
     drawMap();
     $('sidebar')?.classList.remove('mob');
   }
@@ -2545,6 +2940,79 @@
   }
 
   // ── RENDER (safe — no innerHTML concat of user data) ───────────
+  // ── WHERE SOMEONE IS, IN WORDS ─────────────────────────────────
+  //
+  // Everything here is computed ON THIS DEVICE from data the family
+  // already holds. There is deliberately no reverse geocoding: turning
+  // coordinates into "Near Bondi Junction" means sending a family
+  // member's live position to a third party on every render, which is
+  // exactly what this app promises never to happen. A nearest-saved-place
+  // reading is less precise and costs nobody anything.
+
+  // Beyond this, "3 km from Home" stops being a useful description of
+  // where someone is and becomes a fact about how far away Home is.
+  const NEAR_PLACE_MAX_M = 5000;
+
+  /** Decimal degrees — the one format Google Maps, Apple Maps and Waze
+   *  all accept pasted into search. 5dp is ~1 m, past which we would be
+   *  quoting precision GPS does not have. */
+  function formatCoords(lat, lng) {
+    return Number(lat).toFixed(5) + ', ' + Number(lng).toFixed(5);
+  }
+
+  /** The saved place a position is inside, or null. */
+  function placeContaining(lat, lng) {
+    for (const p of (S.places || [])) {
+      if (distanceM(lat, lng, p.lat, p.lng) <= p.radius_m) return p;
+    }
+    return null;
+  }
+
+  /** Nearest saved place and how far, or null when there are no places. */
+  function nearestPlace(lat, lng) {
+    let best = null, bestD = Infinity;
+    for (const p of (S.places || [])) {
+      const d = distanceM(lat, lng, p.lat, p.lng);
+      if (d < bestD) { bestD = d; best = p; }
+    }
+    return best ? { place: best, metres: bestD } : null;
+  }
+
+  function formatDistance(m) {
+    if (m < 1000) return Math.round(m / 10) * 10 + ' m';
+    return (m / 1000).toFixed(m < 10000 ? 1 : 0) + ' km';
+  }
+
+  /**
+   * One line saying where a member is.
+   *
+   * Order of preference: the place they are checked into, then the
+   * nearest saved place if one is close enough to be a landmark, then
+   * raw coordinates. Returns '' when there is no position at all, so
+   * callers can leave the line out rather than print "unknown".
+   */
+  function whereIs(m) {
+    if (!m || typeof m.lat !== 'number' || typeof m.lng !== 'number') return '';
+
+    // last_place_id is the authoritative "they are checked in here" —
+    // written on arrive, cleared on leave — so prefer it over recomputing
+    // from coordinates, which can disagree at a boundary.
+    if (m.last_place_id) {
+      const p = (S.places || []).find(x => x.id === m.last_place_id);
+      if (p) return 'At ' + p.icon + ' ' + p.name;
+    }
+    // No check-in, but they may still be standing inside a place added
+    // since — or one whose arrival was missed.
+    const inside = placeContaining(m.lat, m.lng);
+    if (inside) return 'At ' + inside.icon + ' ' + inside.name;
+
+    const near = nearestPlace(m.lat, m.lng);
+    if (near && near.metres <= NEAR_PLACE_MAX_M) {
+      return formatDistance(near.metres) + ' from ' + near.place.icon + ' ' + near.place.name;
+    }
+    return formatCoords(m.lat, m.lng);
+  }
+
   function renderMembers() {
     const host = $('members-list');
     if (!host) return;
@@ -2582,9 +3050,17 @@
         : paused ? ('⏸ Location paused' + (m.paused_until ? ' · resumes ' + pauseClock(m.paused_until) : ''))
         : (m.status || '');
 
+      // Where they are, under the status line. Suppressed while paused —
+      // the member deliberately went dark, and their last known position
+      // is exactly what they chose to stop sharing. Suppressed on SOS
+      // too, because the status line is already shouting and the
+      // navigable position belongs on the SOS activity entry.
+      const whereText = (paused || m.sos) ? '' : whereIs(m);
+
       const main = el('div', { class: 'mc-main' }, [
         nameEl,
-        el('div', { class: 'mc-st', text: statusText })
+        el('div', { class: 'mc-st', text: statusText }),
+        whereText ? el('div', { class: 'mc-where', text: '📍 ' + whereText }) : null
       ]);
 
       // Hide battery/last-seen while paused — the member deliberately went
@@ -2827,6 +3303,54 @@
     }
   }
 
+  /**
+   * Open the phone's navigation app at a position.
+   *
+   * `geo:` is the Android intent that lets the user pick their own nav
+   * app, so it is tried first and is what a family member on Android
+   * gets. It does nothing on desktop and in some WebViews, so a Google
+   * Maps URL is the fallback — universal, and the same coordinates.
+   *
+   * Both are plain coordinates in a URL the user's own app resolves.
+   * Nothing is sent anywhere by us.
+   */
+  function sosNavigate(t) {
+    const lat = Number(t.dataset.lat), lng = Number(t.dataset.lng);
+    if (!isFinite(lat) || !isFinite(lng)) return;
+    const label = encodeURIComponent('SOS');
+    const webUrl = 'https://www.google.com/maps/search/?api=1&query=' + lat + ',' + lng;
+    if (isNative()) {
+      try {
+        // ?q= makes the pin land exactly here rather than centring
+        // loosely, which matters when someone is following it.
+        window.location.href = 'geo:' + lat + ',' + lng + '?q=' + lat + ',' + lng + '(' + label + ')';
+        return;
+      } catch (_) { /* fall through to the URL */ }
+    }
+    window.open(webUrl, '_blank', 'noopener');
+  }
+
+  async function sosCopy(t) {
+    const coords = t.dataset.coords || '';
+    if (!coords) return;
+    try {
+      await navigator.clipboard.writeText(coords);
+      toast('📋 ' + coords + ' copied', 'ok');
+    } catch (_) {
+      // Clipboard is permission-gated and absent over plain http. Select
+      // the text instead so it can still be copied by hand — better than
+      // a dead button in an emergency.
+      try {
+        const r = document.createRange();
+        r.selectNodeContents(t);
+        const sel = window.getSelection();
+        sel.removeAllRanges();
+        sel.addRange(r);
+        toast('Select and copy the coordinates', 'err');
+      } catch (_) {}
+    }
+  }
+
   function renderCheckins() {
     const host = $('ci-feed');
     if (!host) return;
@@ -2840,14 +3364,50 @@
     }
     for (const c of S.checkins) {
       const type = (c.type || 'manual').toLowerCase();
+      const body = el('div', {}, [
+        el('div', { class: 'ci-nm', text: c.member_name }),
+        el('div', { class: 'ci-pl', text: c.place }),
+        el('span', { class: 'ci-badge ' + type, text: type.charAt(0).toUpperCase() + type.slice(1) }),
+        el('div', { class: 'ci-tm', text: formatActivityTime(c.created_at) })
+      ]);
+
+      // An SOS that carries a position gets a navigable one. Whoever
+      // reads this needs to GET THERE, and the two things that actually
+      // achieve that are opening a nav app and pasting coordinates into
+      // one — so offer both rather than making them retype anything.
+      //
+      // Rows written before v13 have no lat/lng; absence is normal and
+      // the block is simply left out.
+      if (type === 'sos' && typeof c.lat === 'number' && typeof c.lng === 'number') {
+        const coords = formatCoords(c.lat, c.lng);
+        // Where it happened, in the same words the Family tab uses, so
+        // "1.2 km from Home" reads consistently across the app.
+        const near = nearestPlace(c.lat, c.lng);
+        const hint = near && near.metres <= NEAR_PLACE_MAX_M
+          ? formatDistance(near.metres) + ' from ' + near.place.icon + ' ' + near.place.name
+          : '';
+
+        body.appendChild(el('div', { class: 'ci-loc' }, [
+          hint ? el('div', { class: 'ci-loc-hint', text: hint }) : null,
+          el('div', { class: 'ci-coords' }, [
+            el('button', {
+              class: 'ci-nav',
+              dataset: { action: 'sos-navigate', lat: String(c.lat), lng: String(c.lng) },
+              text: '🧭 Directions'
+            }),
+            el('button', {
+              class: 'ci-copy',
+              dataset: { action: 'sos-copy', coords: coords },
+              title: 'Copy coordinates',
+              text: coords
+            })
+          ])
+        ]));
+      }
+
       host.appendChild(el('div', { class: 'ci-item' }, [
         el('div', { class: 'ci-av', text: c.member_avatar }),
-        el('div', {}, [
-          el('div', { class: 'ci-nm', text: c.member_name }),
-          el('div', { class: 'ci-pl', text: c.place }),
-          el('span', { class: 'ci-badge ' + type, text: type.charAt(0).toUpperCase() + type.slice(1) }),
-          el('div', { class: 'ci-tm', text: formatActivityTime(c.created_at) })
-        ])
+        body
       ]));
     }
   }
@@ -3153,7 +3713,6 @@
     // where the trip's diagonal (plus margin) fits the shorter side.
     const z = Math.log2(156543.03392 * Math.cos(S.mLat * Math.PI / 180) * px / (spanM * 1.4));
     S.mZoom = Math.max(3, Math.min(17, Math.floor(z)));
-    S.tiles = {};
   }
 
   function showTripOnMap(idx) {
@@ -3171,7 +3730,7 @@
   function focusStayPlace(placeStr) {
     const p = (S.places || []).find(x => x.icon + ' ' + x.name === placeStr);
     if (!p) return;
-    S.mLat = p.lat; S.mLng = p.lng; S.mZoom = 16; S.tiles = {};
+    S.mLat = p.lat; S.mLng = p.lng; S.mZoom = 16;
     drawMap();
     closeDrawer();
   }
@@ -3180,7 +3739,7 @@
   function focusMember(id) {
     const m = S.members.find(x => x.id === id);
     if (m && m.lat != null) {
-      S.mLat = m.lat; S.mLng = m.lng; S.mZoom = 15; S.tiles = {};
+      S.mLat = m.lat; S.mLng = m.lng; S.mZoom = 15;
       drawMap();
       $('sidebar').classList.remove('mob');
     }
@@ -3239,14 +3798,25 @@
     try {
       await S.sb.from('keep_members').update({ sos: true, status: '🆘 SOS ACTIVE' }).eq('id', S.myId);
       if (me) {
-        await S.sb.from('checkins').insert({
+        // Stamp WHERE, not just who and when. This row is what the rest
+        // of the family navigates to, and it has to keep meaning the
+        // same thing a week later — so it records the position at the
+        // moment the alert was raised rather than wherever the member
+        // happens to be when someone opens the log.
+        //
+        // Best effort: a member with no fix yet still gets the alert out.
+        // An SOS that failed to send because we were waiting on GPS would
+        // be the worst possible trade.
+        const sosAt = (typeof me.lat === 'number' && typeof me.lng === 'number')
+          ? { lat: me.lat, lng: me.lng } : {};
+        await S.sb.from('checkins').insert(Object.assign({
           keep_id: S.keepId,
           member_id: S.myId,
           member_name: me.name,
           member_avatar: me.avatar,
           place: '🆘 Emergency SOS Alert',
           type: 'sos'
-        });
+        }, sosAt));
       }
     } catch (_) {}
     $('sos-hdr')?.classList.add('ring');
@@ -3376,9 +3946,18 @@
   // What the OS is currently registered for, as a comparable string.
   // Anything that changes a fence's geometry has to be in here, or a
   // moved pin / edited radius would look identical to the armed set.
+  //
+  // NAME AND ICON ARE IN HERE TOO, and not for the geometry's sake: the
+  // native side keeps its own copy of them in PrefsStore, and
+  // GeofenceReceiver composes its check-in text from that copy. With
+  // geometry alone, a RENAME never re-armed — so a renamed place went on
+  // filing check-ins under its old name indefinitely, on every device
+  // that wasn't in the foreground when the edit happened. Same bug family
+  // as the never-armed add (PR #40) and the never-pruned delete (PR #42),
+  // one field narrower. Keep this in step with GeofenceArmer.signature().
   function placesSignature() {
     return (S.places || [])
-      .map(p => [p.id, p.lat, p.lng, p.radius_m].join(':'))
+      .map(p => [p.id, p.lat, p.lng, p.radius_m, p.name, p.icon].join(':'))
       .sort()
       .join('|');
   }
@@ -3857,6 +4436,11 @@
     'cancel-place': cancelPlaceEdit,
     'edit-place': (t) => editPlace(t.dataset.id),
     'delete-place': (t) => deletePlace(t.dataset.id),
+    'sos-navigate': (t) => sosNavigate(t),
+    'sos-copy': (t) => sosCopy(t),
+    'place-notify': (t) => openPlaceNotify(t.dataset.id),
+    'close-place-notify': closePlaceNotify,
+    'toggle-place-notify': (t) => togglePlaceNotify(t, t.dataset.id),
     'focus-place': (t) => focusPlace(t.dataset.id),
     'pick-place-icon': (t) => pickPlaceIcon(t, t.dataset.icon),
     'toggle-notify': (t) => toggleNotify(t),
@@ -4036,9 +4620,9 @@
   //     confident, wrong, and unactionable, since no amount of the owner
   //     running migrations will fix it.
   //
-  // Collapsing the two is harmless only while NEEDS_SCHEMA equals
-  // SCHEMA_PRE_META (nothing can fail the comparison) and becomes a bug
-  // the moment a release raises the bar. Keep them apart.
+  // Collapsing the two was harmless while NEEDS_SCHEMA equalled
+  // SCHEMA_PRE_META (nothing could fail the comparison) and became a bug
+  // the moment a release raised the bar. Keep them apart.
   async function readSchemaVersion() {
     try {
       const { data, error } = await S.sb.rpc('roamkeep_schema_version');
@@ -4121,7 +4705,7 @@
   //
   // Exists because a family who upgraded by pasting schema.sql into the
   // dashboard never told the database its project URL, and without it
-  // their check-in webhook silently no-ops.
+  // their check-in and place webhooks silently no-op.
   async function ensureProjectUrl() {
     if (!S.sb || !SB_URL) return;
     try {

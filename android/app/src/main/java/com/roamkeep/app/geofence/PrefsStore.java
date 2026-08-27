@@ -45,6 +45,17 @@ public class PrefsStore {
     // Places: JSON array of { id, name, icon, lat, lng, radius }.
     private static final String K_PLACES = "places";
 
+    // Fingerprint of the place list as it was last ARMED (see
+    // GeofenceArmer.signature). A push wake-up refetches keep_places and
+    // compares against this, so the common case — a wake-up caused by
+    // something else entirely — costs one comparison instead of a
+    // pointless re-registration.
+    //
+    // Deliberately NOT K_LAST_PUSH_SEEN: that one means "newest check-in
+    // already notified" and advancing it for a place change would drop
+    // notifications.
+    private static final String K_PLACES_SIG = "places_sig";
+
     // Active tracking mode (auto|live|balanced|saver). Persisted so the
     // BootReceiver can re-arm native location updates headlessly after a
     // reboot without waiting for the app to open.
@@ -191,6 +202,11 @@ public class PrefsStore {
     private static final String K_LAST_PUSH_SEEN = "last_push_seen";
     public String getLastPushSeen()            { return sp.getString(K_LAST_PUSH_SEEN, null); }
     public void setLastPushSeen(String isoTs)  { sp.edit().putString(K_LAST_PUSH_SEEN, isoTs).apply(); }
+
+    /** null = never armed. Distinct from "" (armed an empty list), which
+     *  is a real state meaning every place was deleted. */
+    public String getPlacesSignature()          { return sp.getString(K_PLACES_SIG, null); }
+    public void setPlacesSignature(String sig)  { sp.edit().putString(K_PLACES_SIG, sig).apply(); }
     public boolean isPaused()           { return getPausedUntil() > System.currentTimeMillis(); }
 
     /** Record a LocationUpdateReceiver firing: stamp the time and bump the

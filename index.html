@@ -442,6 +442,28 @@
   </div>
 </div>
 
+<!-- PER-PLACE NOTIFY SHEET — who this place tells me about.
+     Reached from the 🔔 button on a row in the Places tab. The rows are
+     built by renderPlaceNotifySheet(); only the chrome is here. -->
+<div class="sheet-scrim" id="pn-scrim" data-action="close-place-notify"></div>
+<div class="sheet" id="pn-sheet" role="dialog" aria-modal="true" aria-labelledby="pn-title">
+  <div class="sheet-handle" aria-hidden="true"></div>
+  <div class="sheet-body">
+    <div class="sec-h" id="pn-title">Notifications</div>
+    <p class="note">Tell me when these people arrive at or leave this place.
+      Turning someone off here only affects this place — you'll still hear
+      about them everywhere else.</p>
+    <div class="info-card" id="pn-global-off" style="display:none">
+      <strong>🔕 Your notifications are off</strong>
+      These switches take effect once you turn "Notify me when family arrive
+      or leave a place" back on, in Family → Settings.
+    </div>
+    <div id="pn-list"></div>
+    <p class="note">🆘 SOS alerts always come through, whatever is set here.</p>
+    <button class="lnk-btn" data-action="close-place-notify">Done</button>
+  </div>
+</div>
+
 <!-- SETUP SHEET (first run, and any time a requirement is missing) -->
 <div class="sheet-scrim" id="setup-scrim" data-action="close-setup"></div>
 <div class="sheet" id="setup-sheet" role="dialog" aria-modal="true" aria-labelledby="setup-title">

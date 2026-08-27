@@ -59,7 +59,7 @@ export async function applySchema(api, ref) {
  * needs: asserting it is strictly stronger than counting tables, because
  * the stamp only lands if everything before it in the file succeeded.
  */
-export const SCHEMA_VERSION = 12;
+export const SCHEMA_VERSION = 13;
 
 /**
  * The database's own schema version, or null if it predates the marker.
@@ -118,11 +118,11 @@ export async function verifySchema(api, ref) {
 /**
  * Tell the database its own URL.
  *
- * The webhook trigger function POSTs to its Edge Function and cannot know
- * the project ref from inside Postgres, so it is stored in roamkeep_meta.
- * The app's set_project_url() RPC is write-once and owner-only; the wizard
- * writes directly and is therefore authoritative — if a client guessed
- * wrong, re-running the wizard corrects it.
+ * The webhook trigger functions POST to their Edge Functions and cannot
+ * know the project ref from inside Postgres, so it is stored in
+ * roamkeep_meta. The app's set_project_url() RPC is write-once and
+ * owner-only; the wizard writes directly and is therefore authoritative —
+ * if a client guessed wrong, re-running the wizard corrects it.
  *
  * `ref` reaches here from CLI input and is interpolated into SQL, so it is
  * checked against the shape Supabase actually issues rather than trusted.
@@ -220,12 +220,27 @@ export async function createWebhook(api, ref) {
   await api.query(ref, sql);
 }
 
+/**
+ * Both webhook triggers must exist.
+ *
+ * on_checkin_notify is created above (or by db/schema.sql on a project
+ * that has never had one). on_place_notify comes from db/schema.sql only,
+ * because place sync has to reach owners who upgrade by pasting that file
+ * into the SQL editor rather than running this wizard.
+ *
+ * Checked together so a missing one is named rather than the pair being
+ * reported as a single vague failure.
+ */
 export async function verifyWebhook(api, ref) {
   const rows = await api.query(ref, `
-    select count(*)::int as n from pg_trigger
-    where tgname = 'on_checkin_notify' and not tgisinternal;`);
-  const r = Array.isArray(rows) ? rows[0] : rows;
-  if (Number(r?.n ?? 0) < 1) throw new Error('webhook trigger not found after creation');
+    select tgname from pg_trigger
+    where tgname in ('on_checkin_notify', 'on_place_notify')
+      and not tgisinternal;`);
+  const found = new Set((Array.isArray(rows) ? rows : [rows]).map((r) => r?.tgname));
+  const missing = ['on_checkin_notify', 'on_place_notify'].filter((t) => !found.has(t));
+  if (missing.length) {
+    throw new Error(`webhook trigger(s) missing: ${missing.join(', ')}`);
+  }
   return true;
 }
 
@@ -237,12 +252,16 @@ export async function verifyWebhook(api, ref) {
  * out is genuinely simpler. The wizard checks, and tells the user the
  * exact command if it's missing, rather than pretending to do it.
  */
+export const FUNCTIONS = ['notify-checkin', 'notify-places'];
+
 export async function checkFunction(api, ref) {
   try {
     const fns = await api.listFunctions(ref);
-    return Array.isArray(fns) && fns.some((f) => f.slug === 'notify-checkin');
+    const have = new Set(Array.isArray(fns) ? fns.map((f) => f.slug) : []);
+    const missing = FUNCTIONS.filter((s) => !have.has(s));
+    return { ok: missing.length === 0, missing };
   } catch (e) {
-    if (e instanceof ApiError && e.status === 404) return false;
+    if (e instanceof ApiError && e.status === 404) return { ok: false, missing: [...FUNCTIONS] };
     throw e;
   }
 }
@@ -265,22 +284,35 @@ export async function getAnonKey(api, ref) {
  * with "no recipients" proves the function is deployed, reachable,
  * parsing the payload and able to query the database.
  */
-export async function probeFunction(ref) {
-  const payload = {
+const PROBE_PAYLOAD = {
+  'notify-checkin': {
     type: 'INSERT', table: 'checkins', schema: 'public', old_record: null,
     record: {
       id: '00000000-0000-0000-0000-000000000001',
       keep_id: '00000000-0000-0000-0000-0000000000ff',
       member_id: '00000000-0000-0000-0000-000000000002',
       member_name: 'setup-probe', member_avatar: '🧪',
-      type: 'arrived', place: 'setup-probe',
-      created_at: new Date().toISOString(),
+      type: 'arrived', place: 'setup-probe', place_id: null,
     },
-  };
-  const res = await fetch(`https://${ref}.supabase.co/functions/v1/notify-checkin`, {
+  },
+  'notify-places': {
+    type: 'INSERT', table: 'keep_places', schema: 'public', old_record: null,
+    record: {
+      id: '00000000-0000-0000-0000-000000000003',
+      keep_id: '00000000-0000-0000-0000-0000000000ff',
+      name: 'setup-probe', icon: '🧪',
+      lat: 0, lng: 0, radius_m: 100,
+    },
+  },
+};
+
+export async function probeFunction(ref, slug = 'notify-checkin') {
+  const body = { ...PROBE_PAYLOAD[slug] };
+  if (body.record) body.record = { ...body.record, created_at: new Date().toISOString() };
+  const res = await fetch(`https://${ref}.supabase.co/functions/v1/${slug}`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(payload),
+    body: JSON.stringify(body),
   });
   const text = await res.text();
   return { ok: res.ok, status: res.status, body: text.slice(0, 200) };

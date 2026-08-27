@@ -21,6 +21,7 @@ that's already on an older version.
 | `familynest-schema-v10-advisor-cleanup.sql` | Revokes `anon` EXECUTE on every SECURITY DEFINER RPC. `REVOKE … FROM PUBLIC` alone does not do this — Supabase's default privileges grant execute to `anon` *by name*, so it has to be revoked explicitly. |
 | `familynest-schema-v11-profile-edits.sql` | `rename_keep` + `update_member_profile` RPCs — editable family name, display name and avatar. |
 | `familynest-schema-v12-meta.sql` | `roamkeep_meta` (schema version, `min_app_build`, `project_url`) + `roamkeep_schema_version()` + `set_project_url()`. Sets **schema_version 12**. Purely additive — every installed app keeps working after it is applied. |
+| `familynest-schema-v13-notify-prefs.sql` | `checkins.place_id`, `keep_notify_prefs` (per-person, per-place mutes), `checkin_recipients()`, the `my_checkin_feed` view, and the `keep_places` → `notify-places` webhook trigger. Sets **schema_version 13**. Requires v12. Additive. |
 
 ## Schema versions and app compatibility
 
@@ -31,6 +32,7 @@ number rather than claiming a state it did not reach.
 | schema_version | Set by | Minimum app |
 |---|---|---|
 | 12 | `familynest-schema-v12-meta.sql` | 4.7.0 (the gate ships inert — 4.7.0 runs fine against a pre-v12 database too) |
+| 13 | `familynest-schema-v13-notify-prefs.sql` | **4.8.0** — the first release to actually require a version. Run this before 4.8.0 reaches phones, or they show the "server needs updating" screen until you do. |
 
 `roamkeep_schema_version()` returns a **number, not a verdict**. That is
 deliberate and should stay that way: a database that answered

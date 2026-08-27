@@ -162,7 +162,7 @@ async function runUpgrade(api, ref) {
   await step(4, 'Recording the project URL', () => steps.setProjectUrl(api, ref),
     `Run this in the SQL editor for ${ref}:\n\n` +
     color.cyan(`  update roamkeep_meta set project_url = 'https://${ref}.supabase.co';`) + '\n\n' +
-    'Without it the database cannot call its own Edge Function, so push\n' +
+    'Without it the database cannot call its own Edge Functions, so push\n' +
     'notifications stay silent.');
 
   await step(5, 'Re-wiring the check-in webhook', async () => {
@@ -171,16 +171,23 @@ async function runUpgrade(api, ref) {
   }, 'Dashboard → Database → Webhooks → create one on table "checkins", event Insert,\n' +
      'type "Supabase Edge Functions", function notify-checkin, method POST.');
 
-  const fn = await step(6, 'Checking the notification function', () => steps.checkFunction(api, ref));
-  if (!(fn.ok && fn.out === true)) {
+  const fn = await step(6, 'Checking the notification functions', () => steps.checkFunction(api, ref));
+  const missing = (fn.ok && fn.out ? fn.out.missing : steps.FUNCTIONS) || [];
+  if (missing.length) {
     note(
-      'The notify-checkin Edge Function is not deployed on this project.\n' +
-      'Everything else works without it — you just get no push\n' +
-      'notifications. To deploy, from the repo root:\n\n' +
+      `Not deployed on this project: ${color.bold(missing.join(', '))}\n\n` +
+      (missing.includes('notify-places')
+        ? 'Without notify-places, saved places added or removed on one phone\n' +
+          'do not reach the others until someone opens the app there.\n'
+        : '') +
+      (missing.includes('notify-checkin')
+        ? 'Without notify-checkin, there are no arrive/leave notifications.\n'
+        : '') +
+      '\nTo deploy, from the repo root:\n\n' +
       color.cyan('  npx supabase login') + '\n' +
       color.cyan(`  npx supabase link --project-ref ${ref}`) + '\n' +
-      color.cyan('  npx supabase functions deploy notify-checkin --no-verify-jwt'),
-      'Optional step still outstanding',
+      missing.map((s) => color.cyan(`  npx supabase functions deploy ${s} --no-verify-jwt`)).join('\n'),
+      'Optional steps still outstanding',
     );
   }
 
@@ -381,26 +388,27 @@ async function main() {
      'Then, in the SQL editor:\n\n' +
      `  update roamkeep_meta set project_url = 'https://${ref}.supabase.co';`);
 
-  // ── 9. Edge function (needs the supabase CLI) ──────────────────
-  const fn = await step(9, 'Checking the notification function', () => steps.checkFunction(api, ref));
-  const fnDeployed = fn.ok && fn.out === true;
+  // ── 9. Edge functions (need the supabase CLI) ──────────────────
+  const fn = await step(9, 'Checking the notification functions', () => steps.checkFunction(api, ref));
+  const missingFns = (fn.ok && fn.out ? fn.out.missing : steps.FUNCTIONS) || [];
 
-  if (!fnDeployed) {
+  if (missingFns.length) {
     note(
-      'Arrive/leave notifications need one Edge Function, and deploying it\n' +
-      'requires the Supabase CLI (it bundles the code). Run these ' +
+      'Notifications and place sync need two Edge Functions, and deploying\n' +
+      'them requires the Supabase CLI (it bundles the code). Run these ' +
       color.bold('from the repo root') + ':\n\n' +
       color.cyan(`  npx supabase login`) + '\n' +
       color.cyan(`  npx supabase link --project-ref ${ref}`) + '\n' +
-      color.cyan(`  npx supabase functions deploy notify-checkin --no-verify-jwt`) + '\n\n' +
+      missingFns.map((s) => color.cyan(`  npx supabase functions deploy ${s} --no-verify-jwt`)).join('\n') + '\n\n' +
       color.bold('Check the link took before deploying.') + ' `functions deploy` targets\n' +
       'whichever project is linked, and says nothing if that is the wrong\n' +
       'one — it will happily deploy somewhere else and report success.\n' +
       `The file supabase/.temp/linked-project.json should say ${ref}.\n\n` +
       'Then re-run this to confirm and get your setup QR:\n\n' +
       color.cyan(`  ${SELF} --project ${ref} --from 9`) + '\n\n' +
-      'Everything else already works without it — you just will not get\n' +
-      'push notifications until it is deployed.',
+      'Everything else already works without them — you just will not get\n' +
+      'push notifications, and saved places will not reach other phones\n' +
+      'until someone opens the app there.',
       'One manual step left',
     );
   } else {
@@ -408,16 +416,20 @@ async function main() {
     // is silent: the CLI targets whatever is linked and reports success.
     // Probing the project we just provisioned turns that into a clear
     // message rather than push mysteriously never working.
-    await step(10, 'Checking the function answers on THIS project', async () => {
-      const r = await steps.probeFunction(ref);
-      if (r.status === 404) {
-        throw new Error(
-          `not found on ${ref} — it was probably deployed to a different project. ` +
-          `Re-link to ${ref} and deploy again.`);
+    await step(10, 'Checking the functions answer on THIS project', async () => {
+      const results = {};
+      for (const slug of steps.FUNCTIONS) {
+        const r = await steps.probeFunction(ref, slug);
+        if (r.status === 404) {
+          throw new Error(
+            `${slug} not found on ${ref} — it was probably deployed to a different ` +
+            `project. Re-link to ${ref} and deploy again.`);
+        }
+        if (!r.ok) throw new Error(`${slug} returned ${r.status}`);
+        results[slug] = r.status;
       }
-      if (!r.ok) throw new Error(`function returned ${r.status}`);
-      return r;
-    }, `The function is not answering on ${ref}.\n` +
+      return results;
+    }, `A function is not answering on ${ref}.\n` +
        `Check supabase/.temp/linked-project.json says ${ref}, re-link if not,\n` +
        `then deploy again and re-run with --from 9.`);
   }

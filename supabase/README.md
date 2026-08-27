@@ -8,9 +8,30 @@ instance via the Supabase CLI.
 ### `notify-checkin`
 
 Fans out FCM push notifications when a row is inserted into
-`public.checkins` with `type IN ('arrived', 'left')`. See the file
+`public.checkins` with `type IN ('arrived', 'left', 'sos')`. See the file
 header in [`functions/notify-checkin/index.ts`](functions/notify-checkin/index.ts)
 for the full contract.
+
+Since **v13** it does not decide recipients itself — it calls
+`checkin_recipients(checkin_id)`, so the per-person, per-place mute rule
+is stated once in SQL and read from both directions (the device reads the
+same rule through the `my_checkin_feed` view).
+
+### `notify-places`
+
+Wakes every device in a keep when a row in `public.keep_places` is
+inserted, updated or deleted, so each one re-reads the place list and
+re-arms its geofences without the app being opened. See the file header
+in [`functions/notify-places/index.ts`](functions/notify-places/index.ts).
+
+Two ways it deliberately differs from `notify-checkin`: it ignores
+`notify_on_checkin` (this is a data sync, not a notification — muting
+alerts must not leave a phone holding stale geofences), and it includes
+the member who made the change, whose other devices need it.
+
+**Both must be deployed.** They are separate functions on purpose: the
+recipient rules share nothing, and a bug in place sync must not be able to
+stop an SOS being delivered.
 
 ---
 
@@ -170,6 +191,7 @@ you do **not** set them yourself.)
 
 ```powershell
 supabase functions deploy notify-checkin --no-verify-jwt --project-ref <your-ref>
+supabase functions deploy notify-places  --no-verify-jwt --project-ref <your-ref>
 ```
 
 (Drop `--project-ref` if you ran `supabase link`.)
@@ -185,6 +207,27 @@ Re-deploy any time you change `index.ts` — same command.
 
 In the Supabase Dashboard:
 
+**Normally you don't have to.** Since v13 both triggers are created by
+`db/schema.sql` (`on_checkin_notify`, `on_place_notify`), which is what
+lets an owner who upgrades by pasting that file into the SQL editor get
+working webhooks — a trigger only the setup wizard creates is a trigger
+half the deployments never get.
+
+They read the project's own URL from `roamkeep_meta.project_url` and do
+nothing while it is NULL, so if push or place sync is silent, check that
+first:
+
+```sql
+select schema_version, project_url from roamkeep_meta;
+```
+
+`db/schema.sql` will **not** overwrite an existing `roamkeep_notify_checkin`
+— a live family's copy has its URL baked into the body by the setup wizard
+and is working, and replacing it would kill their notifications until
+`project_url` was set.
+
+To wire one by hand instead, in the Supabase Dashboard:
+
 1. Database → Webhooks → **Create a new hook**
 2. Name: `notify-checkin`
 3. Table: `checkins`
@@ -192,6 +235,10 @@ In the Supabase Dashboard:
 5. Type: **Supabase Edge Functions** → `notify-checkin`
 6. Method: POST
 7. Save.
+
+And for place sync, a second hook: name `notify-places`, table
+`keep_places`, events ☑ Insert ☑ Update ☑ Delete, function
+`notify-places`, method POST.
 
 Insert a fake `arrived` row in the SQL editor to verify the function
 fires (Functions → notify-checkin → Logs):

@@ -227,6 +227,10 @@ public class GeofenceReceiver extends BroadcastReceiver {
                 ci.put("member_avatar", memberAv);
                 ci.put("type", type);
                 ci.put("place", p.icon + " " + p.name);
+                // v13. `place` is a display string composed here, so it
+                // cannot be matched back to a place once one is renamed —
+                // place_id is what the per-place mute rule joins on.
+                ci.put("place_id", placeId);
                 ci.put("created_at", isoTime);
 
                 SupabaseRest.Result ciResult = rest.insertCheckin(ci);

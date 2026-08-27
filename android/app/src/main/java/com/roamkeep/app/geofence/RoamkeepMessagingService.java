@@ -22,6 +22,8 @@ import org.json.JSONObject;
 
 import java.net.URLEncoder;
 import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Map;
 
 /**
@@ -72,27 +74,72 @@ public class RoamkeepMessagingService extends MessagingService {
         super.onMessageReceived(remoteMessage);
     }
 
-    /** Fetch anything newer than the watermark and notify about it. */
+    /**
+     * A wake-up carries no event type — by design, so the relay cannot
+     * learn which events are urgent. So every wake does BOTH jobs:
+     * notify about new check-ins, and reconcile the place list.
+     *
+     * That the place reconcile also runs on check-in wakes is a feature,
+     * not waste. Native place state drifting from the database is the
+     * recurring bug class in this codebase, and until now the only repair
+     * was somebody opening the app.
+     */
     private void handleSync() {
         Context ctx = getApplicationContext();
         PrefsStore prefs = new PrefsStore(ctx);
         if (!prefs.hasContext()) return;
 
+        notifyNewCheckins(ctx, prefs);
+        reconcilePlaces(ctx, prefs);
+    }
+
+    /** Fetch anything newer than the watermark and notify about it. */
+    private void notifyNewCheckins(Context ctx, PrefsStore prefs) {
         String since = prefs.getLastPushSeen();
         if (since == null) {
             since = SupabaseRest.toIso8601Utc(System.currentTimeMillis() - COLD_START_LOOKBACK_MS);
         }
 
-        String path = "/rest/v1/checkins"
+        // my_checkin_feed, not checkins. The view applies the caller's own
+        // per-person, per-place mutes server-side (and the member_id and
+        // type filters that used to be spelled out here).
+        //
+        // This filter is NOT redundant with the one in notify-checkin.
+        // The wake-up is content-free and untargeted: an SOS, or an
+        // unmuted event about someone else, wakes every phone — and this
+        // method then fetches EVERYTHING newer than the watermark. Without
+        // a filter on this side, a muted notification rides in on an
+        // unrelated wake.
+        //
+        // Filtering in a database view rather than against a local copy of
+        // the preferences is deliberate: a mute set mirrored into
+        // PrefsStore would be a fourth store of database state that can
+        // silently drift, which is the failure this codebase keeps paying
+        // for.
+        String path = "/rest/v1/my_checkin_feed"
                 + "?select=id,member_name,member_avatar,type,place,created_at"
-                + "&keep_id=eq." + enc(prefs.getKeepId())
-                + "&member_id=neq." + enc(prefs.getMemberId())
                 + "&created_at=gt." + enc(since)
-                + "&type=in.(arrived,left,sos)"
                 + "&order=created_at.desc"
                 + "&limit=" + MAX_PER_WAKE;
 
-        String body = new SupabaseRest(ctx).getWithRefresh(path);
+        SupabaseRest rest = new SupabaseRest(ctx);
+        String body = rest.getWithRefresh(path);
+
+        if (body == null) {
+            // The view is missing on a database that has not run the v13
+            // migration. Fall back to the pre-v13 query so an app that
+            // arrives ahead of its family's schema update still raises
+            // notifications, rather than going silently deaf.
+            Log.w(TAG, "sync: feed fetch failed — falling back to checkins");
+            body = rest.getWithRefresh("/rest/v1/checkins"
+                    + "?select=id,member_name,member_avatar,type,place,created_at"
+                    + "&keep_id=eq." + enc(prefs.getKeepId())
+                    + "&member_id=neq." + enc(prefs.getMemberId())
+                    + "&created_at=gt." + enc(since)
+                    + "&type=in.(arrived,left,sos)"
+                    + "&order=created_at.desc"
+                    + "&limit=" + MAX_PER_WAKE);
+        }
         if (body == null) { Log.w(TAG, "sync: fetch failed"); return; }
 
         JSONArray rows;
@@ -126,6 +173,77 @@ public class RoamkeepMessagingService extends MessagingService {
 
         if (newest != null) prefs.setLastPushSeen(newest);
         prefs.journal("push: wake-up → " + rows.length() + " notification(s)");
+    }
+
+    /**
+     * Re-read the family's place list and re-arm the OS if it changed.
+     *
+     * This is what makes a place added or deleted on one phone reach the
+     * others within seconds instead of at the next app open. Until now the
+     * only delivery path was the realtime subscription, which Android
+     * suspends whenever the WebView is backgrounded and Supabase never
+     * replays — so a backgrounded phone simply never found out. That gap
+     * shipped twice: an unarmed new place (PR #40) and a deleted place
+     * that went on filing check-ins (PR #42).
+     *
+     * The whole list is fetched and pushed, never a delta. A delta needs
+     * a reliable event stream, and this device is proof there isn't one.
+     */
+    private void reconcilePlaces(Context ctx, PrefsStore prefs) {
+        String body = new SupabaseRest(ctx).getWithRefresh("/rest/v1/keep_places"
+                + "?select=id,name,icon,lat,lng,radius_m"
+                + "&keep_id=eq." + enc(prefs.getKeepId()));
+
+        // ── The one distinction that matters in this method ──────────
+        //
+        // "The fetch failed" and "the fetch succeeded and returned []"
+        // are one `if` apart and demand OPPOSITE actions:
+        //
+        //   * A successful empty list is meaningful. Every place really
+        //     was deleted, and the prune has to run — that is precisely
+        //     the case the prune exists for.
+        //   * A failed read must change NOTHING. Treating it as an empty
+        //     list would unregister every geofence on the device, from a
+        //     receiver with no screen, with nothing to explain it.
+        //
+        // So: bail on null or unparseable, and only then trust an empty
+        // array. Never let a failed read overwrite good state.
+        if (body == null) { Log.w(TAG, "sync: places fetch failed — leaving state alone"); return; }
+
+        List<PrefsStore.Place> places = new ArrayList<>();
+        try {
+            JSONArray arr = new JSONArray(body);
+            for (int i = 0; i < arr.length(); i++) {
+                JSONObject o = arr.optJSONObject(i);
+                if (o == null) continue;
+                String id = o.optString("id", null);
+                String name = o.optString("name", null);
+                if (id == null || name == null) continue;
+                places.add(new PrefsStore.Place(
+                        id, name, o.optString("icon", "📍"),
+                        o.optDouble("lat"), o.optDouble("lng"),
+                        (float) o.optDouble("radius_m", 100)));
+            }
+        } catch (Exception e) {
+            Log.w(TAG, "sync: bad places payload — leaving state alone", e);
+            return;
+        }
+
+        String sig = GeofenceArmer.signature(places);
+        String was = prefs.getPlacesSignature();
+        // null means "never armed", which is different from "" ("armed an
+        // empty list"). A first-ever arm must go ahead even with nothing
+        // in it, so that the signature gets recorded.
+        if (sig.equals(was)) return;
+
+        GeofenceArmer.Result r = GeofenceArmer.arm(ctx, places, "push");
+        prefs.setPlacesSignature(sig);
+
+        // Journal only when something actually changed. A line on every
+        // wake-up would bury the rest of the journal, and the journal is
+        // the only witness these headless paths have.
+        prefs.journal("push: places changed → " + r.stored + " stored, "
+                + r.armed + " armed, " + r.pruned + " pruned");
     }
 
     private void notify(Context ctx, String id, String title, String text, boolean sos) {

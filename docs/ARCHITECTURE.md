@@ -97,7 +97,18 @@ it are correct.
    to **real GPS movement** decided in the service (dense while moving,
    low-power after 3 min still) — NOT the Activity Recognition sensor,
    which proved unreliable and got auto stuck both ways. A periodic
-   re-arm heals a stale callback on long sessions. Replaced the old
+   re-arm heals a stale callback on long sessions. **From Android 13 the
+   user can swipe the foreground-service notification away** —
+   `setOngoing(true)` never prevented that, it only blocked a clear-all —
+   and since it is posted once by `startForeground()` in `onStartCommand`,
+   which does not fire again while the service lives, it stayed gone for
+   the rest of the session. That silently falsified the "permanent
+   notification" claim in `landing/privacy`. `restoreNotificationIfDismissed()`
+   checks `getActiveNotifications()` on each fix and each re-arm and puts
+   it back — silently, because the channel is `IMPORTANCE_LOW`. It is
+   deliberately not restored instantly via a `deleteIntent`: that reads as
+   the app fighting the swipe, where returning at the next fix is the
+   disclosure simply falling due again. Replaced the old
    `@capacitor-community/background-geolocation` plugin. NOT used for
    check-ins. Foreground map smoothness uses a plain
    `@capacitor/geolocation` `watchPosition` while the app is open.
@@ -166,6 +177,33 @@ state, don't apply a delta. `rearmGeofencesFromPlaces` + `placesSignature()`
 is that path; `armPlaces` treats its argument as the complete set and
 prunes anything else. Keep it that way: if you add a fourth thing that
 mirrors DB state, give it a reconcile before you give it a delta handler.
+
+Since v13 there is a **second** reconcile that doesn't wait for someone to
+open the app: `notify-places` wakes every device on a `keep_places`
+change, and `RoamkeepMessagingService.reconcilePlaces` refetches the whole
+list and re-arms. Both paths — and `BootReceiver` — go through the one
+`GeofenceArmer.arm()`, which was extracted from the plugin precisely so
+that callers without a Capacitor bridge could run the identical
+arm-and-prune. Its contract is the rule above: **the caller passes the
+complete list, and anything absent is pruned.**
+
+Two things that fall out of that and have to stay explicit at every call
+site:
+
+- **An empty list is a meaningful state, not a no-op** (as below).
+- **A caller must never pass an empty list because a fetch failed.** That
+  is indistinguishable from "everything was deleted" and would
+  unregister every fence on the device, from a receiver with no screen.
+  `reconcilePlaces` bails on a null or unparseable body and only then
+  trusts an empty array — the two cases are one `if` apart and demand
+  opposite actions.
+
+`placesSignature()` (JS) and `GeofenceArmer.signature()` (native) both
+include **name and icon**, not just geometry. With geometry alone a
+*rename* never re-armed, and since `GeofenceReceiver` composes its
+check-in text from the name in `PrefsStore`, a renamed place went on
+filing check-ins under its old name indefinitely — the same bug as #40 and
+#42, one field narrower.
 
 Two corollaries worth keeping:
 
@@ -250,6 +288,24 @@ Rules that follow from it:
 
 - Every migration sets `schema_version` **as its last statement**, so a
   half-applied migration reports the old number.
+- **A version freezes the moment it is applied anywhere off your own
+  machine** — merged or not, released or not. From then on it is a
+  contract: `13` must mean one exact set of objects, for everybody.
+  Changing what an already-applied version *contains* is the one failure
+  this marker cannot catch, because the number does not move and every
+  check that trusts it reports healthy.
+
+  This has already happened once. `checkins.lat/lng` were added to v13
+  after an earlier v13 had been pasted into live databases, so those
+  reported `13` while missing the columns the SOS position feature reads
+  — and since the app treats a missing position as normal, nothing
+  errored anywhere. The repair was a one-line `ALTER`; finding it was the
+  expensive part. If a version is out in the world, add v+1 instead,
+  however unfinished the release still feels.
+
+  Corollary: **verify OBJECTS, not the number** — count the columns,
+  tables, functions and triggers you expect. `docs/OWNER_SETUP.md` has
+  the query.
 - Every release that starts using something new raises `NEEDS_SCHEMA` in
   the same commit, and `SCHEMA_VERSION` in `cli/src/steps.js` tracks what
   `db/schema.sql` stamps.
@@ -259,17 +315,21 @@ Rules that follow from it:
   become a migration for all of them. The number is also what a future
   per-feature fallback would read (`if (S.schemaVersion >= N) … else …`)
   if the app ever switches from refusing to degrading.
-- **"Couldn't read the version" is not "the version is old."** A missing
-  function is a known answer (pre-v12); a network failure is not an
-  answer at all and must never block, or a tunnel becomes "your family's
-  server needs updating". Collapsing the two is harmless only while
-  `NEEDS_SCHEMA` equals `SCHEMA_PRE_META` and becomes a bug the moment a
-  release raises the bar.
 - `min_app_build` (the other direction) stays **advisory** — a banner,
   never a block. An installed app that refuses can never be talked out of
   refusing by a later database change, and unlike the schema direction
   there is nothing the owner can do about a member whose Play update has
   not rolled out.
+- A new webhook or trigger is **not** done when the CLI creates it. Most
+  owners upgrade by re-pasting `db/schema.sql`, so anything they need must
+  live in that file too — which is what `roamkeep_meta.project_url` is
+  for, since a pasted SQL file cannot know its own project URL.
+- **Publish the public repo BEFORE the Play rollout.** A brand-new owner
+  gets their schema from a ZIP of `roamkeep/roamkeep` and their app from
+  Play. If Play is ahead, they provision, are immediately told the server
+  needs updating, and re-running the wizard from the tree they just
+  downloaded stamps the same old version — a dead end on a five-minute-old
+  project. See `docs/PUBLIC_RELEASE.md` §0.
 
 **Every behavioural change bumps three things together** (the convention
 across all prior PRs):
@@ -403,10 +463,41 @@ context and geofences, then reloads to the Connect screen.
   (`segmentTrips` over that day's breadcrumbs, classified walk/drive
   from GPS speed with a distance/time fallback). Queries run on demand
   when the tab opens; tapping a trip draws it via the trail machinery.
-- Edge Function `notify-checkin` (see `supabase/README.md` for deploy):
-  a Database Webhook on `checkins` INSERT triggers it. It decides *who*
-  should be told and then calls the relay — it does **not** compose a
-  notification. See "Push is content-free" below.
+- **Per-place notifications (v13).** `keep_notify_prefs` holds *exception
+  rows only* — a row means "don't tell me about this person at this
+  place", no row means notify — so an empty table is exactly pre-v13
+  behaviour. The rule is written once in SQL and read from both
+  directions, because the two consumers ask opposite questions:
+  `checkin_recipients(id)` answers "who to wake for this check-in" (the
+  Edge Function), and the `my_checkin_feed` view answers "which check-ins
+  should *I* raise" (the device). SOS ignores every mute, and so does a
+  check-in with a NULL `place_id` (manual, or pre-v13).
+  **Both filters are needed.** The wake-up is content-free and
+  untargeted, so an SOS — or an unmuted event about someone else — wakes
+  every phone, and the woken device then fetches everything newer than
+  its watermark; filtering only in the Edge Function leaks muted
+  notifications through unrelated wakes. Doing the device side as a
+  *view* rather than a `PrefsStore` cache is deliberate: a mirrored mute
+  set would be a fourth instance of the divergence bug below.
+- Edge Functions `notify-checkin` and `notify-places` (see
+  `supabase/README.md` for deploy). Database Webhooks trigger them —
+  `checkins` INSERT and `keep_places` INSERT/UPDATE/DELETE. Both decide
+  *who* should be woken and then call the relay; neither composes a
+  notification. See "Push is content-free" below. **Both triggers are
+  created by `db/schema.sql`** (`on_checkin_notify`, `on_place_notify`),
+  not only by the wizard, because most owners upgrade by re-pasting that
+  file — a trigger only the wizard creates is one half the deployments
+  never get. They read the project's own URL from
+  `roamkeep_meta.project_url` and no-op while it is NULL. `schema.sql`
+  will **not** replace an existing `roamkeep_notify_checkin`: a live
+  family's copy has its URL baked into the body by the wizard and works,
+  and overwriting it would kill their push until `project_url` was set.
+- **Place changes reach devices by push, not only realtime (v13).** A
+  `keep_places` change wakes every device via `notify-places`;
+  `RoamkeepMessagingService.reconcilePlaces` refetches the whole list and
+  re-arms through `GeofenceArmer`. `notify-places` deliberately ignores
+  `notify_on_checkin` — this is a data sync, not a notification, and
+  muting alerts must not leave a phone holding stale geofences.
 
 ## Push is content-free (the relay)
 
