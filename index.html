@@ -80,6 +80,65 @@
   </div>
 </div>
 
+<!-- TERMS OF USE — shown once, before sign-in, so agreement precedes the
+     app asking for an email address. Deliberately NOT folded into the
+     setup sheet: stacking a second dialog on the prominent-disclosure
+     flow is the ordering bug this codebase has already fixed three times.
+
+     This SUMMARISES; it does not restate. The binding document is the one
+     published at get.roamkeep.app/terms, and a second copy in the bundle
+     would guarantee the two drift apart. -->
+<div id="s-terms" class="screen">
+  <div class="card">
+    <div class="brand">
+      <svg class="brand-icon-svg" aria-hidden="true"><use href="#rk-mark"/></svg>
+      <h1>Before you start</h1>
+      <p>The short version. Please read it.</p>
+    </div>
+
+    <div class="terms-pt">
+      <strong>🚑 Roamkeep is not an emergency service</strong>
+      SOS alerts the people in your Keep and nobody else. It does not
+      contact police, ambulance or fire, and no one is on call. In an
+      emergency call <strong>000</strong> — don't wait for this app.
+    </div>
+
+    <div class="terms-pt">
+      <strong>📍 Location is best-effort, and will sometimes be wrong</strong>
+      Phones go flat, lose signal and get throttled by Android. A position
+      may be stale, out by hundreds of metres, or missing entirely.
+      <strong>No alert is not evidence that nothing happened.</strong>
+    </div>
+
+    <div class="terms-pt">
+      <strong>🤝 Everyone in a Keep must know they are in it</strong>
+      Adults can pause their own sharing at any time. Never use Roamkeep to
+      track someone covertly. A parent or guardian is responsible for
+      anyone in the household who cannot agree for themselves.
+    </div>
+
+    <div class="terms-pt">
+      <strong>🗄️ Your family's database is yours</strong>
+      We do not run it, cannot read it, and cannot recover it for you.
+      Roamkeep is free and provided "as is", with no warranty.
+    </div>
+
+    <p class="note">Full <a id="terms-link" href="https://get.roamkeep.app/terms"
+      target="_blank" rel="noopener">Terms of Use</a> and
+      <a id="privacy-link" href="https://get.roamkeep.app/privacy"
+      target="_blank" rel="noopener">Privacy Policy</a> —
+      last updated <span id="terms-date">17 August 2026</span>.</p>
+
+    <button class="btn btn-g" data-action="accept-terms">I agree — continue</button>
+    <button class="lnk-btn" data-action="decline-terms">I don't agree</button>
+
+    <div class="err" id="terms-declined" style="display:none">
+      Roamkeep can't be used without agreeing to these terms. Close the app
+      if you'd rather not — nothing has been saved, and you can come back.
+    </div>
+  </div>
+</div>
+
 <!-- CONNECT (first run — choose which family server this device talks to) -->
 <div id="s-connect" class="screen">
   <div class="card">
@@ -223,6 +282,12 @@
         <h2>Roamkeep</h2>
         <div class="hdr-sub" id="hdr-sub">—</div>
       </div>
+      <!-- Everything configured once and then forgotten lives behind
+           here, so the Family tab can be about the setting people
+           actually revisit: their own tracking. -->
+      <button class="icon-btn hdr-cog" data-action="open-settings" aria-label="Settings">
+        <span class="ic" data-icon="settings"></span>
+      </button>
     </div>
     <div class="hdr-r">
       <div class="live" id="live-badge" data-action="refresh-fix" role="button" tabindex="0">
@@ -264,35 +329,9 @@
         <div class="sp on" id="sp-family">
           <div class="sec-h">Your Keep 🏰</div>
           <div id="members-list"></div>
-          <div class="sec-h" style="margin-top:18px">Settings</div>
+          <div class="sec-h" style="margin-top:18px">Tracking</div>
 
-          <div class="setting-block" id="family-name-block" style="display:none">
-            <div class="set-line" id="family-name-view">
-              <div class="grow">
-                <div class="setting-lbl">🏰 Family name</div>
-                <div class="set-val" id="family-name-val">—</div>
-              </div>
-              <button class="icon-btn" data-action="edit-family-name" aria-label="Edit family name">✏️</button>
-            </div>
-            <div id="family-name-edit" style="display:none">
-              <div class="field" style="margin:2px 0 8px">
-                <label for="family-name-input">🏰 Family name — shown at the top of everyone’s map</label>
-                <input id="family-name-input" type="text" maxlength="40" autocomplete="off">
-              </div>
-              <div class="row-btns">
-                <button class="btn btn-ghost sm" data-action="cancel-family-name">Cancel</button>
-                <button class="btn btn-g sm" id="family-name-save" data-action="save-family-name">Save name</button>
-              </div>
-            </div>
-          </div>
 
-          <div class="setting-row">
-            <span class="setting-lbl">🔔 Notify me when family arrive or leave a place</span>
-            <label class="switch" for="notify-toggle">
-              <input id="notify-toggle" type="checkbox" data-action="toggle-notify">
-              <span class="switch-slider"></span>
-            </label>
-          </div>
 
           <div class="setting-block" id="pause-block" style="display:none">
             <div class="setting-lbl">⏸️ Pause my location</div>
@@ -316,17 +355,8 @@
             <p class="note" id="track-desc"></p>
           </div>
 
-          <div class="setting-block">
-            <div class="setting-lbl">🔌 Family server</div>
-            <p class="note" id="backend-host">—</p>
-            <button class="btn" data-action="disconnect-backend">Disconnect this device</button>
-          </div>
 
-          <div class="setting-block">
-            <div class="setting-lbl">🏰 Background setup</div>
-            <p class="note">Location, battery and notification permissions that let your Keep stay up to date while the app is closed.</p>
-            <button class="btn" data-action="open-setup">Check setup</button>
-          </div>
+
 
           <div class="setting-block">
             <div class="diag-head">
@@ -461,6 +491,72 @@
     <div id="pn-list"></div>
     <p class="note">🆘 SOS alerts always come through, whatever is set here.</p>
     <button class="lnk-btn" data-action="close-place-notify">Done</button>
+  </div>
+</div>
+
+<!-- SETTINGS SHEET — the cog in the header.
+     Holds what is set once and then left alone. The Family tab keeps only
+     Tracking, which is the part someone actually comes back to.
+     Disconnect sits last and apart: it is the one irreversible thing in
+     here, and it should never be adjacent to something routine. -->
+<div class="sheet-scrim" id="settings-scrim" data-action="close-settings"></div>
+<div class="sheet" id="settings-sheet" role="dialog" aria-modal="true" aria-labelledby="settings-sheet-title">
+  <div class="sheet-handle" aria-hidden="true"></div>
+  <div class="sheet-body">
+    <div class="sec-h" id="settings-sheet-title">Settings</div>
+
+    <div class="setting-block">
+      <div class="setting-lbl">🏰 Background setup</div>
+      <p class="note">Location, battery and notification permissions that let your Keep stay up to date while the app is closed.</p>
+      <button class="btn" data-action="open-setup">Check setup</button>
+    </div>
+
+    <div class="setting-row">
+      <span class="setting-lbl">🔔 Notify me when family arrive or leave a place</span>
+      <label class="switch" for="notify-toggle">
+        <input id="notify-toggle" type="checkbox" data-action="toggle-notify">
+        <span class="switch-slider"></span>
+      </label>
+    </div>
+
+    <div class="setting-block" id="family-name-block" style="display:none">
+      <div class="set-line" id="family-name-view">
+        <div class="grow">
+          <div class="setting-lbl">🏰 Family name</div>
+          <div class="set-val" id="family-name-val">—</div>
+        </div>
+        <button class="icon-btn" data-action="edit-family-name" aria-label="Edit family name">✏️</button>
+      </div>
+      <div id="family-name-edit" style="display:none">
+        <div class="field" style="margin:2px 0 8px">
+          <label for="family-name-input">🏰 Family name — shown at the top of everyone’s map</label>
+          <input id="family-name-input" type="text" maxlength="40" autocomplete="off">
+        </div>
+        <div class="row-btns">
+          <button class="btn btn-ghost sm" data-action="cancel-family-name">Cancel</button>
+          <button class="btn btn-g sm" id="family-name-save" data-action="save-family-name">Save name</button>
+        </div>
+      </div>
+    </div>
+
+    <div class="setting-block">
+      <div class="setting-lbl">📄 Terms &amp; privacy</div>
+      <p class="note">What Roamkeep promises, what it doesn't, and what is
+        stored where. Last updated <span id="set-terms-date">17 August 2026</span>.</p>
+      <button class="btn" data-action="open-terms">Terms of Use</button>
+      <button class="btn" data-action="open-privacy" style="margin-top:8px">Privacy Policy</button>
+    </div>
+
+    <div class="setting-block">
+      <div class="setting-lbl">🔌 Family server</div>
+      <p class="note" id="backend-host">—</p>
+    </div>
+
+    <div class="setting-block danger-block">
+      <button class="btn" data-action="disconnect-backend">Disconnect this device</button>
+    </div>
+
+    <button class="lnk-btn" data-action="close-settings">Done</button>
   </div>
 </div>
 

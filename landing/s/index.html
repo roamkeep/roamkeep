@@ -1,0 +1,45 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Roamkeep — setup link</title>
+<meta name="robots" content="noindex">
+<!--
+  Setup links point at /s, and until now nothing was published there.
+
+  On the author's CloudFront the request survived by accident: an
+  index-rewrite function turns a extensionless path into "/s/index.html",
+  S3 returns 404 because that file did not exist, and a custom error
+  response quietly serves the root index.html with a 200. It works, and it
+  works for a reason nothing in this repo records — so anyone deploying
+  landing/ to a host without that error mapping gets a 404 on every setup
+  link a family sends.
+
+  This file makes /s a real path. It hands off to the page that actually
+  reads the link rather than duplicating it: two copies of that logic
+  would drift, and this one is small enough that it cannot.
+
+  The fragment is carried across explicitly. It is never sent to a server
+  in either hop — location.hash is read in the browser only, which is the
+  whole reason the config lives after the # instead of in a query string.
+-->
+<style>
+  body { font-family: -apple-system, 'Segoe UI', Roboto, sans-serif;
+         background: #FAFBFC; color: #0F172A; padding: 40px 20px;
+         text-align: center; line-height: 1.6; }
+  a { color: #0E7C7B; }
+  @media (prefers-color-scheme: dark) { body { background: #0B1220; color: #E8EEF6; } }
+</style>
+<script>
+  // replace(), not assign(): the hop should not sit in the back stack,
+  // so Back from the setup page returns where the family member came
+  // from rather than bouncing them through here again.
+  location.replace('/' + location.hash);
+</script>
+</head>
+<body>
+<p>Opening your setup link…</p>
+<p><a href="/">Continue</a> if this page does not move on its own.</p>
+</body>
+</html>

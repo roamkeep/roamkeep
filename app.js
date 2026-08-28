@@ -31,6 +31,25 @@
   // in the fragment.
   const SETUP_LINK_BASE = 'https://get.roamkeep.app/s';
 
+  // ── TERMS OF USE ───────────────────────────────────────────────
+  //
+  // The binding document is the one published at get.roamkeep.app/terms,
+  // and that is the ONLY copy. The gate screen summarises it and links to
+  // it; it deliberately does not restate it. Two copies of a legal
+  // document drift, and a contradiction between them is worse than either
+  // alone — the same reasoning landing/terms and landing/privacy already
+  // carry in their own headers.
+  //
+  // Bump TERMS_VERSION when the published terms change MATERIALLY. Every
+  // member is then asked again on next open, which is what makes the
+  // published "changes will be noted in the app's release notes" line
+  // honest rather than a formality. Do not bump it for a typo.
+  const TERMS_VERSION = 1;
+  const TERMS_DATE = '17 August 2026';        // matches the published page
+  const TERMS_URL = 'https://get.roamkeep.app/terms';
+  const PRIVACY_URL = 'https://get.roamkeep.app/privacy';
+  const TERMS_STORE_KEY = 'rk_terms';
+
   // Assigned once a backend is resolved; every consumer reads these.
   let SB_URL = '';
   let SB_KEY = '';
@@ -164,6 +183,43 @@
       if (Prefs) await Prefs.set({ key: BACKEND_STORE_KEY, value: raw });
       else localStorage.setItem(BACKEND_STORE_KEY, raw);
     } catch (e) { console.warn('saveBackendConfig', e); }
+  }
+
+  // Which terms version this device has accepted, or 0.
+  //
+  // Stored per DEVICE, not per account, and alongside the backend config
+  // rather than in the family's database. Acceptance is this person on
+  // this phone agreeing — it is not data their family should hold, and
+  // putting it in Supabase would have made it a schema change and a
+  // synchronisation problem for something neither needs.
+  //
+  // Android backup is off (see allowBackup in the manifest), so a
+  // reinstall asks again. That is the correct outcome, not a bug.
+  async function loadTermsAccepted() {
+    try {
+      const Prefs = window.Capacitor?.Plugins?.Preferences;
+      const raw = Prefs
+        ? (await Prefs.get({ key: TERMS_STORE_KEY })).value
+        : localStorage.getItem(TERMS_STORE_KEY);
+      if (!raw) return 0;
+      const v = JSON.parse(raw);
+      return Number(v && v.version) || 0;
+    } catch (_) { return 0; }
+  }
+
+  async function saveTermsAccepted() {
+    const raw = JSON.stringify({
+      version: TERMS_VERSION,
+      // What they agreed to and when, so a support question about which
+      // wording someone saw has an answer.
+      terms: TERMS_DATE,
+      at: new Date().toISOString()
+    });
+    try {
+      const Prefs = window.Capacitor?.Plugins?.Preferences;
+      if (Prefs) await Prefs.set({ key: TERMS_STORE_KEY, value: raw });
+      else localStorage.setItem(TERMS_STORE_KEY, raw);
+    } catch (e) { console.warn('saveTermsAccepted', e); }
   }
 
   async function clearBackendConfig() {
@@ -350,6 +406,7 @@
     x: '<path d="M18 6 6 18"/><path d="m6 6 12 12"/>',
     share: '<path d="M4 12v8a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-8"/><polyline points="16 6 12 2 8 6"/><line x1="12" y1="2" x2="12" y2="15"/>',
     'log-out': '<path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><polyline points="16 17 21 12 16 7"/><line x1="21" y1="12" x2="9" y2="12"/>',
+    'settings': '<circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.6 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.6a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9c.2.61.75 1.03 1.4 1.03H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/>',
     download: '<path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/>',
     history: '<path d="M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"/><path d="M3 3v5h5"/><path d="M12 7v5l4 2"/>',
     qr: '<rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><path d="M14 14h3v3h-3z"/><path d="M21 14v3"/><path d="M14 21h3"/><path d="M21 21h.01"/>',
@@ -944,12 +1001,10 @@
     // only revealed (and rotatable) inside the owner-only Invite modal.
     $('hdr-sub').textContent = S.keepName;
     // Show which server this device is bound to — with one app talking to
-    // many backends, "which one am I on?" is a real question.
-    const hostEl = $('backend-host');
-    if (hostEl) {
-      try { hostEl.textContent = new URL(SB_URL).host; }
-      catch (_) { hostEl.textContent = SB_URL; }
-    }
+    // many backends, "which one am I on?" is a real question — but the
+    // answer now lives in the cog sheet, which fills it in when opened.
+    // Setting it here too would be two places to keep in step for a value
+    // nobody can see until the sheet is up.
     // Sequential, not Promise.all: loadPlaces seeds insidePlaces from the
     // caller's own member row, so it needs loadMembers to have landed.
     await loadTwice(loadMembers);
@@ -4436,6 +4491,12 @@
     'cancel-place': cancelPlaceEdit,
     'edit-place': (t) => editPlace(t.dataset.id),
     'delete-place': (t) => deletePlace(t.dataset.id),
+    'open-settings': openSettings,
+    'close-settings': closeSettings,
+    'accept-terms': acceptTerms,
+    'decline-terms': declineTerms,
+    'open-terms': () => openExternal(TERMS_URL),
+    'open-privacy': () => openExternal(PRIVACY_URL),
     'sos-navigate': (t) => sosNavigate(t),
     'sos-copy': (t) => sosCopy(t),
     'place-notify': (t) => openPlaceNotify(t.dataset.id),
@@ -4715,6 +4776,89 @@
     }
   }
 
+  /**
+   * Show the terms and wait for an answer. Resolves true once accepted.
+   *
+   * Placed BEFORE the sign-in screen, so agreement comes before the app
+   * asks for an email address — not after, and nowhere near the setup
+   * sheet. Interleaving it with the permission flow would put a second
+   * dialog on top of the prominent-disclosure sheet, which is the exact
+   * ordering this codebase has had to fix three times.
+   */
+  // The cog sheet. Contents are static markup; the only state it needs is
+  // whatever the blocks inside already manage for themselves, so opening
+  // it just refreshes the two values that can go stale while it is shut.
+  function openSettings() {
+    const host = $('backend-host');
+    if (host) {
+      try { host.textContent = new URL(SB_URL).host; }
+      catch (_) { host.textContent = SB_URL; }
+    }
+    const td = $('set-terms-date');
+    if (td) td.textContent = TERMS_DATE;
+    // Owner-only, and ownership can change while the app is open — so
+    // this is re-evaluated on every open rather than once at launch.
+    // renderFamilyNameSetting already owns that rule; don't restate it.
+    renderFamilyNameSetting();
+
+    closeDrawer();
+    const sheet = $('settings-sheet');
+    const scrim = $('settings-scrim');
+    if (sheet) { sheet.classList.remove('half'); sheet.classList.add('full', 'open'); }
+    if (scrim) scrim.classList.add('on');
+    document.body.classList.add('sheet-open');
+  }
+
+  function closeSettings() {
+    const sheet = $('settings-sheet');
+    const scrim = $('settings-scrim');
+    if (sheet) sheet.classList.remove('open', 'half', 'full');
+    if (scrim) scrim.classList.remove('on');
+    document.body.classList.remove('sheet-open');
+  }
+
+  /** Open a published page in the system browser, not the WebView — the
+   *  app's own WebView has no chrome to get back from. */
+  function openExternal(url) {
+    try { window.open(url, '_blank', 'noopener'); }
+    catch (_) { window.location.href = url; }
+  }
+
+  function askTerms() {
+    return new Promise((resolve) => {
+      const d = $('terms-date');
+      if (d) d.textContent = TERMS_DATE;
+      const t = $('terms-link');
+      if (t) t.href = TERMS_URL;
+      const p = $('privacy-link');
+      if (p) p.href = PRIVACY_URL;
+      _termsResolve = resolve;
+      show('s-terms');
+    });
+  }
+
+  let _termsResolve = null;
+
+  async function acceptTerms() {
+    await saveTermsAccepted();
+    const done = _termsResolve;
+    _termsResolve = null;
+    if (done) done(true);
+  }
+
+  // Declining is a real answer, so it gets a real outcome rather than a
+  // disabled button: the app closes. Nothing is deleted — reopening asks
+  // again, and a family member who wants to read the full terms first can
+  // do exactly that.
+  function declineTerms() {
+    const App = window.Capacitor?.Plugins?.App;
+    if (isNative() && App && App.exitApp) {
+      try { App.exitApp(); return; } catch (_) {}
+    }
+    const note = $('terms-declined');
+    if (note) note.style.display = 'block';
+  }
+
   async function applySetupConfig(cfg, opts) {
     setConnectErr('');
     const btnIds = ['connect-scan', 'connect-paste-go'];
@@ -4898,6 +5042,18 @@
     // then refuse to use.
     setMsg('Checking your family server…');
     if (!(await checkSchemaCompatible())) return;
+
+    // Terms before anything is collected. Deliberately after the schema
+    // check — there is no point asking someone to agree to use an app
+    // that is about to tell them it cannot run against their database.
+    //
+    // Gated on the VERSION, not a boolean, so materially changed terms
+    // ask again on next open. Existing members upgrading into this
+    // release see it once, which is the intent: they have not agreed to
+    // anything yet either.
+    if ((await loadTermsAccepted()) < TERMS_VERSION) {
+      await askTerms();
+    }
 
     setMsg('Checking session…');
 
