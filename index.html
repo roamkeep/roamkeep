@@ -422,6 +422,7 @@
 <div class="sheet-scrim" id="place-sheet-scrim" data-action="cancel-place"></div>
 <div class="sheet" id="place-sheet" role="dialog" aria-modal="true" aria-labelledby="pe-title">
   <div class="sheet-handle" aria-hidden="true"></div>
+  <button class="sheet-x" data-action="cancel-place" aria-label="Close"><span class="ic" data-icon="x"></span></button>
   <div class="sheet-body">
     <div class="sec-h" id="pe-title">New Place</div>
     <div class="field">
@@ -435,30 +436,28 @@
       <input id="pe-radius" type="range" min="25" max="500" step="5" value="100">
     </div>
     <div class="pe-coord" id="pe-coord"></div>
-    <button class="btn btn-g" id="pe-save" data-action="save-place"><span class="ic" data-icon="save"></span> Save place</button>
-    <button class="lnk-btn" data-action="cancel-place">Cancel</button>
-  </div>
+    <button class="btn btn-g" id="pe-save" data-action="save-place"><span class="ic" data-icon="save"></span> Save place</button>  </div>
 </div>
 
 <!-- INVITE SHEET (owner only) -->
 <div class="sheet-scrim" id="invite-scrim" data-action="close-invite"></div>
 <div class="sheet" id="invite-sheet" role="dialog" aria-modal="true" aria-labelledby="inv-title">
   <div class="sheet-handle" aria-hidden="true"></div>
+  <button class="sheet-x" data-action="close-invite" aria-label="Close"><span class="ic" data-icon="x"></span></button>
   <div class="sheet-body">
     <div class="sec-h" id="inv-title">Invite family 🏰</div>
     <p class="note">Share this code with a family member. They create an account, tap <strong>Join Keep</strong>, and enter it. Codes expire after 72 hours — rotate a fresh one whenever you need.</p>
     <div class="invite-code" id="inv-code">——</div>
     <div class="note" id="inv-expiry">—</div>
     <button class="btn btn-g" data-action="share-invite"><span class="ic" data-icon="share"></span> Share invite</button>
-    <button class="btn" id="inv-rotate" data-action="rotate-code">🔄 Rotate code</button>
-    <button class="lnk-btn" data-action="close-invite">Close</button>
-  </div>
+    <button class="btn" id="inv-rotate" data-action="rotate-code">🔄 Rotate code</button>  </div>
 </div>
 
 <!-- PROFILE EDIT SHEET (own row always; owner on any row) -->
 <div class="sheet-scrim" id="profile-scrim" data-action="cancel-profile"></div>
 <div class="sheet" id="profile-sheet" role="dialog" aria-modal="true" aria-labelledby="pf-title">
   <div class="sheet-handle" aria-hidden="true"></div>
+  <button class="sheet-x" data-action="cancel-profile" aria-label="Close"><span class="ic" data-icon="x"></span></button>
   <div class="sheet-body">
     <div class="sec-h" id="pf-title">Edit profile</div>
     <div class="field">
@@ -467,9 +466,7 @@
     </div>
     <div class="av-label">Avatar</div>
     <div class="av-row scroll" id="pf-avs"></div>
-    <button class="btn btn-g" id="pf-save" data-action="save-profile">Save changes</button>
-    <button class="lnk-btn" data-action="cancel-profile">Cancel</button>
-  </div>
+    <button class="btn btn-g" id="pf-save" data-action="save-profile">Save changes</button>  </div>
 </div>
 
 <!-- PER-PLACE NOTIFY SHEET — who this place tells me about.
@@ -478,6 +475,7 @@
 <div class="sheet-scrim" id="pn-scrim" data-action="close-place-notify"></div>
 <div class="sheet" id="pn-sheet" role="dialog" aria-modal="true" aria-labelledby="pn-title">
   <div class="sheet-handle" aria-hidden="true"></div>
+  <button class="sheet-x" data-action="close-place-notify" aria-label="Close"><span class="ic" data-icon="x"></span></button>
   <div class="sheet-body">
     <div class="sec-h" id="pn-title">Notifications</div>
     <p class="note">Tell me when these people arrive at or leave this place.
@@ -489,9 +487,7 @@
       or leave a place" back on, in Family → Settings.
     </div>
     <div id="pn-list"></div>
-    <p class="note">🆘 SOS alerts always come through, whatever is set here.</p>
-    <button class="lnk-btn" data-action="close-place-notify">Done</button>
-  </div>
+    <p class="note">🆘 SOS alerts always come through, whatever is set here.</p>  </div>
 </div>
 
 <!-- SETTINGS SHEET — the cog in the header.
@@ -502,14 +498,9 @@
 <div class="sheet-scrim" id="settings-scrim" data-action="close-settings"></div>
 <div class="sheet" id="settings-sheet" role="dialog" aria-modal="true" aria-labelledby="settings-sheet-title">
   <div class="sheet-handle" aria-hidden="true"></div>
+  <button class="sheet-x" data-action="close-settings" aria-label="Close"><span class="ic" data-icon="x"></span></button>
   <div class="sheet-body">
     <div class="sec-h" id="settings-sheet-title">Settings</div>
-
-    <div class="setting-block">
-      <div class="setting-lbl">🏰 Background setup</div>
-      <p class="note">Location, battery and notification permissions that let your Keep stay up to date while the app is closed.</p>
-      <button class="btn" data-action="open-setup">Check setup</button>
-    </div>
 
     <div class="setting-row">
       <span class="setting-lbl">🔔 Notify me when family arrive or leave a place</span>
@@ -540,6 +531,12 @@
     </div>
 
     <div class="setting-block">
+      <div class="setting-lbl">🏰 Background setup</div>
+      <p class="note">Location, battery and notification permissions that let your Keep stay up to date while the app is closed.</p>
+      <button class="btn" data-action="open-setup">Check setup</button>
+    </div>
+
+    <div class="setting-block">
       <div class="setting-lbl">📄 Terms &amp; privacy</div>
       <p class="note">What Roamkeep promises, what it doesn't, and what is
         stored where. Last updated <span id="set-terms-date">17 August 2026</span>.</p>
@@ -555,8 +552,6 @@
     <div class="setting-block danger-block">
       <button class="btn" data-action="disconnect-backend">Disconnect this device</button>
     </div>
-
-    <button class="lnk-btn" data-action="close-settings">Done</button>
   </div>
 </div>
 
@@ -564,6 +559,7 @@
 <div class="sheet-scrim" id="setup-scrim" data-action="close-setup"></div>
 <div class="sheet" id="setup-sheet" role="dialog" aria-modal="true" aria-labelledby="setup-title">
   <div class="sheet-handle" aria-hidden="true"></div>
+  <button class="sheet-x" data-action="close-setup" aria-label="Close"><span class="ic" data-icon="x"></span></button>
   <div class="sheet-body">
     <div class="sec-h" id="setup-title">Finish setting up 🏰</div>
     <!-- Prominent disclosure. Android requires location use to be
@@ -574,9 +570,7 @@
       leave a saved place — <strong>including when the app is closed or not
       in use</strong>. Only members of your Keep can ever see it.</p>
     <div id="setup-rows"></div>
-    <p class="note" id="setup-foot"></p>
-    <button class="btn btn-g" data-action="close-setup">Done</button>
-  </div>
+    <p class="note" id="setup-foot"></p>  </div>
 </div>
 
 <!-- TOASTS -->

@@ -1,4 +1,5 @@
 import type { CapacitorConfig } from '@capacitor/cli';
+import { KeyboardResize } from '@capacitor/keyboard';
 
 const config: CapacitorConfig = {
   appId: 'com.roamkeep.app',
@@ -38,6 +39,13 @@ const config: CapacitorConfig = {
     // the toast and the banner come from the same checkins INSERT.
     PushNotifications: {
       presentationOptions: ['badge', 'sound', 'alert']
+    },
+    // Do NOT let the plugin resize the WebView: resize:native does not shrink
+    // under this app's edge-to-edge layout (the keyboard just overlaps), so we
+    // keep the view fixed and float the open sheet / login card above the
+    // keyboard via the --kb inset (initKeyboardInsets in app.js).
+    Keyboard: {
+      resize: KeyboardResize.None
     }
   }
 };

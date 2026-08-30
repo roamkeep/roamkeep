@@ -2,7 +2,7 @@
   "name": "roamkeep",
   "version": "0.3.0",
   "private": true,
-  "description": "Roamkeep \u2014 private family location sharing. PWA + Capacitor Android shell.",
+  "description": "Roamkeep — private family location sharing. PWA + Capacitor Android shell.",
   "scripts": {
     "build": "node build.js",
     "build:pwa": "node build.js --bake",
@@ -27,6 +27,7 @@
     "@capacitor/app": "^7.1.2",
     "@capacitor/core": "^7.0.0",
     "@capacitor/geolocation": "^7.0.0",
+    "@capacitor/keyboard": "^7.0.6",
     "@capacitor/preferences": "^7.0.4",
     "@capacitor/push-notifications": "^7.0.6",
     "@capacitor/status-bar": "^7.0.0"

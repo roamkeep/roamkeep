@@ -498,6 +498,12 @@
   function sTab(id, btn) {
     document.querySelectorAll('.stab').forEach(t => t.classList.remove('on'));
     if (btn) btn.classList.add('on');
+    // Keep the bottom nav in step with the drawer tab. Switching tabs inside
+    // the open drawer goes through a .stab tap (this fn) without touching the
+    // bnav, which left the two strips highlighting different tabs. mobNav()
+    // also routes through here, so both entry points stay in sync.
+    document.querySelectorAll('.bnav-btn').forEach(b => b.classList.remove('on'));
+    document.querySelector('.bnav-btn[data-nav="' + id + '"]')?.classList.add('on');
     document.querySelectorAll('.sp').forEach(p => p.classList.remove('on'));
     $('sp-' + id)?.classList.add('on');
     // The timeline renders lazily — its queries only run when looked at.
@@ -570,6 +576,9 @@
   }
 
   async function signOut() {
+    // The sign-out control sits in the header next to routine actions and is
+    // easy to hit by mistake; confirm before tearing down the session.
+    if (!confirm('Sign out of Roamkeep?\n\nYou can sign back in with your email and password.')) return;
     if (S.channel) S.sb.removeChannel(S.channel);
     if (S.myId) {
       // Clear the FCM token alongside the offline flag so the
@@ -2766,51 +2775,137 @@
     drawMap();
   }
 
-  function initSheet() {
-    const sheet = $('place-sheet');
-    const handle = sheet?.querySelector('.sheet-handle');
-    if (!sheet || !handle) return;
-    let startY = 0;
-    let startH = 0;
-    let dragging = false;
-    const onDown = (e) => {
+  // Drag/tap gesture for EVERY sheet that has a handle (not just the place
+  // editor). Position is driven by an inline translateY offset, never by
+  // mutating height — the old code grew style.height while the .half class
+  // pinned the visible height to 380px, so dragging revealed nothing and the
+  // action button (e.g. "Update place") stayed unreachable. On release we snap
+  // to full / half / close; a tap toggles half<->full. Gated to touch: on
+  // desktop the sheet is a centered modal and the X is the control.
+  const SHEET_PEEK = 380; // must match .sheet.half translateY(calc(100% - 380px))
+  function initSheets() {
+    const sheets = Array.from(document.querySelectorAll('.sheet'))
+      .filter((s) => s.querySelector('.sheet-handle'));
+    if (!sheets.length) return;
+    const coarse = () => window.matchMedia('(pointer: coarse)').matches;
+    let active = null, startY = 0, baseT = 0, boxH = 0, moved = 0, downT = 0;
+    let lastY = 0, lastT = 0, prevY = 0, prevT = 0;
+
+    const stateOffset = (sheet, H) =>
+      sheet.classList.contains('full') ? 0 : Math.max(0, H - SHEET_PEEK);
+
+    const onDown = (sheet, e) => {
+      if (!coarse()) return; // desktop: no drag, use the X
+      if (!sheet.classList.contains('open')) return; // never drag a parked/closed sheet
       const pt = e.touches ? e.touches[0] : e;
-      startY = pt.clientY;
-      startH = sheet.getBoundingClientRect().height;
-      dragging = true;
+      active = sheet;
+      boxH = sheet.getBoundingClientRect().height;
+      baseT = stateOffset(sheet, boxH);
+      startY = prevY = lastY = pt.clientY;
+      downT = prevT = lastT = performance.now();
+      moved = 0;
       sheet.classList.add('dragging');
     };
     const onMove = (e) => {
-      if (!dragging) return;
+      if (!active) return;
       const pt = e.touches ? e.touches[0] : e;
       const dy = pt.clientY - startY;
-      const vh = window.innerHeight;
-      const h = Math.max(120, Math.min(vh - 20, startH - dy));
-      sheet.style.height = h + 'px';
+      moved = Math.max(moved, Math.abs(dy));
+      let t = baseT + dy;
+      if (t < 0) t = 0; else if (t > boxH) t = boxH;
+      active.style.transform = 'translateY(' + t + 'px)';
+      prevY = lastY; prevT = lastT;
+      lastY = pt.clientY; lastT = performance.now();
+      if (e.cancelable) e.preventDefault(); // stop the map/body scrolling under us
     };
     const onUp = () => {
-      if (!dragging) return;
-      dragging = false;
+      if (!active) return;
+      const sheet = active; active = null;
       sheet.classList.remove('dragging');
-      const h = sheet.getBoundingClientRect().height;
-      const vh = window.innerHeight;
-      sheet.style.height = '';
-      if (h < 180) {
-        cancelPlaceEdit();
-      } else if (h > vh * 0.75) {
-        sheet.classList.remove('half');
-        sheet.classList.add('full');
+      const H = boxH;
+      const m = /translateY\(([-\d.]+)px\)/.exec(sheet.style.transform || '');
+      const t = m ? parseFloat(m[1]) : baseT;
+      sheet.style.transform = ''; // hand back to the class-based transforms
+      const v = (lastY - prevY) / Math.max(1, lastT - prevT); // px/ms, +ve = down
+      const dur = performance.now() - downT;
+
+      if (moved < 6 && dur < 300) { // tap → toggle half<->full
+        const full = sheet.classList.toggle('full');
+        sheet.classList.toggle('half', !full);
+        return;
+      }
+      const visible = H - t;
+      if (visible < 140 || v > 1.1) { // dragged/flicked down → close via the sheet's own closer
+        const act = sheet.querySelector('.sheet-x')?.dataset.action;
+        if (act && ACTIONS[act]) ACTIONS[act]();
+        else sheet.classList.remove('open', 'half', 'full');
+        return;
+      }
+      if (visible > (SHEET_PEEK + H) / 2) {
+        sheet.classList.remove('half'); sheet.classList.add('full');
       } else {
-        sheet.classList.remove('full');
-        sheet.classList.add('half');
+        sheet.classList.remove('full'); sheet.classList.add('half');
       }
     };
-    handle.addEventListener('touchstart', onDown, { passive: true });
-    handle.addEventListener('mousedown', onDown);
-    window.addEventListener('touchmove', onMove, { passive: true });
+
+    sheets.forEach((sheet) => {
+      const handle = sheet.querySelector('.sheet-handle');
+      handle.addEventListener('touchstart', (e) => onDown(sheet, e), { passive: true });
+      handle.addEventListener('mousedown', (e) => onDown(sheet, e));
+    });
+    window.addEventListener('touchmove', onMove, { passive: false });
     window.addEventListener('mousemove', onMove);
     window.addEventListener('touchend', onUp);
     window.addEventListener('mouseup', onUp);
+  }
+
+  function initKeyboardInsets() {
+    // The WebView is NOT resized for the IME (Keyboard resize:none) — that
+    // doesn't shrink under this app's edge-to-edge layout, so the keyboard
+    // just overlaps. Instead we set --kb (the occluded height) and float the
+    // open sheet / login card above it. The native Keyboard event is a
+    // reliable "keyboard is up" signal + height on the app; visualViewport
+    // refines it to the EXACT occlusion (native keyboardHeight over-lifts on
+    // some devices) and is the sole driver on the PWA.
+    const root = document.documentElement;
+    let kb = -1, kbOpen = false;
+    const setKb = (px) => {
+      const v = Math.max(0, Math.round(px || 0));
+      if (v === kb) return;
+      kb = v;
+      root.style.setProperty('--kb', v + 'px');
+    };
+    setKb(0);
+    const KB = window.Capacitor?.Plugins?.Keyboard;
+    const native = KB && typeof KB.addListener === 'function';
+    if (native) {
+      KB.addListener('keyboardWillShow', (info) => { kbOpen = true; setKb(info && info.keyboardHeight); });
+      KB.addListener('keyboardWillHide', () => { kbOpen = false; setKb(0); });
+    }
+    const vv = window.visualViewport;
+    if (vv) {
+      const onVV = () => {
+        const occluded = window.innerHeight - (vv.height + vv.offsetTop);
+        const val = occluded > 80 ? occluded : 0; // ignore small browser-UI shifts
+        if (native) {
+          // Refine the native lift to the exact occlusion, but never zero it
+          // while the keyboard is up — keyboardWillHide owns closing.
+          if (kbOpen && val > 0) setKb(val);
+        } else {
+          setKb(val);
+        }
+      };
+      vv.addEventListener('resize', onVV);
+      vv.addEventListener('scroll', onVV);
+    }
+    // Keep the focused field visible within a tall sheet or the login card.
+    document.addEventListener('focusin', (e) => {
+      const el = e.target;
+      if (!el || !el.matches || !el.matches('input, textarea')) return;
+      setTimeout(() => {
+        try { el.scrollIntoView({ block: 'center', behavior: 'smooth' }); } catch (_) {}
+      }, 250);
+    });
   }
 
   async function savePlaceFromForm() {
@@ -4996,7 +5091,8 @@
   // ── BOOT ───────────────────────────────────────────────────────
   async function boot() {
     renderStaticIcons();
-    initSheet();
+    initSheets();
+    initKeyboardInsets();
     await configureNativeChrome();
     setMsg('Loading…');
     if (!window.supabase || !window.supabase.createClient) {

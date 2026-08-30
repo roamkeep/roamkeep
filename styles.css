@@ -152,6 +152,11 @@ body {
   align-items: center;
   justify-content: center;
   padding: 20px;
+  /* When the on-screen keyboard is up (--kb > 0) give the scrollable card
+     extra room below and tell scrollIntoView to clear the keyboard, so the
+     focused field lifts above it instead of hiding behind it. */
+  padding-bottom: calc(20px + var(--kb, 0px));
+  scroll-padding-bottom: var(--kb, 0px);
   overflow-y: auto;
   -webkit-overflow-scrolling: touch;
 }
@@ -817,6 +822,9 @@ input[type=range]::-moz-range-thumb {
    already-active button closes the drawer (map-only view). */
 .bnav {
   display: none; flex-shrink: 0;
+  /* Above the slide-up drawer (z-index 50) so the drawer can sit flush against
+     it — even overlapping slightly — without ever covering the nav buttons. */
+  position: relative; z-index: 51;
   background: var(--surface); color: var(--muted);
   padding-bottom: env(safe-area-inset-bottom);
   box-shadow: 0 -1px 0 var(--surface-3);
@@ -897,14 +905,22 @@ input[type=range]::-moz-range-thumb {
   border-radius: 20px 20px 0 0;
   box-shadow: 0 -12px 32px rgba(15, 23, 42, .16);
   transform: translateY(110%);
-  transition: transform .28s cubic-bezier(.2,.8,.2,1);
+  transition: transform .28s cubic-bezier(.2,.8,.2,1), bottom .2s ease;
   max-height: 90dvh;
   padding-bottom: env(safe-area-inset-bottom);
   display: flex; flex-direction: column;
 }
-.sheet.half { transform: translateY(calc(100% - 380px)); }
+/* max(0px, …) so a short sheet (content shorter than the 380px peek) sits
+   flush at the bottom instead of the peek transform lifting it up and leaving
+   a gap below it. The keyboard is handled natively (Keyboard resize:native
+   shrinks the WebView), so no manual bottom offset is needed. */
+.sheet.half { transform: translateY(max(0px, calc(100% - 380px))); }
 .sheet.full { transform: translateY(0); }
 .sheet.dragging { transition: none; }
+/* Float ONLY the open sheet above the on-screen keyboard (--kb = occluded
+   height, set by initKeyboardInsets). Scoped to .open so closed sheets stay
+   parked at bottom:0 (translateY(110%)) and never poke back on-screen. */
+.sheet.open { bottom: var(--kb, 0px); }
 .sheet-handle {
   padding: 10px 0 6px; cursor: grab;
   display: flex; align-items: center; justify-content: center;
@@ -915,6 +931,20 @@ input[type=range]::-moz-range-thumb {
   background: var(--surface-3); border-radius: 2px;
 }
 .sheet-handle:active { cursor: grabbing; }
+/* Top-right close on every sheet — the standard modal dismiss. Sits in the
+   handle row, clear of the centered bar; the left-aligned title never reaches
+   the far corner. Wired via each sheet's existing data-action closer. */
+.sheet-x {
+  position: absolute; top: 5px; right: 7px; z-index: 2;
+  width: 40px; height: 40px;
+  display: flex; align-items: center; justify-content: center;
+  background: none; border: none; cursor: pointer;
+  color: var(--muted); border-radius: 10px;
+  -webkit-tap-highlight-color: transparent;
+}
+.sheet-x:hover { color: var(--ink); background: var(--surface-2); }
+.sheet-x:active { color: var(--ink); background: var(--surface-3); }
+.sheet-x .ic svg { width: 22px; height: 22px; }
 .sheet-body {
   flex: 1; overflow-y: auto;
   -webkit-overflow-scrolling: touch;
@@ -938,9 +968,11 @@ input[type=range]::-moz-range-thumb {
   .sidebar { display: none; }
   .sidebar.mob {
     display: flex; position: fixed;
-    /* Sit above the bottom nav so users can still switch tabs
-       or tap the active button to close the drawer. */
-    bottom: calc(64px + env(safe-area-inset-bottom));
+    /* Meet the bottom nav flush — reach just into it so no map shows through
+       the seam. The bnav (z-index 51) covers the small overlap, and the
+       .sbody's own padding keeps the last item clear of the nav. Users can
+       still tap the active bnav button to close the drawer. */
+    bottom: calc(48px + env(safe-area-inset-bottom));
     left: 0; right: 0;
     width: 100%; height: 55vh;
     max-height: calc(100dvh - 180px);
@@ -971,7 +1003,7 @@ input[type=range]::-moz-range-thumb {
     transform: translate(-50%, 110%);
     border-radius: 20px 20px 0 0;
   }
-  .sheet.half { transform: translate(-50%, calc(100% - 420px)); }
+  .sheet.half { transform: translate(-50%, max(0px, calc(100% - 420px))); }
   .sheet.full { transform: translate(-50%, 0); }
 }
 
