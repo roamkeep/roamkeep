@@ -598,11 +598,15 @@ in the Supabase SQL editor (or, for a fresh project, just run
 [`db/schema.sql`](db/schema.sql), which already includes it). Adds:
 
 - `keep_members.fcm_token text` — populated by the Capacitor plugin's
-  registration listener.
+  registration listener. **Moved in v14** to `keep_member_push.fcm_token`,
+  because `keep_members` is readable across the whole keep and RLS cannot
+  restrict columns, so a token there was one every relative could read. On
+  any database at v14 or later, read and write `keep_member_push` instead.
 - `keep_members.notify_on_checkin bool default true` — per-recipient
   mute switch, surfaced as a toggle in the app's Family tab.
 - A partial index on `(keep_id) where fcm_token is not null` so the
-  edge function's per-INSERT recipient lookup stays cheap.
+  edge function's per-INSERT recipient lookup stays cheap. v14 moves this
+  to `idx_member_push_keep` on the new table.
 
 Idempotent; safe to re-run.
 
@@ -657,8 +661,9 @@ function returns `200 ok` synchronously without blocking the insert.
    top of v1.3 — must upgrade in place without uninstall.
 2. First launch on Android 13+ surfaces the notification permission
    prompt. Grant.
-3. Sign in. Open Supabase table editor → `keep_members` → confirm your
-   row's `fcm_token` got populated.
+3. Sign in. Open Supabase table editor → `keep_member_push` (on a
+   pre-v14 database, `keep_members`) → confirm your row's `fcm_token`
+   got populated.
 4. With two devices logged in as different members of the same Keep:
    walk into a saved place on device A. Within ~2 s, device B's
    notification tray gets `📍 Alice arrived at Home`. Device A does
@@ -670,7 +675,8 @@ function returns `200 ok` synchronously without blocking the insert.
 7. Toggle **🔔 Notify me when family arrive or leave a place** off in
    the Family tab on device B → verify B receives nothing on subsequent
    transitions; re-enable → notifications resume.
-8. Sign out on device A → confirm `fcm_token` is cleared.
+8. Sign out on device A → confirm `fcm_token` is cleared in
+   `keep_member_push`.
 9. Edge-function logs: Supabase Dashboard → Functions → notify-checkin
    → Logs. One invocation per check-in INSERT, body `ok recipients=N
    dead=0`.

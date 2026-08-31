@@ -56,8 +56,34 @@
 
 import { createClient } from 'https://esm.sh/@supabase/supabase-js@2.45.4';
 
-const DEFAULT_RELAY = 'https://roamkeep-relay.roamkeep.workers.dev/v1/push';
+const DEFAULT_RELAY = 'https://relay.roamkeep.app/v1/push';
 const RELAY_BATCH = 20;   // relay's per-call token cap
+
+/**
+ * Cached expected webhook secret, per isolate.
+ *
+ * The database issues its own secret (roamkeep_secrets, RLS-denied to
+ * everyone) and the trigger sends it as a header. We read the same row with
+ * the service-role key, so there is nothing for an owner to configure and no
+ * way for the two sides to drift apart.
+ *
+ * Deliberately NOT an Edge Function secret the owner sets by hand. That
+ * works at three projects and silently protects nobody at three thousand,
+ * because most owners will never run the command — and a check that is off
+ * for most deployments is not a check.
+ *
+ * `undefined` = not looked up yet. `null` = looked up, nothing there, which
+ * is the expand case: a function deployed against a database that has not
+ * run the v14 migration keeps working exactly as it did before.
+ */
+let cachedSecret: string | null | undefined;
+
+async function webhookSecret(sb: ReturnType<typeof createClient>): Promise<string | null> {
+  if (cachedSecret !== undefined) return cachedSecret;
+  const { data } = await sb.from('roamkeep_secrets').select('webhook_secret').maybeSingle();
+  cachedSecret = (data as { webhook_secret?: string } | null)?.webhook_secret ?? null;
+  return cachedSecret;
+}
 
 /**
  * Accept RELAY_URL with or without the endpoint path.
@@ -104,6 +130,22 @@ interface WebhookPayload {
 Deno.serve(async (req) => {
   if (req.method !== 'POST') return new Response('method not allowed', { status: 405 });
 
+  const sb = createClient(
+    Deno.env.get('SUPABASE_URL')!,
+    Deno.env.get('SUPABASE_SERVICE_ROLE_KEY')!,
+    { auth: { persistSession: false } },
+  );
+
+  // This function is deployed --no-verify-jwt, because a Database Webhook
+  // has no user JWT to present. Without the check below, anyone who knew
+  // the project ref could invoke it — and the ref is in every setup link
+  // and QR code. Checked before the body is read, so a forged call is
+  // rejected as cheaply as possible.
+  const want = await webhookSecret(sb);
+  if (want && req.headers.get('x-roamkeep-webhook') !== want) {
+    return new Response('forbidden', { status: 403 });
+  }
+
   let payload: WebhookPayload;
   try {
     payload = await req.json();
@@ -120,12 +162,6 @@ Deno.serve(async (req) => {
   if (row.type !== 'arrived' && row.type !== 'left' && !isSos) {
     return new Response('skip type=' + row.type, { status: 200 });
   }
-
-  const sb = createClient(
-    Deno.env.get('SUPABASE_URL')!,
-    Deno.env.get('SUPABASE_SERVICE_ROLE_KEY')!,
-    { auth: { persistSession: false } },
-  );
 
   // Recipients: decided by checkin_recipients() in the family's own
   // database — everyone else in the keep with a token, minus anyone who
@@ -178,8 +214,9 @@ Deno.serve(async (req) => {
   if (dead.length) {
     // Null out stale tokens so we stop trying. The next time the
     // affected device opens the app, the registration listener
-    // re-populates with a fresh token.
-    await sb.from('keep_members').update({ fcm_token: null }).in('id', dead);
+    // re-populates with a fresh token. Since v14 the token lives in
+    // keep_member_push, keyed on member_id.
+    await sb.from('keep_member_push').update({ fcm_token: null }).in('member_id', dead);
   }
 
   return new Response(

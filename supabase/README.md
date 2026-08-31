@@ -196,8 +196,21 @@ supabase functions deploy notify-places  --no-verify-jwt --project-ref <your-ref
 
 (Drop `--project-ref` if you ran `supabase link`.)
 
-`--no-verify-jwt` is required because Database Webhooks call this
-function with the webhook's own auth header, not a Supabase user JWT.
+`--no-verify-jwt` is required because a Database Webhook has no Supabase
+user JWT to present.
+
+That used to mean the functions were open to anyone who knew the project
+ref — which is in every setup link and QR code. Since **v14** the database
+issues itself a secret (`roamkeep_secrets`, RLS-denied to everyone), the
+trigger sends it as an `x-roamkeep-webhook` header, and each function reads
+the same row with its service-role key and rejects anything that does not
+match.
+
+**There is nothing to configure.** No secret to generate, copy or set — that
+was the point: a step every owner has to remember is a step most deployments
+never get. A function deployed against a database that has not yet run v14
+finds no secret and leaves the check open, so the two halves can be rolled
+out in either order without a window where push breaks.
 
 Re-deploy any time you change `index.ts` — same command.
 

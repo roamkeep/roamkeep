@@ -68,8 +68,26 @@
 
 import { createClient } from 'https://esm.sh/@supabase/supabase-js@2.45.4';
 
-const DEFAULT_RELAY = 'https://roamkeep-relay.roamkeep.workers.dev/v1/push';
+const DEFAULT_RELAY = 'https://relay.roamkeep.app/v1/push';
 const RELAY_BATCH = 20;   // relay's per-call token cap
+
+/**
+ * Cached expected webhook secret, per isolate. See notify-checkin for the
+ * full reasoning: the database issues its own secret, the trigger sends it,
+ * and this function reads the same row with the service-role key — so there
+ * is nothing for an owner to configure and no way for the two to drift.
+ *
+ * `undefined` = not looked up. `null` = nothing there, which leaves the
+ * check open so a function deployed ahead of the v14 migration keeps working.
+ */
+let cachedSecret: string | null | undefined;
+
+async function webhookSecret(sb: ReturnType<typeof createClient>): Promise<string | null> {
+  if (cachedSecret !== undefined) return cachedSecret;
+  const { data } = await sb.from('roamkeep_secrets').select('webhook_secret').maybeSingle();
+  cachedSecret = (data as { webhook_secret?: string } | null)?.webhook_secret ?? null;
+  return cachedSecret;
+}
 
 /** Accept RELAY_URL with or without the endpoint path — see notify-checkin. */
 function relayEndpoint(): string {
@@ -83,6 +101,12 @@ interface PlaceRow {
   name: string;
 }
 
+/** One row of keep_push_recipients(). */
+interface Recipient {
+  member_id: string;
+  fcm_token: string;
+}
+
 interface WebhookPayload {
   type: 'INSERT' | 'UPDATE' | 'DELETE';
   table: string;
@@ -93,6 +117,20 @@ interface WebhookPayload {
 
 Deno.serve(async (req) => {
   if (req.method !== 'POST') return new Response('method not allowed', { status: 405 });
+
+  const sb = createClient(
+    Deno.env.get('SUPABASE_URL')!,
+    Deno.env.get('SUPABASE_SERVICE_ROLE_KEY')!,
+    { auth: { persistSession: false } },
+  );
+
+  // Deployed --no-verify-jwt, so without this anyone who knew the project
+  // ref could invoke it and wake every device in a keep, repeatedly. See
+  // notify-checkin. Checked before the body is read.
+  const want = await webhookSecret(sb);
+  if (want && req.headers.get('x-roamkeep-webhook') !== want) {
+    return new Response('forbidden', { status: 403 });
+  }
 
   let payload: WebhookPayload;
   try {
@@ -107,25 +145,21 @@ Deno.serve(async (req) => {
   const keepId = payload?.record?.keep_id ?? payload?.old_record?.keep_id;
   if (!keepId) return new Response('no keep_id', { status: 200 });
 
-  const sb = createClient(
-    Deno.env.get('SUPABASE_URL')!,
-    Deno.env.get('SUPABASE_SERVICE_ROLE_KEY')!,
-    { auth: { persistSession: false } },
-  );
-
   // EVERY member with a token, including whoever made the change. See the
   // header for why notify_on_checkin is not consulted here.
-  const { data: recipients, error } = await sb
-    .from('keep_members')
-    .select('id, fcm_token')
-    .eq('keep_id', keepId)
-    .not('fcm_token', 'is', null);
+  //
+  // Since v14 this goes through an RPC rather than selecting
+  // keep_members.fcm_token directly: that column moved to keep_member_push,
+  // whose RLS is own-row only, so a member can no longer read a relative's
+  // push token. Only service_role may execute keep_push_recipients().
+  const { data, error } = await sb.rpc('keep_push_recipients', { p_keep: keepId });
 
   if (error) {
     console.error('recipients query failed', error);
     return new Response('db error', { status: 500 });
   }
-  if (!recipients?.length) return new Response('no recipients', { status: 200 });
+  const recipients = (data ?? []) as Recipient[];
+  if (!recipients.length) return new Response('no recipients', { status: 200 });
 
   const relayUrl = relayEndpoint();
   const dead: string[] = [];
@@ -153,7 +187,8 @@ Deno.serve(async (req) => {
       // `stale` is a list of INDICES into the batch we sent.
       for (const idx of (out?.stale ?? [])) {
         const r = batch[idx];
-        if (r) dead.push(r.id);
+        // keep_push_recipients() names the column member_id, not id.
+        if (r) dead.push(r.member_id);
       }
     } catch (e) {
       console.warn('relay call failed', e);
@@ -161,7 +196,8 @@ Deno.serve(async (req) => {
   }
 
   if (dead.length) {
-    await sb.from('keep_members').update({ fcm_token: null }).in('id', dead);
+    // Since v14 the token lives in keep_member_push, keyed on member_id.
+    await sb.from('keep_member_push').update({ fcm_token: null }).in('member_id', dead);
   }
 
   return new Response(

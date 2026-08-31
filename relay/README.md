@@ -26,10 +26,17 @@ HIGH priority, precisely so that urgency isn't leaked to it.
 
 There is no database binding, no KV, and `[observability]` is off.
 
-### The relay is blind to its own health — deliberately
+### The relay keeps no per-request record — but it is not blind
 
-Because nothing is logged, a fleet-wide push failure produces **no signal
-here**. That is an accepted cost of the retention claim, not an oversight.
+`[observability]` off disables Workers **Logs**: persisted, per-request
+records. It does not disable Workers **Metrics**, the aggregate request,
+error and CPU counts under Workers &amp; Pages → `roamkeep-relay` → Metrics.
+Those are counts rather than records, so they cost the retention claim
+nothing, and a flood or a fleet-wide failure shows in them plainly.
+
+What genuinely produces no signal here is anything *about a particular
+call* — which family, which device, which event. That is the accepted cost
+of the retention claim, not an oversight.
 
 Diagnose from the family side instead: `notify-checkin` returns
 `ok recipients=N sent=M dead=K limited=L` and that line lands in **each
@@ -41,24 +48,49 @@ true while this stays as it is.
 
 ## Rate limiting
 
-**One global counter for the whole relay**, keyed on a fixed constant.
-Nothing about any caller — no IP, no token, no device — contributes to the
-key, so the counter is a fact about the *service* ("N requests this
-minute"), never about a person. That is what keeps the retention claim
-above unqualified.
+There are **two** limiters, in different places, doing different jobs.
+
+**In the Worker: one global counter**, keyed on a fixed constant. Nothing
+about any caller — no IP, no token, no device — contributes to the key, so
+the counter is a fact about the *service* ("N requests this minute"), never
+about a person.
 
 Be clear about what it does and doesn't do: it is a **quota guard, not an
-abuse guard**. It stops a runaway or a flood from silently burning the
-daily Workers quota and taking push down for everyone. It cannot stop
-someone who holds a token from spamming that one device.
+abuse guard**. It caps how many FCM sends and how much CPU a runaway can
+burn. Note that it does **not** protect the daily Workers *request*
+allowance, whatever an earlier version of this file claimed:
+`env.RATE_LIMITER.limit()` is evaluated inside `fetch()`, so by the time it
+returns `success: false` the Worker has been invoked and the request has
+already been counted.
+
+**At the Cloudflare edge: a rate-limiting rule on `relay.roamkeep.app`**,
+keyed on the caller's address. This is the abuse guard, and it is the reason
+the relay moved off `workers.dev` — zone rules cannot be attached to a zone
+Cloudflare owns. A rule here runs before the Worker is invoked, so a
+rejected flood costs no invocation, no request allowance, and no share of
+the global ceiling above. Without it, any stranger with `curl` could hold
+that ceiling at its limit and take push down for every family at once,
+silently, because push is best-effort.
+
+Its threshold and period are **deliberately not published**. The mechanism
+is disclosed here and on the privacy page; publishing the calibration would
+only tell an attacker how to stay under it.
 
 Two designs were rejected, recorded so they aren't reintroduced:
 
-- **Per source IP** (the original) — every request arrives from a Supabase
-  Edge Function and Supabase egress IPs are shared, so unrelated families
-  shared a budget. Check-ins burst together at school-run times, so a few
-  hundred families behind one egress IP could trip the limit and lose
+- **Per source IP, inside the Worker** — every request arrives from a
+  Supabase Edge Function and Supabase egress IPs are shared, so unrelated
+  families shared a budget. Check-ins burst together at school-run times, so
+  a few hundred families behind one egress IP could trip the limit and lose
   notifications silently.
+
+  Per-IP was later reintroduced **one layer out**, at the Cloudflare edge, on
+  purpose. The shared-egress hazard above is unchanged and is exactly what
+  sizes the threshold — it is a flood guard, not a precise control, and it
+  must be raised in step with the global ceiling as families are added. What
+  moving it out buys is that a rejection there costs nothing: no invocation,
+  no request allowance, no share of the global counter that real traffic
+  depends on.
 - **Per device, keyed on a token hash** — better protection, but it places
   a counter *about a device* into Cloudflare's backing store, whose
   retention is undocumented. That qualifies the privacy claim, and the
@@ -108,11 +140,18 @@ default if unset).
 
 ## Threat model
 
-- **Unauthenticated, by design.** An FCM registration token is a long
-  unguessable string; possessing one is already the capability to be woken.
-  The worst an attacker with a token can do is make that app sync its own
-  data — no content is injectable, because none is carried. The per-device
-  budget above caps how hard they can do it.
+- **Unauthenticated, by design — but no longer unprotected.** An FCM
+  registration token is a long unguessable string; possessing one is already
+  the capability to be woken. The worst an attacker with a token can do is
+  make that app sync its own data — no content is injectable, because none is
+  carried.
+
+  What that reasoning missed for a while is that flooding the endpoint needs
+  no token at all: any stranger could spend the global ceiling and take push
+  down for every family at once. The edge rule described above is the answer
+  to that, and it is why the relay now lives on a hostname in a zone we
+  control. There is still no per-caller credential, so a family provisions
+  themselves and it simply works.
 - **Relay down = degraded, not broken.** `notify-checkin` treats the call
   as best-effort and always returns 200; the check-in is already committed
   and the notification simply appears the next time the app is opened.
@@ -120,6 +159,12 @@ default if unset).
   could in principle observe token + timestamp in transit. Logging is
   disabled and nothing is persisted, but this is the one residual metadata
   exposure and is stated plainly rather than hidden.
-- **Rate-limit counter.** The limiter keeps one counter keyed on a fixed
-  constant. It records the relay's own throughput and nothing about any
-  caller — no per-device or per-family state exists to expose.
+- **Rate-limit counters.** Two. In the Worker, one keyed on a fixed
+  constant — the relay's own throughput, nothing about any caller. At the
+  Cloudflare edge, a rate-limiting rule on `relay.roamkeep.app` keyed on the
+  caller's address, held for the rule's period. Every caller is a Supabase
+  Edge Function, so that address identifies Supabase's shared egress and
+  never a family or a device — no phone contacts the relay directly.
+  Requests the rule blocks appear in this account's Security Events with
+  address, ASN and timestamp, retained on Cloudflare's schedule. The Worker
+  itself still writes nothing.

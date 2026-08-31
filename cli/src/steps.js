@@ -59,7 +59,7 @@ export async function applySchema(api, ref) {
  * needs: asserting it is strictly stronger than counting tables, because
  * the stamp only lands if everything before it in the file succeeded.
  */
-export const SCHEMA_VERSION = 13;
+export const SCHEMA_VERSION = 14;
 
 /**
  * The database's own schema version, or null if it predates the marker.

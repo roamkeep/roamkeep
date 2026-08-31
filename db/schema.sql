@@ -6,11 +6,16 @@
 -- migration in db/migrations/ (v2 → v5).
 --
 -- Properties:
---   • Idempotent & non-destructive. CREATE TABLE IF NOT EXISTS, ADD
---     COLUMN IF NOT EXISTS, DROP POLICY IF EXISTS + CREATE, CREATE OR
---     REPLACE FUNCTION. Safe to run against a brand-new project (creates
---     everything) AND against the live project (no-ops). It will NOT
---     drop or truncate existing data.
+--   • Idempotent. CREATE TABLE IF NOT EXISTS, ADD COLUMN IF NOT EXISTS,
+--     DROP POLICY IF EXISTS + CREATE, CREATE OR REPLACE FUNCTION. Safe to
+--     run against a brand-new project (creates everything) AND against the
+--     live project (no-ops).
+--   • Non-destructive, with ONE deliberate exception since v14: it moves
+--     keep_members.fcm_token into keep_member_push and then drops the
+--     column. The data is copied first, so nothing is lost — but a client
+--     older than 4.8.3 can no longer register a new push token after this
+--     runs. See the "RETIRE keep_members.fcm_token" section for why the
+--     step cannot live only in the migration file.
 --   • Run it in: Supabase Dashboard → SQL Editor → New query → Run.
 --
 -- After running, in the Dashboard:
@@ -60,7 +65,9 @@ CREATE TABLE IF NOT EXISTS keep_members (
   last_seen         TIMESTAMPTZ DEFAULT NOW(),
   created_at        TIMESTAMPTZ DEFAULT NOW(),
   -- Added by later migrations; inlined here for fresh installs.
-  fcm_token         TEXT,
+  -- (fcm_token lived here until v14 — it is now keep_member_push, because
+  -- this table is readable across the whole keep and RLS cannot restrict
+  -- columns, so a token here was a token every relative could read.)
   notify_on_checkin BOOLEAN NOT NULL DEFAULT TRUE,
   -- v8: two orthogonal axes + a time-boxed self-pause.
   --   member_type — life-stage / tracking policy (adult may pause &
@@ -155,6 +162,40 @@ CREATE TABLE IF NOT EXISTS roamkeep_meta (
 -- The three cascades are the whole garbage-collection story — delete a
 -- place or remove a member and the preferences referencing them go too.
 -- No cleanup job, and no way to accumulate rows pointing at nothing.
+-- Per-member push token (v14).
+--
+-- Split out of keep_members because that table is readable across the whole
+-- keep and RLS cannot restrict columns, so `select fcm_token from
+-- keep_members` handed any member every relative's registration token. Here
+-- the policy is own-row only. Both Edge Functions run as service_role and
+-- bypass RLS, so neither needs a policy.
+CREATE TABLE IF NOT EXISTS keep_member_push (
+  member_id  uuid PRIMARY KEY REFERENCES keep_members(id) ON DELETE CASCADE,
+  keep_id    uuid NOT NULL REFERENCES keeps(id) ON DELETE CASCADE,
+  fcm_token  text,
+  updated_at timestamptz NOT NULL DEFAULT now()
+);
+
+-- The webhook secret the database issues itself (v14).
+--
+-- Deliberately NOT in roamkeep_meta: that table is readable by anon so the
+-- version check can run before sign-in, and the anon key is in every setup
+-- link — a secret there would be world-readable. RLS on with NO policies,
+-- the keep_join_attempts pattern: only the SECURITY DEFINER trigger
+-- functions read it, and the Edge Functions read it with the service-role
+-- key they already hold. Self-seeding, so no owner ever has to set it.
+CREATE TABLE IF NOT EXISTS roamkeep_secrets (
+  id             boolean PRIMARY KEY DEFAULT true CHECK (id),
+  webhook_secret text NOT NULL,
+  created_at     timestamptz NOT NULL DEFAULT now()
+);
+
+-- Seeded once, never overwritten — re-running this file must not rotate a
+-- secret the triggers are already sending.
+INSERT INTO roamkeep_secrets (id, webhook_secret)
+VALUES (true, encode(gen_random_bytes(32), 'hex'))
+ON CONFLICT (id) DO NOTHING;
+
 CREATE TABLE IF NOT EXISTS keep_notify_prefs (
   id                uuid PRIMARY KEY DEFAULT gen_random_uuid(),
   keep_id           uuid NOT NULL REFERENCES keeps(id)        ON DELETE CASCADE,
@@ -187,7 +228,6 @@ ALTER TABLE checkins
   ADD COLUMN IF NOT EXISTS lng double precision;
 
 ALTER TABLE keep_members
-  ADD COLUMN IF NOT EXISTS fcm_token text,
   ADD COLUMN IF NOT EXISTS notify_on_checkin boolean NOT NULL DEFAULT true,
   ADD COLUMN IF NOT EXISTS last_place_id uuid
     REFERENCES keep_places(id) ON DELETE SET NULL,
@@ -206,10 +246,10 @@ ALTER TABLE location_history
 
 CREATE INDEX IF NOT EXISTS idx_keep_places_keep_id ON keep_places(keep_id);
 
--- The notify-checkin edge function fans out on every checkins INSERT by
--- selecting members of the keep with a token; this is the hot path.
-CREATE INDEX IF NOT EXISTS idx_keep_members_keep_token
-  ON keep_members(keep_id) WHERE fcm_token IS NOT NULL;
+-- The push fan-out hot path. Lives on keep_member_push since v14; the old
+-- idx_keep_members_keep_token went with the column it indexed.
+CREATE INDEX IF NOT EXISTS idx_member_push_keep
+  ON keep_member_push(keep_id) WHERE fcm_token IS NOT NULL;
 
 -- "This member's points, newest first, within a time window" — the
 -- query the breadcrumb trail runs.
@@ -361,6 +401,20 @@ ALTER TABLE location_history   ENABLE ROW LEVEL SECURITY;
 ALTER TABLE keep_join_attempts ENABLE ROW LEVEL SECURITY;
 ALTER TABLE roamkeep_meta      ENABLE ROW LEVEL SECURITY;
 ALTER TABLE keep_notify_prefs  ENABLE ROW LEVEL SECURITY;
+ALTER TABLE keep_member_push   ENABLE ROW LEVEL SECURITY;
+-- No policies on roamkeep_secrets either → default deny. Same reasoning as
+-- keep_join_attempts: only the DEFINER trigger functions and the Edge
+-- Functions' service-role key ever read it.
+ALTER TABLE roamkeep_secrets   ENABLE ROW LEVEL SECURITY;
+
+-- KEEP_MEMBER_PUSH — own row only, and deliberately no keep-wide SELECT.
+-- That asymmetry with every other table in this file IS the fix: a push
+-- token is not something the rest of the family has any business reading.
+DROP POLICY IF EXISTS "Members manage own push row" ON keep_member_push;
+CREATE POLICY "Members manage own push row"
+  ON keep_member_push FOR ALL TO authenticated
+  USING      (member_id IN (SELECT id FROM keep_members WHERE user_id = auth.uid()))
+  WITH CHECK (member_id IN (SELECT id FROM keep_members WHERE user_id = auth.uid()));
 
 -- KEEP_NOTIFY_PREFS — scoped to OWN rows, unlike the keep-wide read
 -- policies everywhere else in this file. Who you have quietly stopped
@@ -428,22 +482,27 @@ CREATE POLICY "Members can read their keep"
 DROP POLICY IF EXISTS "Users can join a keep as themselves" ON keep_members;
 
 -- Own-row UPDATE stays, but a BEFORE UPDATE trigger (below) forbids
--- changing the protected trio role/member_type/paused_until unless the
--- change comes through a DEFINER RPC. So a member can still move their
--- own lat/lng/battery/status/notify/fcm_token/online, but not privilege
--- or pause columns.
+-- changing role/member_type/paused_until unless the change comes through a
+-- DEFINER RPC, and forbids changing keep_id/user_id at all. So a member can
+-- still move their own lat/lng/battery/status/notify/online, but not
+-- privilege, pause, or which family they are in.
+--
+-- The WITH CHECK below pins user_id and cannot do more: a policy's WITH
+-- CHECK only ever sees the NEW row, so it has no way to say "keep_id must
+-- equal what it was". That is why the guard is a trigger.
 DROP POLICY IF EXISTS "Users can update own member row" ON keep_members;
 CREATE POLICY "Users can update own member row"
   ON keep_members FOR UPDATE TO authenticated
   USING (user_id = auth.uid()) WITH CHECK (user_id = auth.uid());
 
--- v8: a CHILD cannot self-remove (deterrent, not a guarantee — the child
--- controls the device). Owners kick via remove_member. Adults may leave.
+-- No DELETE policy on keep_members. v8 allowed adults to delete their own
+-- row; v14 dropped that, because the rule it has to express — "unless you
+-- are the last owner" — is not something a policy can say, and a bare
+-- DELETE grant is a capability the client never otherwise needs. Leaving
+-- goes through leave_keep() and kicking through remove_member(), both
+-- SECURITY DEFINER. Same move v8 made for the INSERT policies.
 DROP POLICY IF EXISTS "Users can delete own member row" ON keep_members;
 DROP POLICY IF EXISTS "Adults can delete own member row" ON keep_members;
-CREATE POLICY "Adults can delete own member row"
-  ON keep_members FOR DELETE TO authenticated
-  USING (user_id = auth.uid() AND member_type <> 'child');
 
 -- CHECKINS
 DROP POLICY IF EXISTS "Keep members can read checkins" ON checkins;
@@ -451,10 +510,18 @@ CREATE POLICY "Keep members can read checkins"
   ON checkins FOR SELECT TO authenticated
   USING (keep_id IN (SELECT private_user_keep_ids()));
 
+-- v14 binds member_id to the caller. Without it any member could file a
+-- check-in as somebody else — including type='sos', which is exempt from
+-- every mute and wakes every phone in the family. Mirrors what the
+-- location_history INSERT policy below has always done; both writers
+-- (app.js, GeofenceReceiver.java) already send only their own member_id.
 DROP POLICY IF EXISTS "Keep members can insert checkins" ON checkins;
 CREATE POLICY "Keep members can insert checkins"
   ON checkins FOR INSERT TO authenticated
-  WITH CHECK (keep_id IN (SELECT private_user_keep_ids()));
+  WITH CHECK (
+    keep_id IN (SELECT private_user_keep_ids())
+    AND member_id IN (SELECT id FROM keep_members WHERE user_id = auth.uid())
+  );
 
 -- KEEP_PLACES
 DROP POLICY IF EXISTS "Members can read places" ON keep_places;
@@ -541,7 +608,16 @@ AS $$
 BEGIN
   IF (NEW.role         IS DISTINCT FROM OLD.role
       OR NEW.member_type  IS DISTINCT FROM OLD.member_type
-      OR NEW.paused_until IS DISTINCT FROM OLD.paused_until)
+      OR NEW.paused_until IS DISTINCT FROM OLD.paused_until
+      -- v14: keep_id and user_id too. Without them a member could call
+      -- create_keep (which seats them as role='owner') and then move that
+      -- owner row into any keep whose uuid they knew — skipping the invite
+      -- code, the expiry, the rate limiter and remove_member in one PATCH.
+      -- The own-row UPDATE policy cannot stop it: its WITH CHECK only ever
+      -- sees the NEW row, so it can pin user_id to auth.uid() but cannot
+      -- say "keep_id must equal what it was".
+      OR NEW.keep_id      IS DISTINCT FROM OLD.keep_id
+      OR NEW.user_id      IS DISTINCT FROM OLD.user_id)
      AND coalesce(current_setting('roamkeep.priv', true), '') <> 'on' THEN
     RAISE EXCEPTION 'protected_column';
   END IF;
@@ -553,6 +629,34 @@ DROP TRIGGER IF EXISTS trg_guard_member_cols ON keep_members;
 CREATE TRIGGER trg_guard_member_cols
   BEFORE UPDATE ON keep_members
   FOR EACH ROW EXECUTE FUNCTION _roamkeep_guard_member_cols();
+
+-- v14: the same problem on keep_places. created_by exists for attribution
+-- and keep_id decides which family a place belongs to; an edit should move
+-- neither. Any member may still edit any place in their keep — name, icon,
+-- radius, position — which is the family model and is unchanged.
+--
+-- Raises rather than silently restoring, matching the member guard. Safe
+-- because updatePlace() in app.js sends a narrow patch and never includes
+-- either column. No roamkeep.priv escape hatch: unlike the member columns,
+-- no DEFINER RPC has any business moving these.
+CREATE OR REPLACE FUNCTION _roamkeep_guard_place_cols()
+RETURNS trigger
+LANGUAGE plpgsql
+SET search_path = public
+AS $$
+BEGIN
+  IF NEW.created_by IS DISTINCT FROM OLD.created_by
+     OR NEW.keep_id IS DISTINCT FROM OLD.keep_id THEN
+    RAISE EXCEPTION 'protected_column';
+  END IF;
+  RETURN NEW;
+END;
+$$;
+
+DROP TRIGGER IF EXISTS trg_guard_place_cols ON keep_places;
+CREATE TRIGGER trg_guard_place_cols
+  BEFORE UPDATE ON keep_places
+  FOR EACH ROW EXECUTE FUNCTION _roamkeep_guard_place_cols();
 
 
 -- ── SECURITY DEFINER RPCs ─────────────────────────────────
@@ -646,23 +750,27 @@ SECURITY DEFINER
 SET search_path = public
 STABLE
 AS $$
-  SELECT m.id, m.fcm_token
+  SELECT m.id, p.fcm_token
   FROM checkins c
-  JOIN keep_members m ON m.keep_id = c.keep_id
+  JOIN keep_members m     ON m.keep_id = c.keep_id
+  JOIN keep_member_push p ON p.member_id = m.id   -- v14: token lives here now
   WHERE c.id = p_checkin
     AND m.id <> c.member_id
-    AND m.fcm_token IS NOT NULL
+    AND p.fcm_token IS NOT NULL
     AND (
       c.type = 'sos'
       OR (
         m.notify_on_checkin
         AND (
           c.place_id IS NULL
+          -- `k`, not `p`: since v14 the outer query binds `p` to
+          -- keep_member_push, and an inner `p` here would shadow it. Legal,
+          -- but it would read as if the two were the same table.
           OR NOT EXISTS (
-            SELECT 1 FROM keep_notify_prefs p
-            WHERE p.member_id = m.id
-              AND p.subject_member_id = c.member_id
-              AND p.place_id = c.place_id
+            SELECT 1 FROM keep_notify_prefs k
+            WHERE k.member_id = m.id
+              AND k.subject_member_id = c.member_id
+              AND k.place_id = c.place_id
           )
         )
       )
@@ -671,6 +779,68 @@ $$;
 
 REVOKE ALL ON FUNCTION public.checkin_recipients(uuid) FROM public, anon, authenticated;
 GRANT EXECUTE ON FUNCTION public.checkin_recipients(uuid) TO service_role;
+
+-- The other direction of the same question, for place sync (v14). Everyone
+-- in the keep with a token, including whoever made the change, and ignoring
+-- notify_on_checkin — this is a data sync, not a notification, and muting
+-- alerts must not leave a phone holding stale geofences.
+--
+-- Exists because notify-places used to SELECT keep_members.fcm_token
+-- directly, which stopped being possible when the column moved.
+CREATE OR REPLACE FUNCTION keep_push_recipients(p_keep uuid)
+RETURNS TABLE (member_id uuid, fcm_token text)
+LANGUAGE sql
+SECURITY DEFINER
+SET search_path = public
+STABLE
+AS $$
+  SELECT p.member_id, p.fcm_token
+    FROM keep_member_push p
+   WHERE p.keep_id = p_keep
+     AND p.fcm_token IS NOT NULL
+$$;
+
+REVOKE ALL ON FUNCTION public.keep_push_recipients(uuid) FROM public, anon, authenticated;
+GRANT EXECUTE ON FUNCTION public.keep_push_recipients(uuid) TO service_role;
+
+
+-- ── v14: RETIRE keep_members.fcm_token ────────────────────────
+--
+-- THE ONE DESTRUCTIVE STEP IN THIS FILE, and the reason the header no
+-- longer claims to be non-destructive without qualification.
+--
+-- It has to be here rather than only in the migration, because most owners
+-- upgrade by re-pasting this file. If re-pasting created keep_member_push
+-- and repointed checkin_recipients() at it but left the old column in
+-- place, the new table would be empty, the recipient query would return
+-- nobody, and that family's push would go quiet with nothing to explain it.
+--
+-- Order matters and is already satisfied above: both recipient functions
+-- read the new table before the old column disappears. The backfill is
+-- guarded so a second run — when the column is already gone — is a no-op
+-- rather than an error.
+DO $$
+BEGIN
+  IF EXISTS (
+    SELECT 1 FROM information_schema.columns
+     WHERE table_schema = 'public'
+       AND table_name   = 'keep_members'
+       AND column_name  = 'fcm_token'
+  ) THEN
+    EXECUTE $body$
+      INSERT INTO keep_member_push (member_id, keep_id, fcm_token)
+      SELECT id, keep_id, fcm_token
+        FROM keep_members
+       WHERE fcm_token IS NOT NULL
+      ON CONFLICT (member_id) DO UPDATE
+        SET fcm_token = excluded.fcm_token,
+            updated_at = now()
+    $body$;
+  END IF;
+END$$;
+
+DROP INDEX IF EXISTS idx_keep_members_keep_token;
+ALTER TABLE keep_members DROP COLUMN IF EXISTS fcm_token;
 
 -- The device's view of its own feed. security_invoker so the caller's JWT
 -- and RLS apply — which is what lets a phone filter server-side and hold
@@ -741,6 +911,7 @@ CREATE OR REPLACE FUNCTION public.roamkeep_notify_places()
 AS $fn$
 DECLARE
   v_url text;
+  v_secret text;
   v_row jsonb;
   v_old jsonb;
   -- AFTER triggers ignore the return value, but it must still be a valid
@@ -754,6 +925,7 @@ BEGIN
   IF v_url IS NULL THEN
     RETURN v_ret;
   END IF;
+  SELECT webhook_secret INTO v_secret FROM roamkeep_secrets;
 
   IF TG_OP = 'DELETE' THEN
     v_row := NULL;
@@ -765,7 +937,14 @@ BEGIN
 
   PERFORM net.http_post(
     url     := v_url || '/functions/v1/notify-places',
-    headers := jsonb_build_object('Content-Type', 'application/json'),
+    -- v14: the shared secret proves the payload came from this database.
+    -- Both functions are deployed --no-verify-jwt (a Database Webhook has
+    -- no user JWT to present), so without this anyone who knew the project
+    -- ref could invoke them — and the ref is in every setup link.
+    headers := jsonb_build_object(
+                 'Content-Type', 'application/json',
+                 'x-roamkeep-webhook', coalesce(v_secret, '')
+               ),
     body    := jsonb_build_object(
                  'type',       TG_OP,
                  'table',      'keep_places',
@@ -818,12 +997,17 @@ BEGIN
       AS $fn$
       DECLARE
         v_url text;
+        v_secret text;
       BEGIN
         SELECT project_url INTO v_url FROM roamkeep_meta;
         IF v_url IS NULL THEN RETURN NEW; END IF;
+        SELECT webhook_secret INTO v_secret FROM roamkeep_secrets;
         PERFORM net.http_post(
           url     := v_url || '/functions/v1/notify-checkin',
-          headers := jsonb_build_object('Content-Type', 'application/json'),
+          headers := jsonb_build_object(
+                       'Content-Type', 'application/json',
+                       'x-roamkeep-webhook', coalesce(v_secret, '')
+                     ),
           body    := jsonb_build_object(
                        'type', 'INSERT', 'table', 'checkins', 'schema', 'public',
                        'record', to_jsonb(NEW), 'old_record', NULL),
@@ -1073,6 +1257,65 @@ END;
 $$;
 REVOKE ALL ON FUNCTION remove_member(uuid) FROM PUBLIC, anon;
 GRANT EXECUTE ON FUNCTION remove_member(uuid) TO authenticated;
+
+-- leave_keep: a member removes THEMSELVES, and their history with them.
+--
+-- Exists since v14 because landing/privacy promised this and nothing in the
+-- app could do it — there was no action, no button, and no code path that
+-- deleted a member row. Signing out only set online=false.
+--
+-- Three rules, enforced here rather than trusted from the caller: a child
+-- cannot leave (the v8 deterrent); the last owner cannot leave, because
+-- that strands the keep, its places and everyone still in it with nobody
+-- able to administer them — their exit is deleting the Supabase project;
+-- and you can only leave as yourself.
+CREATE OR REPLACE FUNCTION leave_keep(p_member_id uuid)
+RETURNS void
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public
+AS $$
+DECLARE
+  v_uid uuid := auth.uid();
+  v_member keep_members%ROWTYPE;
+  v_owner_count int;
+BEGIN
+  IF v_uid IS NULL THEN
+    RAISE EXCEPTION 'not_authenticated';
+  END IF;
+
+  SELECT * INTO v_member FROM keep_members WHERE id = p_member_id;
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'member_not_found';
+  END IF;
+  IF v_member.user_id <> v_uid THEN
+    RAISE EXCEPTION 'not_authorized';
+  END IF;
+
+  IF v_member.member_type = 'child' THEN
+    RAISE EXCEPTION 'child_cannot_leave';
+  END IF;
+
+  IF v_member.role = 'owner' THEN
+    SELECT count(*) INTO v_owner_count
+      FROM keep_members
+     WHERE keep_id = v_member.keep_id AND role = 'owner';
+    IF v_owner_count <= 1 THEN
+      RAISE EXCEPTION 'last_owner';
+    END IF;
+  END IF;
+
+  -- Explicit, though location_history cascades off the member row anyway:
+  -- this is the line that makes the privacy claim true, and it should be
+  -- visible here rather than depending on a foreign key someone might later
+  -- change. checkins, keep_member_push and keep_notify_prefs go with the
+  -- row by cascade.
+  DELETE FROM location_history WHERE member_id = v_member.id;
+  DELETE FROM keep_members WHERE id = v_member.id;
+END;
+$$;
+REVOKE ALL ON FUNCTION leave_keep(uuid) FROM PUBLIC, anon;
+GRANT EXECUTE ON FUNCTION leave_keep(uuid) TO authenticated;
 
 -- set_member_role: owner-only (owner ⊆ adults, so "only adults change
 -- roles" holds). Refuses to demote the last owner.
@@ -1408,9 +1651,9 @@ END$$;
 -- upgrade path, and it must never walk a database BACKWARDS if someone
 -- runs an older checkout of it against a newer database.
 
-INSERT INTO roamkeep_meta (id, schema_version) VALUES (true, 13)
+INSERT INTO roamkeep_meta (id, schema_version) VALUES (true, 14)
   ON CONFLICT (id) DO UPDATE
-    SET schema_version = GREATEST(roamkeep_meta.schema_version, 13),
+    SET schema_version = GREATEST(roamkeep_meta.schema_version, 14),
         updated_at = now();
 
 

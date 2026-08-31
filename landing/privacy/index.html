@@ -16,6 +16,14 @@
   `[observability]` remaining disabled in relay/wrangler.toml and on there
   being no console.* calls in relay/src/index.js. Do not change either
   without changing this page first.
+
+  The rate-limit paragraph is the exception that proves the rule: that
+  control lives in the Cloudflare dashboard, not in the published source,
+  so a reader checking the code against this page would never find it.
+  An undisclosed component would make the sentence after it — "this claim
+  can be checked against it" — quietly untrue. Its threshold is deliberately
+  not stated anywhere public; the mechanism is what has to be disclosed,
+  not its calibration.
 -->
 <style>
   :root {
@@ -70,7 +78,7 @@
 </svg>
 
 <h1>Privacy Policy</h1>
-<p class="sub">Roamkeep · <code>com.roamkeep.app</code> · last updated 12 August 2026</p>
+<p class="sub">Roamkeep · <code>com.roamkeep.app</code> · last updated 31 August 2026</p>
 
 <div class="lede">
   <p><strong>Roamkeep has no servers.</strong> Every family runs its own private
@@ -154,6 +162,10 @@ on the device.</p>
 cannot see names, places, coordinates, messages, or even what kind of event
 occurred — every wake-up is identical, and many of them produce no
 notification at all. <strong>It stores nothing and logs nothing.</strong></p>
+<p>Cloudflare, which runs the relay, applies a rate limit to it and keeps a
+short record of requests it blocks. Those records identify the family server
+that made the call, never your phone — your device never contacts the relay
+directly.</p>
 <p>The relay's complete source code is published, and this claim can be
 checked against it.</p>
 
@@ -177,7 +189,12 @@ at any time, without asking anyone.</p>
 <h2>Keeping and deleting your data</h2>
 <ul>
   <li><strong>Location history</strong> is deleted automatically after 7 days.</li>
-  <li><strong>Leaving a Keep</strong> removes your membership and your location history.</li>
+  <li><strong>Leaving a Keep</strong> (Settings → Leave this Keep) permanently
+      deletes your membership, your location history and your check-ins from
+      your family's server. Two people cannot do this: a member marked as a
+      child, who has to ask an adult in their family, and the only remaining
+      owner, because that would leave everyone else with nobody able to
+      manage the Keep — their equivalent is deleting the project below.</li>
   <li><strong>Deleting the Supabase project</strong> destroys everything your
       family ever recorded, immediately and permanently.</li>
   <li><strong>Disconnecting a device</strong> (Settings → Disconnect this

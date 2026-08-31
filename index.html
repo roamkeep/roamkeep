@@ -127,7 +127,8 @@
       target="_blank" rel="noopener">Terms of Use</a> and
       <a id="privacy-link" href="https://get.roamkeep.app/privacy"
       target="_blank" rel="noopener">Privacy Policy</a> —
-      last updated <span id="terms-date">17 August 2026</span>.</p>
+      last updated <span id="terms-date">17 August 2026</span> and
+      <span id="privacy-date">31 August 2026</span> respectively.</p>
 
     <button class="btn btn-g" data-action="accept-terms">I agree — continue</button>
     <button class="lnk-btn" data-action="decline-terms">I don't agree</button>
@@ -539,7 +540,8 @@
     <div class="setting-block">
       <div class="setting-lbl">📄 Terms &amp; privacy</div>
       <p class="note">What Roamkeep promises, what it doesn't, and what is
-        stored where. Last updated <span id="set-terms-date">17 August 2026</span>.</p>
+        stored where. Last updated <span id="set-terms-date">17 August 2026</span>
+        and <span id="set-privacy-date">31 August 2026</span> respectively.</p>
       <button class="btn" data-action="open-terms">Terms of Use</button>
       <button class="btn" data-action="open-privacy" style="margin-top:8px">Privacy Policy</button>
     </div>
@@ -551,6 +553,14 @@
 
     <div class="setting-block danger-block">
       <button class="btn" data-action="disconnect-backend">Disconnect this device</button>
+      <!-- Last thing in the sheet, deliberately: it deletes this person's
+           membership and everywhere they have been. Hidden for children and
+           for the last owner, both of whom the server refuses anyway — the
+           button is only hidden so they are not offered something that will
+           fail. See renderLeaveKeep(). -->
+      <button class="btn" id="leave-keep-btn" data-action="leave-keep"
+              style="margin-top:8px; display:none">Leave this Keep</button>
+      <p class="note" id="leave-keep-note" style="display:none"></p>
     </div>
   </div>
 </div>

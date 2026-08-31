@@ -22,6 +22,7 @@ that's already on an older version.
 | `familynest-schema-v11-profile-edits.sql` | `rename_keep` + `update_member_profile` RPCs — editable family name, display name and avatar. |
 | `familynest-schema-v12-meta.sql` | `roamkeep_meta` (schema version, `min_app_build`, `project_url`) + `roamkeep_schema_version()` + `set_project_url()`. Sets **schema_version 12**. Purely additive — every installed app keeps working after it is applied. |
 | `familynest-schema-v13-notify-prefs.sql` | `checkins.place_id`, `keep_notify_prefs` (per-person, per-place mutes), `checkin_recipients()`, the `my_checkin_feed` view, and the `keep_places` → `notify-places` webhook trigger. Sets **schema_version 13**. Requires v12. Additive. |
+| `familynest-schema-v14-column-pinning-and-push-auth.sql` | Pins `keep_members.keep_id`/`user_id` and `keep_places.created_by`/`keep_id` via BEFORE UPDATE triggers (RLS `WITH CHECK` only sees the new row, so it cannot); binds `checkins.member_id` to the caller; adds `roamkeep_secrets` + an `x-roamkeep-webhook` header so the Edge Functions can tell a real webhook from a forged one; moves push tokens to `keep_member_push` and **drops `keep_members.fcm_token`**. Sets **schema_version 14**. Requires v13. **Not purely additive** — see the file header before running it against clients you do not control. |
 
 ## Schema versions and app compatibility
 

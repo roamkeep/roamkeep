@@ -180,6 +180,10 @@ public by design — the database is protected by its own security rules, not
 by hiding the key — but anyone with the link can reach your family's sign-up
 screen. **Share it like your home address, not like a password.**
 
+Once everybody has joined you can close that screen entirely — see
+**Step 10**. After that the link reaches a server that will not create
+accounts for anyone.
+
 ---
 
 ## Step 7 — Set up the first phone
@@ -221,6 +225,10 @@ Each family member:
 Mark children as **Child** in the Family tab — adults can pause their own
 tracking, children cannot.
 
+> If you have already done Step 10 and closed sign-ups, turn them back on
+> before sending the invite, and off again once they are in. Their account has
+> to be created before they can join.
+
 ---
 
 ## Step 9 — Check it works
@@ -232,6 +240,37 @@ Within a minute or two, other family members should get an arrive/leave
 notification. If they do not, open **Settings → Diagnostics** on the phone
 that moved — it shows exactly which permissions are missing and what the
 tracking service has been doing.
+
+---
+
+## Step 10 — Close the door
+
+Your setup link reaches your family's sign-up screen, and that link travels
+over text messages and gets shown on a web page. Once everyone has an
+account, nobody else needs to be able to create one — so stop them.
+
+In the Supabase dashboard: **Authentication → Sign In / Providers → Email**,
+and turn **Allow new users to sign up** off.
+
+**This does not lock your family out.** Signing in is separate from signing
+up, so everyone keeps working normally, including on a brand-new phone after
+a reinstall — which matters, because Roamkeep deliberately keeps nothing in
+Google's backup and a replacement phone always re-links from scratch.
+
+What it does stop is a stranger who got hold of your setup link making an
+account on your server. If someone tries while it is closed, the app tells
+them to ask you to open it.
+
+**When you add a family member later:** turn it back on, let them sign up and
+join, then turn it off again. That is Step 8, and there is a reminder there.
+
+While it is open — during setup, or whenever you are adding someone — two
+more settings are worth having on, under **Authentication → Settings**:
+
+- **CAPTCHA protection**, so accounts cannot be created in bulk by a script.
+- A lower **sign-up rate limit** than the default.
+
+Neither changes anything for a normal person signing up once.
 
 ---
 

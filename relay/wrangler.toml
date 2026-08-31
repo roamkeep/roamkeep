@@ -2,6 +2,22 @@ name = "roamkeep-relay"
 main = "src/index.js"
 compatibility_date = "2026-01-15"
 
+# The relay answers on a hostname in a zone we control, not on workers.dev.
+#
+# That is not cosmetic. WAF and rate-limiting rules are scoped to a zone in
+# your own account, and workers.dev belongs to Cloudflare — so on the old
+# hostname there was no way to stop one caller spending the global ceiling
+# below, and with it every family's push. A rule on this hostname runs in the
+# WAF phase, BEFORE the Worker is invoked, so a rejected flood costs no
+# invocation, no daily request allowance, and no share of that ceiling.
+#
+# Both Edge Functions default to this host (DEFAULT_RELAY). The workers.dev
+# route must stay disabled: while it answers, any rule here is decorative,
+# and the old URL is in this repository's history.
+routes = [
+  { pattern = "relay.roamkeep.app", custom_domain = true }
+]
+
 # No KV, no D1, no R2, no Durable Objects — the relay is stateless by
 # design. There is nowhere for it to keep anything even if it wanted to.
 
@@ -9,9 +25,13 @@ compatibility_date = "2026-01-15"
 # claim is that it retains nothing — that claim is only true while this
 # stays false. Do not turn it on to debug.
 #
-# Accepted cost: the relay cannot see its own health, so a fleet-wide push
-# failure produces no signal here. Diagnose from the family side instead —
+# Accepted cost: nothing about a PARTICULAR call is recorded — which family,
+# which device, which event. Diagnose that from the family side instead:
 # notify-checkin logs sent/dead/limited on their own Supabase.
+#
+# This does NOT make the relay blind. Workers Metrics (aggregate request,
+# error and CPU counts) are unaffected by this setting and are the right
+# place to look for a flood or a fleet-wide failure. Counts, not records.
 [observability]
 enabled = false
 

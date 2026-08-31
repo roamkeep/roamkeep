@@ -44,8 +44,12 @@
   // member is then asked again on next open, which is what makes the
   // published "changes will be noted in the app's release notes" line
   // honest rather than a formality. Do not bump it for a typo.
-  const TERMS_VERSION = 1;
-  const TERMS_DATE = '17 August 2026';        // matches the published page
+  const TERMS_VERSION = 2;
+  const TERMS_DATE = '17 August 2026';        // matches landing/terms
+  // Tracked separately because the two documents move independently — v14
+  // changed only the privacy policy, and showing one date for both on the
+  // very screen asking people to agree again would be its own small lie.
+  const PRIVACY_DATE = '31 August 2026';      // matches landing/privacy
   const TERMS_URL = 'https://get.roamkeep.app/terms';
   const PRIVACY_URL = 'https://get.roamkeep.app/privacy';
   const TERMS_STORE_KEY = 'rk_terms';
@@ -211,8 +215,10 @@
     const raw = JSON.stringify({
       version: TERMS_VERSION,
       // What they agreed to and when, so a support question about which
-      // wording someone saw has an answer.
+      // wording someone saw has an answer. Both documents, because the
+      // acceptance covers both and they are dated separately.
       terms: TERMS_DATE,
+      privacy: PRIVACY_DATE,
       at: new Date().toISOString()
     });
     try {
@@ -453,7 +459,8 @@
     if (code.includes('last_owner')) return 'A Keep needs at least one owner. Make someone else an owner first.';
     if (code.includes('owner_must_be_adult')) return 'An owner must be an adult. Remove their owner role first.';
     if (code.includes('child_cannot_pause')) return 'Children can’t pause their own location.';
-    if (code.includes('cannot_remove_self')) return 'You can’t remove yourself here — use Sign out to leave.';
+    if (code.includes('cannot_remove_self')) return 'You can’t remove yourself here — use Leave this Keep in Settings.';
+    if (code.includes('child_cannot_leave')) return 'Children can’t leave a Keep on their own — ask an adult in your family.';
     if (code.includes('invalid_pause')) return 'Pick a pause length up to 24 hours.';
     if (code.includes('protected_column')) return 'That change has to go through the family controls.';
     return error?.message || 'Something went wrong.';
@@ -554,7 +561,16 @@
     setErr('auth-err', '');
     const { data, error } = await S.sb.auth.signUp({ email, password: pass });
     if (error) {
-      setErr('auth-err', error.message);
+      // A family that has finished onboarding can turn sign-ups off on their
+      // own project, which is the strongest answer to "anyone with the setup
+      // link can reach our sign-up screen". Supabase's own wording for that
+      // is "Signups not allowed for this instance", which reads like a fault.
+      // It isn't one — somebody closed a door on purpose — so say that, and
+      // point at the person who can open it.
+      setErr('auth-err', /signups? not allowed/i.test(error.message || '')
+        ? 'This family server isn’t accepting new accounts right now. Ask '
+          + 'whoever set up your Keep to turn sign-ups on while you join.'
+        : error.message);
       btnLoad('su-btn', false, 'Create Account →');
       return;
     }
@@ -588,8 +604,13 @@
       // token — annoying, and a privacy leak.)
       try {
         await S.sb.from('keep_members')
-          .update({ online: false, fcm_token: null })
+          .update({ online: false })
           .eq('id', S.myId);
+        // The token moved out of keep_members in v14 — that row is readable
+        // across the whole keep, and a push token is nobody else's business.
+        await S.sb.from('keep_member_push')
+          .update({ fcm_token: null, updated_at: new Date().toISOString() })
+          .eq('member_id', S.myId);
       } catch (_) {}
     }
     // Stop the OS from firing geofence transitions or location updates
@@ -968,11 +989,19 @@
       // event fires synchronously on the native side once FCM hands us
       // a token, and we don't want to miss it on a cold start.
       Push.addListener('registration', async (token) => {
-        if (!token || !token.value || !S.myId) return;
+        if (!token || !token.value || !S.myId || !S.keepId) return;
         try {
-          await S.sb.from('keep_members')
-            .update({ fcm_token: token.value })
-            .eq('id', S.myId);
+          // keep_member_push, not keep_members: that row is readable across
+          // the whole keep and RLS cannot restrict columns, so a token there
+          // was a token every relative could read. Upsert because the row
+          // may not exist yet on a first run.
+          await S.sb.from('keep_member_push')
+            .upsert({
+              member_id: S.myId,
+              keep_id: S.keepId,
+              fcm_token: token.value,
+              updated_at: new Date().toISOString()
+            }, { onConflict: 'member_id' });
         } catch (e) {
           console.warn('persist fcm_token failed', e);
         }
@@ -3280,6 +3309,9 @@
     if (invBtn) invBtn.style.display = viewerOwner ? '' : 'none';
     renderPauseBlock();
     renderFamilyNameSetting();
+    // Whether Leave is offered depends on member_type and on how many
+    // owners are left, both of which this render already reflects.
+    renderLeaveKeep();
   }
 
   // ── FAMILY NAME (owner only) ───────────────────────────────────
@@ -4543,6 +4575,7 @@
     'close-invite': closeInvite,
     'connect-scan': connectFromScan,
     'connect-paste-go': connectFromPaste,
+    'leave-keep': leaveKeep,
     'disconnect-backend': disconnectBackend,
     'open-setup': openSetup,
     'close-setup': closeSetup,
@@ -4729,6 +4762,13 @@
   // user reaches the join screen so they don't have to retype it.
   let _pendingJoinCode = null;
 
+  // A setup link that arrived before boot() worked out whether this device
+  // already has a backend, plus the handler that will deal with it once it
+  // has. See bindSetupLinkHandler / drainSetupLink.
+  let _pendingSetupUrl = null;
+  let _setupLinkHandler = null;
+  let _bootResolved = false;
+
   function setConnectErr(msg) {
     const el = $('connect-err');
     if (!el) return;
@@ -4891,10 +4931,16 @@
     }
     const td = $('set-terms-date');
     if (td) td.textContent = TERMS_DATE;
+    const pd = $('set-privacy-date');
+    if (pd) pd.textContent = PRIVACY_DATE;
     // Owner-only, and ownership can change while the app is open — so
     // this is re-evaluated on every open rather than once at launch.
     // renderFamilyNameSetting already owns that rule; don't restate it.
     renderFamilyNameSetting();
+    // Same reasoning, and the same reason it is not enough to render this
+    // once: the last owner leaving is exactly the state that changes under
+    // you while the sheet is shut.
+    renderLeaveKeep();
 
     closeDrawer();
     const sheet = $('settings-sheet');
@@ -4923,6 +4969,8 @@
     return new Promise((resolve) => {
       const d = $('terms-date');
       if (d) d.textContent = TERMS_DATE;
+      const pd = $('privacy-date');
+      if (pd) pd.textContent = PRIVACY_DATE;
       const t = $('terms-link');
       if (t) t.href = TERMS_URL;
       const p = $('privacy-link');
@@ -4954,8 +5002,35 @@
     if (note) note.style.display = 'block';
   }
 
+  /**
+   * Show the destination and get a yes before adopting it.
+   *
+   * A setup link decides where a family's location data goes, and until now
+   * nothing ever showed the person where that was. The link format accepts
+   * any https host on purpose — self-hosters need that — so the only thing
+   * standing between a tapped link and a stranger's server is this prompt.
+   *
+   * `confirm()` rather than a bespoke screen, matching disconnectBackend(),
+   * which asks the mirror-image question the same way.
+   */
+  function confirmBackend(cfg) {
+    let host;
+    try { host = new URL(cfg.url).host; } catch (_) { host = cfg.url; }
+    const odd = !/\.supabase\.co$/i.test(host);
+    return confirm(
+      'Connect this device to:\n\n' + host + '\n\n' +
+      (odd
+        ? 'This is NOT a supabase.co address. Only continue if you set up '
+          + 'this server yourself.\n\n'
+        : '') +
+      'Your location will be sent to this server. Only continue if you '
+      + 'recognise it.'
+    );
+  }
+
   async function applySetupConfig(cfg, opts) {
     setConnectErr('');
+    if (!confirmBackend(cfg)) return false;
     const btnIds = ['connect-scan', 'connect-paste-go'];
     btnIds.forEach(id => { const b = $(id); if (b) b.disabled = true; });
     try {
@@ -5029,6 +5104,12 @@
   function bindSetupLinkHandler() {
     const App = window.Capacitor?.Plugins?.App;
     const handle = async (url) => {
+      // Hold anything that arrives before boot() has decided whether this
+      // device already has a backend. The listener has to be registered
+      // early or a cold-start intent is dropped, but until loadBackendConfig
+      // has returned, S.sb is null on a device that IS connected — and the
+      // branch below would then treat the link as a first run and apply it.
+      if (!_bootResolved) { _pendingSetupUrl = url; return; }
       const cfg = parseSetupLink(url);
       if (!cfg) return;
       if (S.sb) {
@@ -5045,6 +5126,7 @@
       }
       await applySetupConfig(cfg);
     };
+    _setupLinkHandler = handle;
     if (App && typeof App.addListener === 'function') {
       try { App.addListener('appUrlOpen', (e) => handle(e && e.url)); } catch (_) {}
     }
@@ -5052,6 +5134,14 @@
     if (!isNative() && location.hash && location.hash.length > 3) {
       handle(location.href);
     }
+  }
+
+  // Boot has decided; release anything the handler above parked.
+  function drainSetupLink() {
+    _bootResolved = true;
+    const url = _pendingSetupUrl;
+    _pendingSetupUrl = null;
+    if (url && _setupLinkHandler) _setupLinkHandler(url);
   }
 
   // Prefill the join-code field once the join screen exists.
@@ -5069,6 +5159,88 @@
   // tracking, drop the stored config, and return to the Connect screen.
   // The counterpart to applySetupConfig — needed both for switching
   // servers and for handing a device on.
+  /**
+   * Who is offered the Leave button, and what the others are told instead.
+   *
+   * The server is the authority — leave_keep() raises child_cannot_leave and
+   * last_owner regardless of what the UI does. This only avoids offering
+   * somebody a button that is certain to fail. Re-evaluated on every open,
+   * because roles and member_type both change while the app is running.
+   */
+  function renderLeaveKeep() {
+    const btn = $('leave-keep-btn');
+    const note = $('leave-keep-note');
+    if (!btn || !note) return;
+
+    const me = myMember();
+    if (!me) { btn.style.display = 'none'; note.style.display = 'none'; return; }
+
+    const isChild = me.member_type === 'child';
+    const owners = S.members.filter(m => m.role === 'owner').length;
+    const lastOwner = me.role === 'owner' && owners <= 1;
+
+    btn.style.display = (isChild || lastOwner) ? 'none' : 'block';
+
+    if (isChild) {
+      note.textContent = 'Ask an adult in your family if you want to leave this Keep.';
+    } else if (lastOwner) {
+      note.textContent = 'You are the only owner, so you cannot leave — the rest of '
+        + 'the family would be left with nobody able to manage the Keep. Make someone '
+        + 'else an owner first, or delete the Supabase project to remove everything.';
+    }
+    note.style.display = (isChild || lastOwner) ? 'block' : 'none';
+  }
+
+  /**
+   * Leave the Keep: delete this member and everywhere they have been.
+   *
+   * landing/privacy has always promised this. Until 4.8.3 nothing in the app
+   * could do it — signing out only set online=false, and the membership,
+   * the location history and the check-ins all survived it.
+   *
+   * Deliberately does NOT sign out or clear the backend config: after the
+   * reload the session is still good, no member row is found, and the user
+   * lands on the create-or-join screen. Leaving a family is not the same
+   * decision as handing the phone on.
+   */
+  async function leaveKeep() {
+    const me = myMember();
+    if (!me) return;
+    if (!confirm(
+      'Leave ' + (S.keepName || 'this Keep') + '?\n\n'
+      + 'Your membership, your location history and your check-ins will be '
+      + 'permanently deleted from your family’s server. Your family will no '
+      + 'longer see where you are.\n\n'
+      + 'This cannot be undone.'
+    )) return;
+
+    const btn = $('leave-keep-btn');
+    if (btn) { btn.disabled = true; btn.textContent = '⏳ Leaving…'; }
+
+    const { error } = await S.sb.rpc('leave_keep', { p_member_id: me.id });
+    if (error) {
+      if (btn) { btn.disabled = false; btn.textContent = 'Leave this Keep'; }
+      toast(mapRpcError(error), 'err');
+      return;
+    }
+
+    // Stop the OS firing transitions into a keep this device is no longer
+    // part of. clearAll wipes the stored auth, places and pending queue —
+    // exactly right here, where the membership those referred to is gone.
+    const NG = nativeGeo();
+    if (NG) {
+      try { await NG.clearAll(); } catch (_) {}
+      try { await NG.stopLocationUpdates(); } catch (_) {}
+    }
+    S._nativeGeoReady = false;
+    S._nativeLocReady = false;
+    if (S.channel) { try { S.sb.removeChannel(S.channel); } catch (_) {} S.channel = null; }
+
+    // Full reload for the same reason as disconnectBackend: it resets every
+    // module-level cache honestly instead of hand-clearing each one.
+    location.reload();
+  }
+
   async function disconnectBackend() {
     if (!confirm('Disconnect from this family server?\n\nYou will be signed out and this device will stop sharing location until you connect again. Nothing on the server is deleted.')) return;
     const NG = nativeGeo();
@@ -5109,9 +5281,11 @@
     if (!cfg) {
       // No family server yet — this is a fresh Play Store install.
       show('s-connect');
+      drainSetupLink();
       return;
     }
     await startWithBackend(cfg);
+    drainSetupLink();
   }
 
   // Everything from "we know which Supabase to talk to" onwards. Split out
