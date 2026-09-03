@@ -2,6 +2,36 @@
 <html lang="en">
 <head>
   <meta charset="UTF-8">
+  <!-- Content-Security-Policy for the Android WebView.
+       cloudfront-static-site.yaml sets this same policy as a response
+       header, but a header only ever reaches the PWA and the landing site.
+       Inside the APK the page is served by Capacitor's own local server, so
+       no policy applied at all — the one place with no CSP was the one that
+       ships to phones. This tag closes that gap; on the PWA both apply and
+       the intersection is enforced, so nothing there gets looser.
+
+       Two deliberate differences from the header:
+         - no frame-ancestors. A meta tag cannot set it; it is header-only.
+         - connect-src is scheme-only rather than a host allowlist. The
+           header can pin *.supabase.co because the PWA is one family's own
+           pre-baked deployment, but the APK is pointed at whatever backend
+           a setup link carries (parseSetupLink accepts any https origin),
+           so pinning here would kill a self-hosted family with no error
+           that names CSP. What that allowlist defends against is
+           exfiltration by injected script, and script-src 'self' with
+           neither 'unsafe-inline' nor 'unsafe-eval' means there is no
+           injected script to exfiltrate with.
+
+       The Capacitor bridge survives this: it arrives via
+       addDocumentStartJavaScript, which is not a <script> element and so is
+       not subject to script-src. On a WebView too old for that, Capacitor
+       falls back to an inline <script> injected immediately after <head> —
+       ahead of this tag, and a meta policy only binds what is parsed after
+       it — so that path still works too.
+
+       Re-test on a real device after touching this: the map tiles, the QR
+       scanner, and a live realtime update. -->
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com; img-src 'self' data: https://tile.openstreetmap.org; connect-src 'self' https: wss:; worker-src 'self'; manifest-src 'self'; object-src 'none'">
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
   <title>Roamkeep</title>
   <link rel="manifest" href="manifest.json">
@@ -452,6 +482,32 @@
     <div class="note" id="inv-expiry">—</div>
     <button class="btn btn-g" data-action="share-invite"><span class="ic" data-icon="share"></span> Share invite</button>
     <button class="btn" id="inv-rotate" data-action="rotate-code">🔄 Rotate code</button>  </div>
+</div>
+
+<!-- BEFORE-YOU-DISCONNECT SHEET — the only owner's setup link.
+     A sheet rather than a prompt(): Capacitor's WebChromeClient builds the
+     prompt dialog's EditText and never applies the defaultValue it was
+     handed, so prompt(message, link) renders an empty box and hands over
+     nothing. The link has to be VISIBLE and selectable, so that copying is
+     a convenience rather than the only way to get it. -->
+<div class="sheet-scrim" id="disc-scrim" data-action="close-disc"></div>
+<div class="sheet" id="disc-sheet" role="dialog" aria-modal="true" aria-labelledby="disc-title">
+  <div class="sheet-handle" aria-hidden="true"></div>
+  <button class="sheet-x" data-action="close-disc" aria-label="Close"><span class="ic" data-icon="x"></span></button>
+  <div class="sheet-body">
+    <div class="sec-h" id="disc-title">Before you disconnect 🔌</div>
+    <p class="note" id="disc-note">—</p>
+    <div id="disc-link" class="link-box" role="textbox" aria-readonly="true"
+         aria-label="Your setup link" tabindex="0"></div>
+    <button class="btn btn-g" data-action="copy-disc-link" style="margin-top:10px"><span class="ic" data-icon="share"></span> Copy link</button>
+    <button class="btn" id="disc-share" data-action="share-disc-link" style="margin-top:8px; display:none">Share link…</button>
+    <button class="btn" data-action="close-disc" style="margin-top:8px">Cancel</button>
+    <!-- Same treatment as Settings: a plain .btn inside .danger-block picks
+         up the coral styling, rather than inventing a button class. -->
+    <div class="danger-block">
+      <button class="btn" data-action="disc-go">Disconnect this device</button>
+    </div>
+  </div>
 </div>
 
 <!-- PROFILE EDIT SHEET (own row always; owner on any row) -->

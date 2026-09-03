@@ -58,6 +58,64 @@ function bakedBackendLine() {
          '; /* BUILD_INJECT_BACKEND */';
 }
 
+// ── Release gate: sw.js CACHE must move with android versionCode ──
+//
+// Leaving CACHE alone means returning PWA users keep being served the
+// previous bundle out of the service worker's cache, so a fix — a security
+// fix included — ships to the store and silently never reaches the web.
+// Nothing reports it: the build succeeds, the deploy succeeds, and only the
+// users are stale.
+//
+// It has already happened once. 4.5.10 (versionCode 52) went out with CACHE
+// still at roamkeep-v59, the value 4.5.9 had shipped.
+//
+// The release convention is that a behavioural change bumps versionCode,
+// versionName and CACHE together, so the two numbers move in lockstep and
+// their difference is a constant. Pinning the difference catches a miss in
+// either direction, and — unlike recording the last released CACHE here —
+// never needs updating, so it cannot decay into a check that always passes.
+//
+// If a release ever has a real reason to break the pairing, move
+// CACHE_VERSION_OFFSET in the same commit and say why.
+const CACHE_VERSION_OFFSET = 7;   // roamkeep-v72 ↔ versionCode 65
+
+function checkCacheVersion() {
+  const swPath = path.join(ROOT, 'sw.js');
+  const gradlePath = path.join(ROOT, 'android', 'app', 'build.gradle');
+  // A web-only checkout has no android/ — there is nothing to check against,
+  // and refusing to build one would be its own kind of wrong.
+  if (!fs.existsSync(swPath) || !fs.existsSync(gradlePath)) {
+    console.warn('[build] cache/versionCode gate skipped — sw.js or android/app/build.gradle not present');
+    return;
+  }
+  const cacheM = /const CACHE = 'roamkeep-v(\d+)'/.exec(fs.readFileSync(swPath, 'utf8'));
+  const codeM = /versionCode\s+(\d+)/.exec(fs.readFileSync(gradlePath, 'utf8'));
+  if (!cacheM || !codeM) {
+    throw new Error(
+      '[build] cannot read CACHE from sw.js or versionCode from build.gradle.\n' +
+      '        Repair the pattern rather than dropping the gate — a gate that\n' +
+      '        cannot read its inputs is the same as no gate at all.'
+    );
+  }
+  const cache = Number(cacheM[1]);
+  const code = Number(codeM[1]);
+  const want = code + CACHE_VERSION_OFFSET;
+  if (cache !== want) {
+    throw new Error(
+      '[build] sw.js CACHE is out of step with the android versionCode.\n' +
+      '        versionCode ' + code + ' expects roamkeep-v' + want + ', found roamkeep-v' + cache + '.\n' +
+      '        Every behavioural change bumps versionCode, versionName and CACHE\n' +
+      '        together; a stale CACHE leaves PWA users on the previous bundle with\n' +
+      '        no error anywhere. Bump whichever is behind — or CACHE_VERSION_OFFSET,\n' +
+      '        if the pairing is deliberately changing.'
+    );
+  }
+  console.log('[build] cache/versionCode in step (roamkeep-v' + cache + ' ↔ versionCode ' + code + ')');
+}
+
+// Before the wipe, so a failed gate leaves dist/ as it was.
+checkCacheVersion();
+
 fs.rmSync(DIST, { recursive: true, force: true });
 fs.mkdirSync(DIST, { recursive: true });
 

@@ -1,7 +1,7 @@
 // Roamkeep Service Worker
 // Caches the app shell so it loads instantly and works offline.
 
-const CACHE = 'roamkeep-v71';
+const CACHE = 'roamkeep-v72';
 
 const PRECACHE = [
   './',

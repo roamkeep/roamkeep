@@ -1019,6 +1019,18 @@ input[type=range]::-moz-range-thumb {
   word-break: break-all; user-select: all;
 }
 #inv-expiry { text-align: center; margin-bottom: 14px; }
+
+/* The sole owner's setup link, shown before they disconnect. Wraps so the
+   WHOLE link is on screen: copying is a convenience here, and the link
+   still has to be readable and selectable when every clipboard call fails.
+   user-select:all makes one tap take the lot. */
+.link-box {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 12px; line-height: 1.55; color: var(--ink);
+  background: var(--surface-2); border: 2px dashed var(--surface-3);
+  border-radius: 12px; padding: 12px; margin: 8px 0 2px;
+  word-break: break-all; user-select: all; -webkit-user-select: all;
+}
 #inv-rotate { background: var(--surface-2); color: var(--ink-2); margin-top: 8px; }
 #inv-rotate:active { background: var(--surface-3); transform: scale(.98); }
 

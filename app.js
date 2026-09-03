@@ -54,6 +54,16 @@
   const PRIVACY_URL = 'https://get.roamkeep.app/privacy';
   const TERMS_STORE_KEY = 'rk_terms';
 
+  // The two status strings the app writes for itself. Constants because
+  // they are now written in one place and read in another — disconnect
+  // sets the marker, the next launch retracts it — and two copies of a
+  // magic string are two things that can drift apart silently.
+  // STATUS_DEFAULT matches the keep_members.status column default in
+  // db/schema.sql, so a retracted marker looks exactly like a row that
+  // never carried one.
+  const STATUS_DEFAULT = '📍 Location sharing on';
+  const STATUS_DISCONNECTED = '🔌 Disconnected this device';
+
   // Assigned once a backend is resolved; every consumer reads these.
   let SB_URL = '';
   let SB_KEY = '';
@@ -1033,6 +1043,34 @@
   }
 
   // ── LAUNCH ─────────────────────────────────────────────────────
+  /**
+   * Clear the "Disconnected this device" marker once the member is back.
+   *
+   * The status lives on the MEMBER row, not on a device, so the honest
+   * moment to retract it is when any of that member's devices opens the
+   * app — that device is the evidence. Restores the column default rather
+   * than an empty string, so a retracted marker is indistinguishable from
+   * a row that never carried one.
+   *
+   * Filtered on the old value as well as the id, so a status that changed
+   * underneath us — an SOS raised from another device between the read and
+   * the write — is never clobbered by this.
+   */
+  async function clearDisconnectedStatus() {
+    const me = myMember();
+    if (!me || me.status !== STATUS_DISCONNECTED) return;
+    try {
+      const { error } = await S.sb.from('keep_members')
+        .update({ status: STATUS_DEFAULT, online: true })
+        .eq('id', S.myId)
+        .eq('status', STATUS_DISCONNECTED);
+      if (error) return;               // leave good state alone on failure
+      me.status = STATUS_DEFAULT;
+      me.online = true;
+      renderMembers();
+    } catch (_) { /* best-effort, exactly like the write that set it */ }
+  }
+
   async function launchApp() {
     show('s-app');
     // Don't passively show the join code in the header anymore — it's now
@@ -1046,6 +1084,12 @@
     // Sequential, not Promise.all: loadPlaces seeds insidePlaces from the
     // caller's own member row, so it needs loadMembers to have landed.
     await loadTwice(loadMembers);
+    // Retract the disconnect marker now this device is demonstrably back.
+    // Nothing used to clear it, so a reconnected member sat at
+    // "Disconnected this device" forever — and because the member list
+    // shows a PAUSED member's computed status ahead of the stored one,
+    // pausing appeared to fix it and resuming brought it straight back.
+    await clearDisconnectedStatus();
     await loadTwice(loadCheckins);
     await loadTwice(loadPlaces);
     // After loadMembers (needs S.myId) and loadPlaces (the sheet lists
@@ -4016,7 +4060,7 @@
   async function cancelSOS() {
     S.sosActive = false;
     try {
-      await S.sb.from('keep_members').update({ sos: false, status: '📍 Location sharing on' }).eq('id', S.myId);
+      await S.sb.from('keep_members').update({ sos: false, status: STATUS_DEFAULT }).eq('id', S.myId);
     } catch (_) {}
     $('sos-hdr')?.classList.remove('ring');
     $('sos-big')?.classList.remove('ring');
@@ -4577,6 +4621,10 @@
     'connect-paste-go': connectFromPaste,
     'leave-keep': leaveKeep,
     'disconnect-backend': disconnectBackend,
+    'close-disc': closeDisconnectSheet,
+    'copy-disc-link': copyReconnectLink,
+    'share-disc-link': shareReconnectLink,
+    'disc-go': disconnectFromSheet,
     'open-setup': openSetup,
     'close-setup': closeSetup,
     'setup-fix-location': setupFixLocation,
@@ -5241,8 +5289,195 @@
     location.reload();
   }
 
+  /**
+   * The only owner's way back, shown before the door shuts.
+   *
+   * This replaced a chain of confirm() -> navigator.share -> clipboard ->
+   * prompt(), every link of which turned out to be unreliable inside the
+   * Android WebView:
+   *
+   *   - navigator.share is not implemented in a plain WebView at all, so
+   *     the chain always fell through to the clipboard.
+   *   - navigator.clipboard.writeText rejects when the document does not
+   *     hold focus, which is exactly the state a modal confirm() leaves it
+   *     in. It worked on a second attempt and not a first, which is the
+   *     worst kind of bug to be told about.
+   *   - prompt(message, defaultValue) then showed an EMPTY box, because
+   *     Capacitor's BridgeWebChromeClient.onJsPrompt builds its own
+   *     EditText and never applies defaultValue. The last resort — the one
+   *     whose entire job was to make sure nobody was stranded — handed
+   *     over nothing.
+   *
+   * So the link is rendered into the page instead, where it is visible and
+   * selectable whether or not any clipboard call succeeds, and copying is
+   * a convenience rather than the delivery mechanism. The disconnect itself
+   * lives on this sheet, so there is no path to it that skips the link.
+   *
+   * The link carries no join code, unlike the invite: whoever uses it
+   * already has a membership and is reconnecting, not joining. The anon key
+   * in it is public by design — RLS is the security.
+   */
+  function openDisconnectSheet() {
+    const box = $('disc-link');
+    if (box) box.textContent = buildSetupLink(null);
+    const note = $('disc-note');
+    if (note) {
+      note.textContent = 'You are the only owner of ' + (S.keepName || 'this Keep') +
+        ', so nobody else can create an invite link for you. This link is what '
+        + 'connects a device back to your family server — save it before you go, '
+        + 'or you will need your Supabase project details to get back in.';
+    }
+    // Web Share exists in a browser PWA but not in the WebView, so the
+    // button is offered only where it can actually do something.
+    const shareBtn = $('disc-share');
+    if (shareBtn) shareBtn.style.display = navigator.share ? '' : 'none';
+
+    const sheet = $('disc-sheet');
+    const scrim = $('disc-scrim');
+    if (sheet) { sheet.classList.remove('full'); sheet.classList.add('half', 'open'); }
+    if (scrim) scrim.classList.add('on');
+    document.body.classList.add('sheet-open');
+  }
+
+  function closeDisconnectSheet() {
+    const sheet = $('disc-sheet');
+    const scrim = $('disc-scrim');
+    if (sheet) sheet.classList.remove('open', 'half', 'full');
+    if (scrim) scrim.classList.remove('on');
+    document.body.classList.remove('sheet-open');
+  }
+
+  async function copyReconnectLink() {
+    const box = $('disc-link');
+    if (!box) return;
+    try {
+      // The bare link and nothing else: this gets pasted straight into the
+      // Connect screen's field, and any preamble is one more thing to trim
+      // off by hand on a phone. The sheet already says what it is, on
+      // screen, where the explanation belongs.
+      await navigator.clipboard.writeText(box.textContent);
+      toast('Setup link copied', 'ok');
+      return;
+    } catch (_) { /* not focused, or no permission — try the old way */ }
+    // execCommand is deprecated but works in the WebView, needs no
+    // permission, and runs off this button's own tap rather than an
+    // activation inherited through a dialog.
+    const sel = window.getSelection();
+    try {
+      const range = document.createRange();
+      range.selectNodeContents(box);
+      sel.removeAllRanges();
+      sel.addRange(range);
+      if (document.execCommand('copy')) { toast('Setup link copied', 'ok'); return; }
+    } catch (_) {}
+    // Both refused. The link is on screen and now selected, so say what to
+    // do rather than claiming a copy that did not happen.
+    toast('Press and hold the link to copy it', 'err');
+  }
+
+  async function shareReconnectLink() {
+    if (!navigator.share) { await copyReconnectLink(); return; }
+    try {
+      await navigator.share({ title: 'Roamkeep setup link', text: buildSetupLink(null) });
+    } catch (e) {
+      // Dismissing the sheet is a decision; anything else means it never
+      // happened, so fall back to the clipboard.
+      if (!e || e.name !== 'AbortError') await copyReconnectLink();
+    }
+  }
+
+  async function disconnectFromSheet() {
+    closeDisconnectSheet();
+    await confirmAndDisconnect(true);
+  }
+
+  /**
+   * Hands this device back: clears the stored family server, signs out, and
+   * disarms every native watcher, leaving the app on the Connect screen.
+   *
+   * Before any of that it marks the member row offline with a status that
+   * says so, because until 4.8.4 disconnecting wrote NOTHING to the
+   * database. 'online' stayed true, so the rest of the family kept seeing
+   * the green dot, and last_seen merely aged — which is exactly what a flat
+   * battery, no signal, and an OS-killed foreground service all look like.
+   * A deliberate opt-out was indistinguishable from the app being broken,
+   * and got chased as a fault.
+   *
+   * The control is deliberately ungated — a member marked as a child can
+   * reach it — and that should not change. Gating it would be
+   * unenforceable, since whoever holds the phone can uninstall, revoke
+   * location, or turn on airplane mode; the same reasoning is already
+   * written on the member DELETE policy and on pause_member. And a
+   * location app that is hard to switch off from the tracked device is an
+   * app that is better at coercive control, which the terms forbid. The
+   * defect here was never the permission, it was the silence: fix it by
+   * disclosure, not by enforcement.
+   *
+   * Two limits, both accepted rather than chased:
+   *   - it only covers the in-app path. An uninstall writes nothing at all,
+   *     and nothing on the device can make it.
+   *   - it is best-effort, exactly like the same write in signOut().
+   *     Disconnecting with no signal stays silent.
+   * The point is to turn the common, honest case from "looks broken" into
+   * "says what happened", not to make severance detectable in every case.
+   *
+   * The confirmation also says how to get back, because this is a one-way
+   * door: the stored config is gone and the Connect screen wants a setup
+   * link. See the sole-owner note in the body for who can supply one.
+   */
   async function disconnectBackend() {
-    if (!confirm('Disconnect from this family server?\n\nYou will be signed out and this device will stop sharing location until you connect again. Nothing on the server is deleted.')) return;
+    // Only an owner can create an invite link (openInvite refuses everyone
+    // else), so the ONLY owner is the one person in a Keep with nobody to
+    // ask for a way back in. Everyone else can be sent a fresh link; they
+    // would have to recover their project URL and anon key from the
+    // Supabase dashboard by hand.
+    //
+    // Offer them the link rather than taking the button away. Disconnect is
+    // also how you strip your credentials off a phone you are selling or
+    // handing on — the distinction leaveKeep() draws — and that must never
+    // be unavailable to anyone, least of all the person whose session has
+    // the most reach. Nothing here is destructive: the membership, history
+    // and check-ins all survive, so this is a lockout to avoid, not a loss.
+    const me = myMember();
+    const owners = S.members.filter(m => m.role === 'owner').length;
+    const soleOwner = !!me && me.role === 'owner' && owners <= 1;
+
+    // The sole owner goes through the sheet, which carries the link and
+    // the disconnect button together — so there is no route to the
+    // disconnect that skips being handed the way back.
+    //
+    // Settings has to close first. Every .sheet shares z-index 60, so two
+    // open at once are ordered by their position in the DOM — and
+    // #settings-sheet is written after #disc-sheet, so it painted on top
+    // and the new sheet was invisible until Settings was dismissed. They
+    // would also fight over body.sheet-open, which each one clears on
+    // close. One sheet at a time is the fix and the right behaviour.
+    if (soleOwner) { closeSettings(); openDisconnectSheet(); return; }
+
+    await confirmAndDisconnect(false);
+  }
+
+  async function confirmAndDisconnect(soleOwner) {
+    if (!confirm(
+      'Disconnect from this family server?\n\n'
+      + 'You will be signed out and this device will stop sharing location '
+      + 'until you connect again. ' + (soleOwner
+          ? 'Only your own setup link can bring it back.'
+          : 'To connect again you will need a setup link from an owner.')
+      + '\n\nYour family will see that this device was disconnected.\n\n'
+      + 'Nothing on the server is deleted.'
+    )) return;
+    // Own row, and neither column is covered by _roamkeep_guard_member_cols
+    // (v14 guards role/member_type/paused_until/keep_id/user_id), so the RLS
+    // policy and the trigger both permit this. It has to happen BEFORE
+    // signOut() — afterwards there is no session left to write with.
+    if (S.myId) {
+      try {
+        await S.sb.from('keep_members')
+          .update({ online: false, status: STATUS_DISCONNECTED })
+          .eq('id', S.myId);
+      } catch (_) {}
+    }
     const NG = nativeGeo();
     if (NG) {
       // clearAll wipes stored auth + places + the pending queue, which is

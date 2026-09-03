@@ -211,7 +211,15 @@ Resources:
             Preload: true
             Override: true
           ContentSecurityPolicy:
-            ContentSecurityPolicy: "default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com; img-src 'self' data: https://*.tile.openstreetmap.org; connect-src 'self' https://*.supabase.co wss://*.supabase.co; worker-src 'self'; manifest-src 'self'; object-src 'none'; frame-ancestors 'none'"
+            # img-src names tile.openstreetmap.org exactly. It used to say
+            # *.tile.openstreetmap.org, which in CSP requires at least one
+            # leading label and therefore never matched the bare host — and
+            # 4.5.16 moved the map to exactly that bare host, because the OSM
+            # tile usage policy asks for the canonical name with no a/b/c
+            # rotation. Between the two the PWA was blocking its own tiles.
+            # Mirrored as a meta tag in index.html, which is the only policy
+            # the Android WebView sees; keep the two in step.
+            ContentSecurityPolicy: "default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com; img-src 'self' data: https://tile.openstreetmap.org; connect-src 'self' https://*.supabase.co wss://*.supabase.co; worker-src 'self'; manifest-src 'self'; object-src 'none'; frame-ancestors 'none'"
             Override: true
           ContentTypeOptions:
             Override: true

@@ -211,14 +211,23 @@ public class SupabaseRest {
 
             int code = conn.getResponseCode();
             if (code >= 400) {
-                // Drain the error stream for logging so keep-alive can reuse the socket.
+                // Drain the error stream so keep-alive can reuse the socket — that
+                // is the reason this reads at all — but log only the SQLSTATE.
+                //
+                // The whole body used to go to logcat, and a PostgREST error body
+                // quotes the offending row back in its "details" and "hint" fields:
+                // a constraint failure on a check-in would print that check-in's
+                // own coordinates. logcat is readable over adb, so a failed write
+                // was one row value away from being a location leak. The SQLSTATE says which kind of
+                // failure it was and can never carry a row value; the method, path
+                // and HTTP status are already logged by doJsonWithRefresh.
                 try (BufferedReader r = new BufferedReader(new InputStreamReader(
                         conn.getErrorStream() != null ? conn.getErrorStream() : conn.getInputStream(),
                         StandardCharsets.UTF_8))) {
                     StringBuilder sb = new StringBuilder();
                     String line;
                     while ((line = r.readLine()) != null) sb.append(line);
-                    Log.w(TAG, "error body: " + sb);
+                    Log.w(TAG, "error sqlstate: " + sqlStateOf(sb.toString()));
                 } catch (IOException ignored) {}
             }
             return code;
@@ -227,6 +236,24 @@ public class SupabaseRest {
             return -1;
         } finally {
             if (conn != null) conn.disconnect();
+        }
+    }
+
+    /**
+     * Pulls the SQLSTATE out of a PostgREST error body, which is
+     * {"code","details","hint","message"} — of those only "code" is
+     * guaranteed to be free of row values, so it is the only part allowed
+     * near logcat. A body that will not parse reports its size and nothing
+     * else: an unknown shape is exactly the case where no field can be
+     * assumed safe to quote.
+     */
+    private static String sqlStateOf(String body) {
+        if (body == null || body.isEmpty()) return "(empty)";
+        try {
+            String code = new JSONObject(body).optString("code", "");
+            return code.isEmpty() ? "(none)" : code;
+        } catch (JSONException e) {
+            return "(unparsed, " + body.length() + " bytes)";
         }
     }
 
