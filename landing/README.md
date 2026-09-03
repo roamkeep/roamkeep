@@ -29,8 +29,19 @@ install flow. It never transmits it anywhere.
 
 | | |
 |---|---|
-| `index.html` | the page itself, served for `/s` (and anything else) |
+| `index.html` | the page itself, and what unknown paths fall back to |
+| `setup.js` | reads the link and adapts the page |
+| `s/index.html` | makes `/s` a real path; hands off to `/` |
+| `s/redirect.js` | that hand-off |
+| `privacy/`, `terms/` | the published documents |
 | `.well-known/assetlinks.json` | Android App Links verification |
+
+The JavaScript sits in files rather than inline `<script>` blocks because
+the response headers set by `cloudfront-static-site.yaml` include
+`script-src 'self'` with no `'unsafe-inline'`. Inline blocks are blocked
+outright, and the only trace is a console message: for a while the Copy
+button did nothing and "Open in Roamkeep" never appeared, on the one page
+whose whole job is catching setup links. Keep them as files.
 
 ## Hosting
 
@@ -41,6 +52,11 @@ Any static host, with two requirements:
    a redirect fails verification silently.
 2. **`/s` must serve `index.html`.** Either add a rewrite, or serve
    `index.html` as the 404 document.
+3. **Upload the `.js` files with the HTML, never after.** A missing one
+   does not 404 under the arrangement above: the error mapping answers with
+   the root page and a `200`, so the browser gets HTML where it asked for
+   JavaScript and the page breaks exactly as it did when the scripts were
+   inline — silently.
 
 The existing `cloudfront-static-site.yaml` template works — deploy a
 second stack with `SubDomain=get`.
