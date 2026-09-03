@@ -50,16 +50,31 @@ Any static host, with two requirements:
 1. **`/.well-known/assetlinks.json` must be served over HTTPS as
    `application/json`, with no redirect.** Android fetches it directly and
    a redirect fails verification silently.
-2. **`/s` must serve `index.html`.** Either add a rewrite, or serve
-   `index.html` as the 404 document.
+2. **Extensionless paths must resolve to their directory index.** `/s`,
+   `/privacy` and `/terms` are directories with an `index.html` inside;
+   S3 behind Origin Access Control is an object store and has no notion of
+   a directory index, so it refuses a request for the key `privacy`.
+   **Add a real rewrite. Do not "serve `index.html` as the 404 document"** —
+   this README used to suggest exactly that, and it is how `/privacy` and
+   `/terms` came to answer `200` with the invite page for several days.
+   Google re-checks the privacy URL for the Play listing, and the in-app
+   consent sheet links to both.
 3. **Upload the `.js` files with the HTML, never after.** A missing one
-   does not 404 under the arrangement above: the error mapping answers with
-   the root page and a `200`, so the browser gets HTML where it asked for
-   JavaScript and the page breaks exactly as it did when the scripts were
-   inline — silently.
+   still resolves to the error page rather than a bare failure — the
+   browser gets HTML where it asked for JavaScript. It now at least arrives
+   with a `404` rather than a `200`, so it shows up in the network panel
+   instead of failing silently.
 
-The existing `cloudfront-static-site.yaml` template works — deploy a
-second stack with `SubDomain=get`.
+The existing `cloudfront-static-site.yaml` template covers both — deploy a
+second stack with `SubDomain=get`. It carries a CloudFront Function
+(`IndexRewriteFunction`) that does the rewrite on viewer-request, and maps
+origin 403/404 to a `404` rather than a `200`.
+
+**Keep the rewrite in the template, not attached by hand.** It was a
+manually-added function once; a later stack update reset the cache
+behaviour to what the template said and removed it, which is what broke
+`/privacy`. Anything the distribution needs has to be in the file, or the
+next update silently takes it away.
 
 ## Two fingerprints, and why
 

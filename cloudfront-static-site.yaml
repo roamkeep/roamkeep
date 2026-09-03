@@ -244,6 +244,57 @@ Resources:
               Override: true
 
   # -------------------------------------------------------------------------
+  # CloudFront Function — directory index rewrite
+  # -------------------------------------------------------------------------
+  #
+  # S3 behind Origin Access Control is an object store, not a web server: it
+  # has no notion of a directory index. A request for /privacy is a request
+  # for an object with the key "privacy", which does not exist, so the origin
+  # refuses it and the CustomErrorResponses below turn that into the site's
+  # own index.html. DefaultRootObject does not help — it applies to "/" only.
+  #
+  # The result was that https://get.roamkeep.app/privacy served the invite
+  # landing page with a 200. That URL is registered in the Play Console and
+  # Google re-checks it, and the in-app consent sheet links to it and to
+  # /terms — so members were being asked to accept documents that, if they
+  # tapped through, they could not read.
+  #
+  # This lived outside the template before, attached by hand, and a stack
+  # update reset the cache behaviour and removed it. Hence: in the template,
+  # where an update restores it rather than dropping it.
+  IndexRewriteFunction:
+    Type: AWS::CloudFront::Function
+    Properties:
+      Name: !Sub '${AWS::StackName}-index-rewrite'
+      AutoPublish: true
+      FunctionConfig:
+        Comment: Map extensionless paths to their directory index
+        Runtime: cloudfront-js-2.0
+      FunctionCode: |
+        function handler(event) {
+            var request = event.request;
+            var uri = request.uri;
+
+            // "/privacy/" and "/" -> append index.html
+            if (uri.charAt(uri.length - 1) === '/') {
+                request.uri = uri + 'index.html';
+                return request;
+            }
+
+            // "/privacy" -> "/privacy/index.html", but leave anything with a
+            // file extension alone. That last test is what keeps
+            // /.well-known/assetlinks.json, /app.js and /styles.css intact —
+            // assetlinks in particular must be served as-is with no redirect
+            // or Android App Link verification fails silently.
+            var lastSegment = uri.substring(uri.lastIndexOf('/') + 1);
+            if (lastSegment.indexOf('.') === -1) {
+                request.uri = uri + '/index.html';
+            }
+
+            return request;
+        }
+
+  # -------------------------------------------------------------------------
   # CloudFront Distribution
   # -------------------------------------------------------------------------
 
@@ -291,15 +342,29 @@ Resources:
           CachedMethods:
             - GET
             - HEAD
+          FunctionAssociations:
+            - EventType: viewer-request
+              FunctionARN: !GetAtt IndexRewriteFunction.FunctionMetadata.FunctionARN
 
         # Custom error pages
+        #
+        # A missing object still lands here — the rewrite above resolves
+        # /privacy to /privacy/index.html, but nothing can resolve a path that
+        # genuinely has no page behind it. What changed is the status: this
+        # used to answer 200, so every missing route was served as the landing
+        # page and looked like a success. That is precisely what hid the
+        # /privacy fault, and it would have hidden the next one too.
+        #
+        # 403 rather than 404 is what S3 returns for a missing key behind
+        # Origin Access Control, because the caller has GetObject and not
+        # ListBucket — so both are mapped, and both now tell the truth.
         CustomErrorResponses:
           - ErrorCode: 403
-            ResponseCode: 200
+            ResponseCode: 404
             ResponsePagePath: /index.html
             ErrorCachingMinTTL: 0
           - ErrorCode: 404
-            ResponseCode: 200
+            ResponseCode: 404
             ResponsePagePath: /index.html
             ErrorCachingMinTTL: 0
 
