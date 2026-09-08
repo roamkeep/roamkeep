@@ -350,7 +350,7 @@ public class LocationUpdateReceiver extends BroadcastReceiver {
             // wandering around the house with the phone shouldn't show up
             // as a trip. The live pin (below) still updates so others see
             // you're home; only the trail is suppressed.
-            if (isInsideAnyPlace(places, lats[i], lngs[i], acc)) { suppressed++; continue; }
+            if (isInsideAnyPlace(places, lats[i], lngs[i], acc, movingNow)) { suppressed++; continue; }
             String iso = toIso8601Utc(times[i]);
             try {
                 JSONObject row = new JSONObject();
@@ -504,18 +504,36 @@ public class LocationUpdateReceiver extends BroadcastReceiver {
      *
      * Note the deliberate asymmetry with GeofenceReceiver: there an ambiguous
      * fix drops the transition, here it counts as inside. Both refuse to act
-     * on a fix that cannot tell which side it is on. The cost of guessing
-     * wrong here is one missing trail point at the doorstep; the cost the
-     * other way is a phantom trip printed over a stay.
+     * on a fix that cannot tell which side it is on.
+     *
+     * BUT THE PADDING IS CONDITIONAL, and 4.8.6 is where that was learned.
+     * Padding unconditionally clips the START OF EVERY DEPARTURE by roughly
+     * the fix's own accuracy — on a device running ±50 m that is 50 m of
+     * missing trail every time you leave anywhere, which showed up as bike
+     * rides beginning well down the road.
+     *
+     * It is also, by then, protecting almost nothing. The stillness gate
+     * (step 4) runs BEFORE this check, so a stationary phone's fuzzy fixes
+     * never arrive here at all — they were rejected several steps earlier.
+     * The only fix that reaches this padding is one from a device the
+     * pipeline already believes is moving, which is exactly when the points
+     * are wanted.
+     *
+     * So pad only when THIS fix shows no movement of its own. A real
+     * departure carries a trusted speed or has already dragged the centroid,
+     * so movingNow is true and nothing is clipped. Drift leaking through a
+     * grace window has neither, so it is still suppressed — which is the one
+     * hole the padding was left to cover.
      *
      * A PRECISE fix outside the radius is always a trail point, even right at
      * the edge — so a walk that genuinely starts at the front door is not
      * clipped.
      */
     private static boolean isInsideAnyPlace(List<PrefsStore.Place> places,
-                                            double lat, double lng, float acc) {
+                                            double lat, double lng, float acc,
+                                            boolean movingNow) {
         if (places == null || places.isEmpty()) return false;
-        final boolean fuzzy = acc > GeofenceReceiver.DRIFT_MIN_ACC_M;
+        final boolean fuzzy = !movingNow && acc > GeofenceReceiver.DRIFT_MIN_ACC_M;
         float[] out = new float[1];
         for (PrefsStore.Place p : places) {
             Location.distanceBetween(lat, lng, p.lat, p.lng, out);

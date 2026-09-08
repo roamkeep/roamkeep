@@ -540,14 +540,22 @@ context and geofences, then reloads to the Connect screen.
   (`segmentTrips` over that day's breadcrumbs, classified walk/drive
   from GPS speed with a distance/time fallback). Queries run on demand
   when the tab opens; tapping a trip draws it via the trail machinery.
-  `segmentTrips` ends a trip on a **stationary stretch** as well as a
-  silence — the silence never opens on a phone that doze-cycles, because
-  each wake pushes a fresh fix. `isRealTrip` is the one definition of a
-  trip worth showing, used by the timeline, the map and the trail pill
-  alike (they disagreed before it existed): far enough (`TRIP_MIN_M`),
-  *gone* far enough (`TRIP_SPAN_MIN_M` — drift's summed path grows while
-  its distance from the start does not), and not a loop that began and
-  ended at one saved place inside ten minutes.
+  `segmentTrips` splits on a **silence** and nothing else, and
+  `isRealTrip` — the one definition of a trip worth showing, used by the
+  timeline, the map and the trail pill alike, which disagreed before it
+  existed — asks only that the trip covered `TRIP_MIN_M`.
+  **That is deliberate, and it is the lesson of 4.8.5–4.8.6.** Three
+  cleverer read-side filters were added there and all three were removed:
+  a doorstep test that deleted two real errands (leaving somewhere and
+  coming back is what an errand IS), a stationary split that could not
+  tell a parked phone from laps of a small track, and a span test that
+  caught none of the phantoms it was measured against while hiding any
+  real out-and-back under 240 m. **Drift is stopped where it is written,
+  not where it is drawn** — the gates in `LocationUpdateReceiver` are the
+  ones that earned their place, on real journeys from two testers. A
+  filter here cannot tell a short real trip from noise, because by this
+  point the thing that would distinguish them — the fix accuracy — has
+  already been thrown away.
 - **Per-place notifications (v13).** `keep_notify_prefs` holds *exception
   rows only* — a row means "don't tell me about this person at this
   place", no row means notify — so an empty table is exactly pre-v13
