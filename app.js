@@ -1902,6 +1902,16 @@
   // (Breadcrumbs are distance-gated, so a stationary phone emits none and
   // the time gap grows.)
   const TRIP_GAP_MS = 10 * 60 * 1000;
+  // The SECOND way a trip ends, and on Android the only one that ever fires.
+  // The silence above assumes a parked phone goes quiet — but a device that
+  // doze-cycles every few minutes is never quiet: each doze exit pushes a
+  // fresh fix through, so the gap never opens and a whole stationary
+  // afternoon arrived here as one continuous "trip". A device that has not
+  // left a STILL_RADIUS_M ball in STILL_WINDOW_MS is parked, whatever it is
+  // still emitting. 15 minutes to cover 120 m is 0.5 km/h — slower than any
+  // purposeful movement.
+  const STILL_RADIUS_M  = 120;
+  const STILL_WINDOW_MS = 15 * 60 * 1000;
   // Distinct, map-legible colours cycled per trip. 12 hues so a busy day
   // of many trips gets its own colour far longer before any repeat; all
   // kept clear of the place-circle green and the blue radius preview.
@@ -1909,19 +1919,68 @@
     '#b5563f', '#3f7d5a', '#8c4a7a', '#5a7a2c', '#2c6f8c', '#9a7a3a'];
   const ARROW_SPACING_PX = 55;   // draw a direction arrow ~every this many px
 
-  // Split the (oldest → newest) breadcrumb list into trips on time gaps.
+  // Split the (oldest → newest) breadcrumb list into trips, on a time gap or
+  // on a stretch spent standing still.
+  //
+  // The stillness test uses a MOVING ANCHOR rather than the diameter of a
+  // window, and that choice is what protects real closed-loop activity: a
+  // runner doing laps passes 120 m from the anchor every lap, so the clock
+  // resets every lap and they are never called parked. Drift re-anchors only
+  // rarely, and when it does the anchor lands on the far edge of its ball, so
+  // the next escape needs roughly twice the radius from the centre — which
+  // drift cannot reach. A stray outlier therefore costs one extra window, not
+  // correctness. (Same reasoning as the native breadcrumb anchor in
+  // LocationUpdateReceiver, deliberately.)
   function segmentTrips(pts) {
     const trips = [];
-    let cur = null;
+    let cur = null, anchor = null;
     for (const p of pts) {
       const t = new Date(p.recorded_at).getTime();
-      if (!cur || (cur._lastT != null && t - cur._lastT > TRIP_GAP_MS)) {
+      const gap = !!(cur && cur._lastT != null && t - cur._lastT > TRIP_GAP_MS);
+      if (!gap && anchor) {
+        if (distanceM(anchor.lat, anchor.lng, p.lat, p.lng) > STILL_RADIUS_M) {
+          anchor = { lat: p.lat, lng: p.lng, t };     // real progress — re-anchor
+        } else if (t - anchor.t > STILL_WINDOW_MS) {
+          // Parked. Drop the point rather than keeping it: it is a jitter
+          // sample, and keeping jitter samples is what let an hour of sitting
+          // at home add up to "Drive · 4.6 km". The trip resumes at whichever
+          // point finally leaves the ball, which re-anchors on the branch
+          // above.
+          cur = null;
+          continue;
+        }
+      }
+      if (!cur || gap) {
         cur = []; cur._lastT = null; trips.push(cur);
+        anchor = { lat: p.lat, lng: p.lng, t };
       }
       cur.push(p);
       cur._lastT = t;
     }
     return trips;
+  }
+
+  // One definition of "a trip worth showing", used by the map, the trail pill
+  // and the History timeline — they disagreed before this existed, so the map
+  // drew jitter clusters the timeline correctly hid and the pill could report
+  // more trips than the list contained. TRIP_MIN_M / TRIP_SPAN_MIN_M /
+  // isRealTrip live with the rest of the timeline constants further down.
+  //
+  // Memoised on the trail's identity because drawMap calls this on every pan
+  // and zoom frame, and segmentTrips + tripStats is O(points).
+  let _tripsMemo = { key: null, trips: [] };
+  function tripsFrom(pts) {
+    if (!pts || !pts.length) return [];
+    // The places are part of the key, not just the points: isRealTrip's
+    // doorstep test reads them, and a trail drawn before loadPlaces returned
+    // would otherwise stay cached against an empty place list for the rest of
+    // the session. Cheap — a family has a handful of places.
+    const key = pts.length + ':' + pts[0].recorded_at + ':'
+      + pts[pts.length - 1].recorded_at + ':' + placesSignature();
+    if (_tripsMemo.key !== key) {
+      _tripsMemo = { key, trips: segmentTrips(pts).map(tripStats).filter(isRealTrip) };
+    }
+    return _tripsMemo.trips;
   }
 
   function drawArrowhead(ctx, x0, y0, x1, y1, color) {
@@ -1943,13 +2002,18 @@
   function drawTrail(ctx) {
     const pts = S.trail;
     if (!pts || pts.length < 2) return;
-    const trips = segmentTrips(pts);
+    // The same filtered list the timeline shows. Sub-threshold clusters now
+    // vanish from the map too, which is the point: a day spent at home should
+    // render as an empty map, not as a scribble the list refuses to explain.
+    const trips = tripsFrom(pts);
+    if (!trips.length) return;
     ctx.save();
     ctx.lineJoin = 'round';
     ctx.lineCap = 'round';
 
-    trips.forEach((trip, ti) => {
-      if (trip.length < 1) return;
+    trips.forEach((t, ti) => {
+      const trip = t.pts;
+      if (!trip || trip.length < 1) return;
       const color = TRAIL_COLORS[ti % TRAIL_COLORS.length];
       const px = trip.map(p => ll2px(p.lat, p.lng));
 
@@ -2157,6 +2221,18 @@
   const TRAIL_STEP_M  = 25;
   const TRAIL_MIN_MS  = 8000;
   const TRAIL_IDLE_MS = 5 * 60 * 1000;
+  // The idle clause exists to catch a genuinely slow mover, so it needs a
+  // displacement — not merely "> 0". At "> 0" a stationary PWA outside a
+  // place wrote a jitter crumb every 5 minutes, which is SHORTER than
+  // TRIP_GAP_MS (10 min), so the silence that ends a trip could never open
+  // and the day arrived at the timeline as one endless trip.
+  //
+  // _lastHistLat/_lastHistLng only advance when a breadcrumb is actually
+  // written, so this compares against the last RECORDED point — the same
+  // anchor shape the native path uses. Raising TRAIL_IDLE_MS above
+  // TRIP_GAP_MS instead would have cost a slow real walk its points.
+  // Matches LocationForegroundService.MOVING_DISP_M.
+  const TRAIL_IDLE_MIN_M = 40;
 
   let _lastMemberWriteMs = 0;   // last keep_members lat/lng push
   let _lastHistWriteMs   = 0;   // last location_history breadcrumb (web path)
@@ -2304,8 +2380,22 @@
         rows.push(['Notifications allowed', st.notifications ? 'Yes' : 'No', !!st.notifications]);
         rows.push(['Permissions kept (no auto-reset)', st.autoRevokeWhitelisted ? 'Yes' : 'No', !!st.autoRevokeWhitelisted]);
         rows.push(['Background fixes recorded', String(st.locationFireCount || 0), (st.locationFireCount || 0) > 0]);
-        rows.push(['Breadcrumbs written', String(st.breadcrumbCount || 0), (st.breadcrumbCount || 0) > 0]);
+        // A tick when points are flowing, but NEVER a cross. Zero written is
+        // the correct answer for a phone that has not left a saved place, and
+        // since 4.8.5 stopped drift escaping the radius it is the common one —
+        // this row spent a whole quiet night reporting healthy behaviour as a
+        // red failure. "Is the pipeline alive" is already answered by
+        // "Background fixes recorded" above; zero here only means anything
+        // read against the two rows below it.
+        rows.push(['Breadcrumbs written', String(st.breadcrumbCount || 0),
+          (st.breadcrumbCount || 0) > 0 ? true : null]);
         rows.push(['Suppressed (inside a place)', String(st.suppressedCount || 0), null]);
+        // Neither good nor bad on its own, so no tick or cross. The useful
+        // reading is the PAIR: this climbing while "Breadcrumbs written"
+        // stays flat is a stationary phone behaving correctly. Both climbing
+        // together on a real journey would mean the drift gate is eating
+        // trail, and the journal's "max Nm from anchor" line says which.
+        rows.push(['Imprecise fixes ignored', String(st.rejectedCount || 0), null]);
         rows.push(['Last background fix',
           st.lastLocationFireMs ? timeAgo(new Date(st.lastLocationFireMs).toISOString()) : 'never',
           st.lastLocationFireMs > 0]);
@@ -2420,7 +2510,7 @@
       const sinceHist = _lastHistWriteMs ? now - _lastHistWriteMs : Infinity;
       if (_lastHistWriteMs === 0 ||
           (histMoved != null && histMoved >= TRAIL_STEP_M && sinceHist >= TRAIL_MIN_MS) ||
-          (histMoved != null && histMoved > 0 && sinceHist >= TRAIL_IDLE_MS)) {
+          (histMoved != null && histMoved >= TRAIL_IDLE_MIN_M && sinceHist >= TRAIL_IDLE_MS)) {
         _lastHistWriteMs = now;
         _lastHistLat = lat; _lastHistLng = lng;
         writeBreadcrumb(lat, lng, whenIso, speed);
@@ -3646,6 +3736,90 @@
   // Loaded on demand when the tab opens — nothing here runs otherwise.
   const HISTORY_DAYS = 7;
   const TRIP_MIN_M = 120;        // shorter than this is GPS noise, not a trip
+  // A trip must not just have PATH, it must have RANGE. Drift is a random
+  // walk: its summed path grows with the number of samples while its distance
+  // from where it started does not, which is how an afternoon at home
+  // presented as "Drive · 4.6 km". spanM is the furthest the device ever got
+  // from the trip's first point, so a there-and-back scores its half-length.
+  //
+  // Deliberately the same number as TRIP_MIN_M, because that makes the new
+  // rule cost almost nothing: any ONE-WAY trip clearing 120 m of path has a
+  // span of at least 120 m and passes unchanged. The only new casualty is an
+  // out-and-back shorter than 240 m of path — you went less than 120 m from
+  // the door and came straight back — which is the class TRIP_MIN_M's own
+  // comment already calls GPS noise.
+  //
+  // NOT a spanM/distM ratio: ten laps of a running track score 0.03, and a
+  // ratio test would delete a real workout.
+  const TRIP_SPAN_MIN_M = 120;
+  // A leg implying more than this is one bad fix, not travel — ~324 km/h,
+  // above every road and nearly every railway. Set high on purpose: the read
+  // side cannot see accuracy, so it must only reject the unarguable.
+  const MAX_LEG_SPEED_MS = 90;
+  // Floor on a leg's elapsed time, so a one-second gap between two fixes
+  // cannot manufacture an implied speed out of ordinary jitter.
+  const MIN_LEG_DT_S = 2;
+  // A stored speed is only believed when the path around that point can
+  // support it — and the test has to be a RATIO, not a floor. Drift produces
+  // apparent motion of its own: the fuzzy fixes hop tens of metres between
+  // samples, so the breadcrumbs either side of a bad reading are not still,
+  // and an absolute threshold never fires. What gives the reading away is
+  // the disagreement — the "top 139 km/h" spike sat on a path moving at
+  // 1.4 m/s. Only a speed that is itself claiming a DRIVE is ever
+  // questioned, and then only if the path around it is more than this factor
+  // slower; generous on purpose, because a fix caught pulling away from a
+  // red light legitimately outruns the leg that spanned the wait. Rows like
+  // that are already stored, so the native speed-trust gate cannot repair
+  // them retroactively; this can.
+  const SPEED_CORROB_MULT = 4;
+
+  // How far outside a place's radius a fix may land and still count as "at"
+  // that place for the doorstep test below. Breadcrumbs are meant to be
+  // suppressed inside places; what leaks out is a fuzzy fix sitting within
+  // its own error of the edge, which is tens of metres, not hundreds.
+  const DOORSTEP_PAD_M = 120;
+
+  /** A "trip" that began and ended at the same saved place, faster than a
+   *  stop even registers, did not happen. That is the doorstep-drift
+   *  signature: points leaking out around a place and coming straight back —
+   *  the "Drive · 501 m · top 73 km/h" filed while the phone sat at home,
+   *  whose very fixes the geofence journal was flagging as drift at the same
+   *  moment ("fuzzy fix ±66m within 46m of edge — drift, dropped").
+   *
+   *  Conditional on a saved place on purpose: the identical geometry away
+   *  from any place is kept, because there we have no reason to disbelieve
+   *  it. */
+  function isDoorstepDrift(t) {
+    if (!t || !t.pts || t.pts.length < 2) return false;
+    if (t.durMs >= TRIP_GAP_MS) return false;
+    const a = t.pts[0], b = t.pts[t.pts.length - 1];
+    for (const p of (S.places || [])) {
+      const r = p.radius_m + DOORSTEP_PAD_M;
+      if (distanceM(a.lat, a.lng, p.lat, p.lng) > r) continue;
+      if (distanceM(b.lat, b.lng, p.lat, p.lng) > r) continue;
+      // Began and ended at this place — but that alone is just a round
+      // trip, which is what most errands are. Drift is a trip that never
+      // actually LEFT, so the furthest point from the place has to settle
+      // it. Without this the test threw away a real 7-minute drive to a
+      // saved place and back, while the identically-shaped 17-minute walk
+      // an hour earlier survived — the only thing separating them was
+      // TRIP_GAP_MS, which has nothing to say about whether a trip is real.
+      let far = 0;
+      for (const q of t.pts) {
+        const d = distanceM(q.lat, q.lng, p.lat, p.lng);
+        if (d > far) far = d;
+      }
+      if (far <= r) return true;
+    }
+    return false;
+  }
+
+  /** The one definition of a trip worth showing. Used by the timeline, the
+   *  map trail and the trail pill via tripsFrom(). */
+  function isRealTrip(t) {
+    return !!t && t.distM >= TRIP_MIN_M && t.spanM >= TRIP_SPAN_MIN_M
+      && !isDoorstepDrift(t);
+  }
   // Trip classing from GPS speed (per-fix when the breadcrumbs carry
   // it, trip distance/time otherwise). Three bands: walk, ride, drive.
   // "Ride" covers bikes AND runners — speed alone can't split those.
@@ -3806,15 +3980,42 @@
   // Distance / duration / speed stats for one breadcrumb trip.
   function tripStats(trip) {
     if (!trip || trip.length < 2) return null;
-    let distM = 0, maxSp = 0, spSum = 0, spN = 0;
+    // Leg speeds first: they are both the teleport test and the corroboration
+    // for the stored speed column.
+    const legM = new Array(trip.length).fill(0);
+    const legMs = new Array(trip.length).fill(0);
+    const legOk = new Array(trip.length).fill(true);
+    let distM = 0, spanM = 0;
     for (let i = 1; i < trip.length; i++) {
-      distM += distanceM(trip[i - 1].lat, trip[i - 1].lng, trip[i].lat, trip[i].lng);
+      legM[i] = distanceM(trip[i - 1].lat, trip[i - 1].lng, trip[i].lat, trip[i].lng);
+      const dt = Math.max(MIN_LEG_DT_S,
+        (new Date(trip[i].recorded_at).getTime()
+          - new Date(trip[i - 1].recorded_at).getTime()) / 1000);
+      legMs[i] = legM[i] / dt;
+      // A leg nothing on the ground could have travelled is one bad fix, not
+      // five kilometres of driving. It contributes neither distance nor a
+      // top speed.
+      if (legMs[i] > MAX_LEG_SPEED_MS) { legOk[i] = false; continue; }
+      distM += legM[i];
     }
-    for (const p of trip) {
-      if (typeof p.speed === 'number' && p.speed >= 0) {
-        maxSp = Math.max(maxSp, p.speed);
-        spSum += p.speed; spN++;
-      }
+    for (let i = 0; i < trip.length; i++) {
+      spanM = Math.max(spanM, distanceM(trip[0].lat, trip[0].lng, trip[i].lat, trip[i].lng));
+    }
+    let maxSp = 0, spSum = 0, spN = 0;
+    for (let i = 0; i < trip.length; i++) {
+      const sp = trip[i].speed;
+      if (typeof sp !== 'number' || sp < 0 || sp > MAX_LEG_SPEED_MS) continue;
+      // The path around the point has to corroborate the reading. max() of
+      // the two adjacent legs, not min(): the first fix after pulling away
+      // from a stop has a backward leg spanning the whole stop, which reads
+      // slow — its forward leg is the honest one. Only a point with BOTH
+      // neighbours stationary is distrusted.
+      const back = (i >= 1 && legOk[i]) ? legMs[i] : 0;
+      const fwd = (i + 1 < trip.length && legOk[i + 1]) ? legMs[i + 1] : 0;
+      const around = Math.max(back, fwd);
+      if (sp > Math.max(DRIVE_MAX_MS, around * SPEED_CORROB_MULT)) continue;
+      maxSp = Math.max(maxSp, sp);
+      spSum += sp; spN++;
     }
     const startMs = new Date(trip[0].recorded_at).getTime();
     const endMs = new Date(trip[trip.length - 1].recorded_at).getTime();
@@ -3824,7 +4025,7 @@
                : (avgSp >= RIDE_AVG_MS) ? 'ride'
                : 'walk';
     return {
-      kind: 'trip', startMs, endMs, durMs, distM, maxSp, mode,
+      kind: 'trip', startMs, endMs, durMs, distM, spanM, maxSp, mode,
       pts: trip
     };
   }
@@ -3834,8 +4035,7 @@
   function buildTimeline(points, checkins, priorCheckin, dayStartMs, dayEndMs) {
     const entries = [];
 
-    S.tlTrips = segmentTrips(points).map(tripStats)
-      .filter(t => t && t.distM >= TRIP_MIN_M);
+    S.tlTrips = tripsFrom(points).slice();
     S.tlTrips.forEach((t, i) => { t.idx = i; entries.push(t); });
 
     // Reconstruct stays. `open` is the stay we're currently inside of;
@@ -4006,10 +4206,15 @@
     const who = m ? (m.id === S.myId ? 'Your' : m.name + "’s") : 'Member';
     const lbl = $('trail-pill-lbl');
     if (lbl) {
+      const trips = S.trail.length ? tripsFrom(S.trail).length : 0;
       if (!S.trail.length) {
         lbl.textContent = '🧭 ' + who + ' trail · no points yet';
+      } else if (!trips) {
+        // Points, but nothing that went anywhere. Says so plainly rather
+        // than reading as a failure to load — a stationary day is a real
+        // and correct answer.
+        lbl.textContent = '🧭 ' + who + ' trail · no trips · ' + (S.trailLabel || '24h');
       } else {
-        const trips = segmentTrips(S.trail).length;
         lbl.textContent = '🧭 ' + who + ' trail · ' +
           trips + (trips === 1 ? ' trip' : ' trips') + ' · ' + (S.trailLabel || '24h');
       }

@@ -77,15 +77,19 @@ public class LocationForegroundService extends Service {
     // fix (catches movement when speed is absent). We stay dense until
     // STILL_AFTER of no movement, then relax — so red lights don't flap, but
     // a genuinely parked phone drops to low power.
-    private static final float MOVING_SPEED_MS = 0.6f;   // ~2 km/h (slow walk)
-    private static final float MOVING_DISP_M = 40f;      // between fixes (above GPS jitter)
+    // MOVING_SPEED_MS, MOVING_DISP_M, MOVING_ACC_MULT and SPEED_TRUST_ACC_M
+    // are package-private because LocationUpdateReceiver gates breadcrumb
+    // WRITES on the same numbers. They were tuned here, against real journeys,
+    // and a second copy over there would drift from them silently.
+    static final float MOVING_SPEED_MS = 0.6f;   // ~2 km/h (slow walk)
+    static final float MOVING_DISP_M = 40f;      // between fixes (above GPS jitter)
     // A displacement only counts as movement if it also clears this fix's
     // own error radius (× the multiplier). Without this, a stationary phone
     // on the low-power profile (network fixes, ±tens of metres) drifts >40 m
     // between samples, reads as "moving", kicks into dense GPS, then settles
     // — flip-flopping every few minutes and draining battery overnight.
-    private static final float MOVING_ACC_MULT = 1.5f;
-    private static final float SPEED_TRUST_ACC_M = 50f;  // ignore speed from fuzzier fixes
+    static final float MOVING_ACC_MULT = 1.5f;
+    static final float SPEED_TRUST_ACC_M = 50f;  // ignore speed from fuzzier fixes
     private static final long STILL_AFTER_MS = 3 * 60_000;
     private static final long REARM_MS = 5 * 60_000;     // periodic self-heal
     private volatile long lastMovingMs = 0;
@@ -184,6 +188,13 @@ public class LocationForegroundService extends Service {
     // in the journals. Reported on the start line and on every gap line,
     // because "armed" told us nothing about whether we were promoted.
     private volatile boolean promoted = false;
+    /** When startForeground() last succeeded, so the restore check below can
+     *  ignore the window where the OS has not yet listed our notification. */
+    private volatile long promotedAtMs = 0;
+    /** How long to leave getActiveNotifications() alone after posting. Long
+     *  enough for the shade to settle, far shorter than the 5-minute re-arm
+     *  that provides the backstop. */
+    private static final long PROMOTE_SETTLE_MS = 30_000;
     static final String EXTRA_WHY = "why";
 
     private final Handler handler = new Handler(Looper.getMainLooper());
@@ -249,15 +260,14 @@ public class LocationForegroundService extends Service {
             fused.getCurrentLocation(Priority.PRIORITY_HIGH_ACCURACY, null)
                     .addOnSuccessListener(loc -> {
                         if (loc == null) return;
-                        final Location l = loc;
-                        new Thread(() -> {
-                            try {
-                                LocationUpdateReceiver.processLocations(
-                                        getApplicationContext(), Collections.singletonList(l));
-                            } catch (Exception e) {
-                                Log.w(TAG, "doze-exit fix process failed", e);
-                            }
-                        }, "RoamkeepDozeExitWorker").start();
+                        // Through the shared serial worker, NOT a thread of
+                        // its own: this fix has to be folded into the same
+                        // anchor and stillness average as every other one, in
+                        // order. A doze exit landing beside a callback
+                        // delivery was one of the ways two batches used to
+                        // read the same state and clobber each other.
+                        LocationUpdateReceiver.submit(getApplicationContext(),
+                                Collections.singletonList(loc), null);
                     })
                     .addOnFailureListener(e -> Log.w(TAG, "doze-exit getCurrentLocation failed", e));
         } catch (SecurityException e) {
@@ -349,11 +359,10 @@ public class LocationForegroundService extends Service {
                     new PrefsStore(LocationForegroundService.this)
                             .journal(dense ? "auto: moving — dense profile" : "auto: still — low-power profile");
                 }
-                // Off the main thread — processLocations does blocking HTTP.
-                new Thread(() -> {
-                    try { LocationUpdateReceiver.processLocations(getApplicationContext(), locs); }
-                    catch (Exception e) { Log.w(TAG, "location process failed", e); }
-                }, "RoamkeepLocationWorker").start();
+                // Off the main thread — processLocations does blocking HTTP —
+                // and onto the ONE worker that runs batches in order, because
+                // the drift anchor and stillness average are sequential state.
+                LocationUpdateReceiver.submit(getApplicationContext(), locs, null);
             }
         };
     }
@@ -400,6 +409,7 @@ public class LocationForegroundService extends Service {
                 startForeground(NOTIF_ID, n);
             }
             promoted = true;
+            promotedAtMs = System.currentTimeMillis();
         } catch (Exception e) {
             // ForegroundServiceStartNotAllowedException is the one to expect
             // here. Name it in the journal — logcat is gone by the time
@@ -515,6 +525,15 @@ public class LocationForegroundService extends Service {
      */
     private void restoreNotificationIfDismissed() {
         if (!promoted) return;
+        // Just posted it? Then an absence from getActiveNotifications() means
+        // the OS has not caught up, not that anybody swiped. After a reboot
+        // the first fix lands within seconds of startForeground() and this
+        // read came back empty, so the journal reported a dismissal that
+        // never happened — a line claiming something untrue, in a journal
+        // whose only value is being believed. Nobody can swipe a
+        // notification they have not seen yet; if they do, the next fix or
+        // the 5-minute re-arm catches it.
+        if (System.currentTimeMillis() - promotedAtMs < PROMOTE_SETTLE_MS) return;
         // Notifications switched off for the app entirely: there is no
         // notification to restore and notify() would throw on every fix.
         // Nothing to do here — the setup sheet is what asks for this

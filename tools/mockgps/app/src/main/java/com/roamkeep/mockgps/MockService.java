@@ -65,6 +65,27 @@ public class MockService extends Service {
     public static final String EXTRA_LOOP = "loop";
     public static final String EXTRA_HOLD_LAT = "holdLat";
     public static final String EXTRA_HOLD_LNG = "holdLng";
+    /**
+     * Horizontal accuracy to stamp on every injected fix, metres.
+     *
+     * Until this existed every mock fix was ±5 m, so a mock run took the
+     * "precise" branch of every gate Roamkeep has and exercised none of
+     * them — the drift defences in LocationUpdateReceiver, the geofence
+     * anti-drift gate, the speed-trust rule. All of them only ever distrust
+     * an IMPRECISE fix, which the harness could not produce.
+     */
+    public static final String EXTRA_ACC = "accM";
+    /**
+     * Random offset applied to each injected point while HOLDING, metres.
+     *
+     * Accuracy alone does not reproduce the bug. A held position with
+     * accM=66 still injects the identical coordinate every tick, so nothing
+     * downstream ever sees displacement. The failure being reproduced is a
+     * STATIONARY device emitting fuzzy, WANDERING fixes — which is what a
+     * real phone does when the GNSS is cold and the position comes from
+     * wifi or cell. Jitter is what makes the harness able to fail.
+     */
+    public static final String EXTRA_JITTER = "jitterM";
 
     private static final String CHANNEL_ID = "mockgps";
     private static final int NOTIF_ID = 1;
@@ -107,6 +128,12 @@ public class MockService extends Service {
     private boolean holding;
     private double holdLat, holdLng;
     private double lastLat, lastLng;
+    /** Accuracy stamped on injected fixes, and the wander applied while
+     *  holding. Both default to the old fixed behaviour (±5 m, no jitter),
+     *  so every existing recipe behaves exactly as it did. */
+    private volatile float accuracyM = 5f;
+    private volatile float jitterM = 0f;
+    private final java.util.Random jitterRnd = new java.util.Random();
     private long lastCheckMs, lastNotifyMs;
     /** Appended to `status` when the OS is not holding our injected fix. */
     private volatile String warning = "";
@@ -125,6 +152,11 @@ public class MockService extends Service {
         // loop running — two loops would race to set the same provider and
         // the position would jitter between hold point and route.
         handler.removeCallbacks(tick);
+
+        // Fix quality. Applies to hold and route alike; clamped so a typo
+        // cannot inject a negative error radius, which Location rejects.
+        accuracyM = Math.max(1f, intent.getFloatExtra(EXTRA_ACC, 5f));
+        jitterM = Math.max(0f, intent.getFloatExtra(EXTRA_JITTER, 0f));
 
         if (ACTION_HOLD.equals(intent.getAction())) {
             holdLat = intent.getDoubleExtra(EXTRA_HOLD_LAT, Double.NaN);
@@ -236,9 +268,29 @@ public class MockService extends Service {
                 // provider's last fix goes stale, and Roamkeep's foreground
                 // service asks for a fresh one every couple of seconds —
                 // one shot would let the real GPS answer the next request.
-                injectPoint(holdLat, holdLng, 0, 0);
+                double jLat = holdLat, jLng = holdLng;
+                float jSpeed = 0;
+                if (jitterM > 0) {
+                    double ang = jitterRnd.nextDouble() * Math.PI * 2;
+                    double r = jitterM * Math.sqrt(jitterRnd.nextDouble());
+                    jLat = holdLat + (r * Math.sin(ang)) / 111320.0;
+                    jLng = holdLng + (r * Math.cos(ang))
+                            / (111320.0 * Math.cos(Math.toRadians(holdLat)));
+                    // Derive the speed from the wander instead of reporting
+                    // zero. This is not embellishment — it is what FLP
+                    // itself does, differentiating consecutive noisy
+                    // positions, and it is where "top 139 km/h" on a
+                    // stationary phone came from. Reporting 0 here would
+                    // reproduce the drift but not the symptom.
+                    float[] d = new float[1];
+                    Location.distanceBetween(lastLat, lastLng, jLat, jLng, d);
+                    if (lastLat != 0 || lastLng != 0) jSpeed = d[0] / (TICK_MS / 1000f);
+                }
+                injectPoint(jLat, jLng, 0, jSpeed);
                 selfCheck(holdLat, holdLng);
-                status = String.format("Holding %.5f, %.5f", holdLat, holdLng) + warning;
+                status = String.format("Holding %.5f, %.5f", holdLat, holdLng)
+                        + (jitterM > 0 ? String.format(" ±%.0fm acc, %.0fm jitter", accuracyM, jitterM) : "")
+                        + warning;
                 notifyAgain();
                 handler.postDelayed(this, TICK_MS);
                 return;
@@ -354,7 +406,7 @@ public class MockService extends Service {
         // parked device as travelling.
         l.setSpeed(speed);
         l.setAltitude(30);
-        l.setAccuracy(5f);
+        l.setAccuracy(accuracyM);
         l.setTime(System.currentTimeMillis());
         l.setElapsedRealtimeNanos(SystemClock.elapsedRealtimeNanos());
         if (Build.VERSION.SDK_INT >= 26) {

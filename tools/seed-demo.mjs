@@ -322,24 +322,46 @@ function buildPlan() {
   return { breadcrumbs, checkins, pin };
 }
 
-/** app.js tripStats/segmentTrips, close enough to check what will render. */
+/**
+ * app.js tripStats/segmentTrips, close enough to check what will render.
+ *
+ * "Close enough" has to include the EMISSION filter, or the dry run asserts
+ * something the app does not do. It used to skip even TRIP_MIN_M; now that
+ * app.js also requires a trip to have gone somewhere (spanM) and splits on a
+ * stationary stretch as well as a silence, this mirrors both. If it drifts
+ * from app.js again, the dry run goes back to quietly blessing seeds the
+ * timeline will refuse to show.
+ */
+const TRIP_MIN_M = 120;
+const TRIP_SPAN_MIN_M = 120;
+const STILL_RADIUS_M = 120;
+const STILL_WINDOW_MS = 15 * 60 * 1000;
 function classify(rows) {
   const trips = [];
-  let cur = null, lastT = null;
+  let cur = null, lastT = null, anchor = null;
   for (const p of rows) {
     const t = p.at.getTime();
-    if (!cur || t - lastT > TRIP_GAP_MS) { cur = []; trips.push(cur); }
+    const gap = !!(cur && lastT != null && t - lastT > TRIP_GAP_MS);
+    if (!gap && anchor) {
+      if (distanceM(anchor.lat, anchor.lng, p.lat, p.lng) > STILL_RADIUS_M) {
+        anchor = { lat: p.lat, lng: p.lng, t };
+      } else if (t - anchor.t > STILL_WINDOW_MS) {
+        cur = null; continue;
+      }
+    }
+    if (!cur || gap) { cur = []; trips.push(cur); anchor = { lat: p.lat, lng: p.lng, t }; }
     cur.push(p); lastT = t;
   }
   return trips.filter((t) => t.length >= 2).map((t) => {
-    let distM = 0, maxSp = 0, sum = 0;
+    let distM = 0, spanM = 0, maxSp = 0, sum = 0;
     for (let i = 1; i < t.length; i++) distM += distanceM(t[i - 1].lat, t[i - 1].lng, t[i].lat, t[i].lng);
+    for (const p of t) spanM = Math.max(spanM, distanceM(t[0].lat, t[0].lng, p.lat, p.lng));
     for (const p of t) { maxSp = Math.max(maxSp, p.speed); sum += p.speed; }
     const avgSp = sum / t.length;
     const mode = (avgSp >= DRIVE_AVG_MS || maxSp >= DRIVE_MAX_MS) ? 'drive'
                : (avgSp >= RIDE_AVG_MS) ? 'ride' : 'walk';
-    return { mode, distM, avgSp, n: t.length, start: t[0].at };
-  });
+    return { mode, distM, spanM, avgSp, n: t.length, start: t[0].at };
+  }).filter((t) => t.distM >= TRIP_MIN_M && t.spanM >= TRIP_SPAN_MIN_M);
 }
 
 // ── SQL helpers ───────────────────────────────────────────────

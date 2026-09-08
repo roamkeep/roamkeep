@@ -37,7 +37,7 @@ public class MainActivity extends Activity {
     private static final int REQ_NOTIF = 2;
 
     private TextView status, routeInfo;
-    private EditText speed, holdLat, holdLng;
+    private EditText speed, holdLat, holdLng, accuracy, jitter;
     private CheckBox loop;
     private Button start;
 
@@ -65,6 +65,8 @@ public class MainActivity extends Activity {
         speed = findViewById(R.id.speed);
         holdLat = findViewById(R.id.holdLat);
         holdLng = findViewById(R.id.holdLng);
+        accuracy = findViewById(R.id.accuracy);
+        jitter = findViewById(R.id.jitter);
         loop = findViewById(R.id.loop);
         start = findViewById(R.id.start);
 
@@ -169,8 +171,26 @@ public class MainActivity extends Activity {
                 .setAction(MockService.ACTION_HOLD)
                 .putExtra(MockService.EXTRA_HOLD_LAT, la)
                 .putExtra(MockService.EXTRA_HOLD_LNG, lo);
+        applyFixQuality(i);
         if (Build.VERSION.SDK_INT >= 26) startForegroundService(i); else startService(i);
         status.setText("Holding…");
+    }
+
+    /** Accuracy + jitter, on both hold and playback. A blank or unparseable
+     *  box means "leave it as it was" — the defaults in MockService are the
+     *  pre-existing behaviour, so a fumbled entry can never silently change
+     *  what a normal recording injects. */
+    private void applyFixQuality(Intent i) {
+        i.putExtra(MockService.EXTRA_ACC, parseFloatOr(accuracy, 5f));
+        i.putExtra(MockService.EXTRA_JITTER, parseFloatOr(jitter, 0f));
+    }
+
+    private static float parseFloatOr(EditText f, float dflt) {
+        try {
+            return Float.parseFloat(f.getText().toString().trim());
+        } catch (Exception e) {
+            return dflt;
+        }
     }
 
     private void startPlayback() {
@@ -192,6 +212,7 @@ public class MainActivity extends Activity {
                 .putExtra(MockService.EXTRA_LNG, lng)
                 .putExtra(MockService.EXTRA_KMH, kmh)
                 .putExtra(MockService.EXTRA_LOOP, loop.isChecked());
+        applyFixQuality(i);
         if (Build.VERSION.SDK_INT >= 26) startForegroundService(i); else startService(i);
         status.setText("Starting…");
     }

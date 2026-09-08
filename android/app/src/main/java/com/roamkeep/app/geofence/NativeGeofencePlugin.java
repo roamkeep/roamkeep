@@ -283,6 +283,7 @@ public class NativeGeofencePlugin extends Plugin {
         res.put("locationFireCount", prefs.getLocationFireCount());
         res.put("breadcrumbCount", prefs.getBreadcrumbCount());
         res.put("suppressedCount", prefs.getSuppressedCount());
+        res.put("rejectedCount", prefs.getRejectedCount());
         call.resolve(res);
     }
 

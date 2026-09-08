@@ -43,7 +43,10 @@ public class GeofenceReceiver extends BroadcastReceiver {
     // at a boundary, so a genuine crossing (moving between two nearby zones,
     // ±4 m) is never dropped. Stationary drift shows up as much fuzzier
     // network/low-power fixes (±tens of m), which this leaves gated. Tunable.
-    private static final float DRIFT_MIN_ACC_M = 20f;
+    // Package-private so LocationUpdateReceiver can gate breadcrumbs on the
+    // same definition of "precise". Two subsystems disagreeing about what
+    // counts as a real fix is how this bug happened in the first place.
+    static final float DRIFT_MIN_ACC_M = 20f;
 
     @Override
     public void onReceive(Context context, Intent intent) {

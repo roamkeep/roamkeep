@@ -72,6 +72,40 @@
                 android:hint="longitude" />
         </LinearLayout>
 
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="Fix quality. Accuracy is the error radius stamped on every injected fix; jitter wanders the held position by up to that many metres each tick. Leave both alone (5 / 0) for a normal run — raise them to reproduce a stationary phone with a cold GPS, which is the only way to exercise Roamkeep's drift gates."
+            android:textSize="12sp"
+            android:paddingTop="8dp"
+            android:paddingBottom="4dp" />
+
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="horizontal">
+
+            <EditText
+                android:id="@+id/accuracy"
+                android:layout_width="0dp"
+                android:layout_weight="1"
+                android:layout_height="wrap_content"
+                android:inputType="numberDecimal"
+                android:importantForAutofill="no"
+                android:text="5"
+                android:hint="accuracy m" />
+
+            <EditText
+                android:id="@+id/jitter"
+                android:layout_width="0dp"
+                android:layout_weight="1"
+                android:layout_height="wrap_content"
+                android:inputType="numberDecimal"
+                android:importantForAutofill="no"
+                android:text="0"
+                android:hint="jitter m" />
+        </LinearLayout>
+
         <Button
             android:id="@+id/useRouteStart"
             android:layout_width="match_parent"

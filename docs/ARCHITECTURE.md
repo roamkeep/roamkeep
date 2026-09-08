@@ -222,6 +222,33 @@ over minutes. **Never let a failed read overwrite good state** — check
 `error`, leave the last known value alone, and say so if there is nothing
 to show.
 
+### The sibling bug: one rule, enforced on only one of the paths that need it
+
+A close cousin, found in 4.8.5. Three separate rules about **fix quality**
+existed and were correct — `GeofenceReceiver.DRIFT_MIN_ACC_M` (don't act on
+an imprecise fix near a boundary), `detectMoving`'s `SPEED_TRUST_ACC_M`
+(don't believe a fuzzy fix's speed) and its `max(MOVING_DISP_M, acc × mult)`
+(a jump inside the error radius is not travel). Every one lived only where it
+was first needed. `LocationUpdateReceiver`, which decides what gets **stored
+forever**, applied none of them and never called `getAccuracy()` at all.
+
+The journal caught the two paths reaching opposite verdicts about one fix,
+one second apart — `geo: arrived Home fuzzy fix ±66m within 46m of edge —
+drift, dropped`, while that same fix was written as a breadcrumb and became
+`Drive · 501 m · top 73 km/h` on a phone parked at home.
+
+**The rule:** a judgement about whether a fix is *trustworthy* belongs to the
+fix, not to the feature that first needed it. When you add one, apply it at
+every consumer, and share the constant rather than copying the number — which
+is why `DRIFT_MIN_ACC_M`, `MOVING_DISP_M`, `MOVING_ACC_MULT` and
+`SPEED_TRUST_ACC_M` are package-private rather than private.
+
+The tell is the same as ever: it produced no error and no wrong-looking
+screen. The diagnostics counters even looked healthy, because
+`written + suppressed` summed exactly to the fire count — the sum was perfect
+only because nothing was ever rejected. There is now a fourth counter, so
+that identity means something.
+
 ## Build & release pipeline
 
 ```powershell
@@ -479,7 +506,26 @@ context and geofences, then reloads to the Connect screen.
   `LocationUpdateReceiver` — a `FusedLocationProvider` PendingIntent
   target that records points even while the WebView is suspended, so a
   whole walk is captured. The OS distance-gates via
-  `setMinUpdateDistanceMeters`. On the **PWA** the JS path writes it
+  `setMinUpdateDistanceMeters`, but **that gate alone was never enough** —
+  every `applyProfile()` re-arm re-registers the request and resets its
+  reference point, and the doze-exit one-shot pushes a `getCurrentLocation`
+  straight into `processLocations` past the filter entirely, so a
+  doze-cycling phone wrote a cold fuzzy fix every few minutes while sitting
+  still. `processLocations` therefore gates writes itself. **Two gates
+  answering two different questions, and confusing them is what made the
+  first attempt at this fall short.** "Has the device MOVED?" cannot be
+  answered from one fix — a single sample clears any threshold a fixed
+  fraction of the time however good the reference, so a per-fix test does not
+  stop a still phone writing, it only filters the writes down to the
+  *biggest* jumps, which the timeline then sums into an even longer phantom.
+  It takes an **average** (`CENTROID_TAU_MS`, whose noise falls as √N), and
+  while that says still, nothing is written at all. "How far apart should
+  recorded points be?" is the per-fix question, and that is the anchor gate.
+  Alongside them: an accuracy ceiling, `SPEED_TRUST_ACC_M` on the `speed`
+  column, and accuracy-padded place suppression. Every one distrusts only
+  *imprecise* fixes, a trusted speed reading alone counts as moving, and an
+  unknown state is assumed to be moving — so a good fix is never dropped and
+  no trip start is lost. On the **PWA** the JS path writes it
   (distance-gated in `pushLocation`). The trail extends live via a
   `location_history` realtime subscription (one source for both paths).
   Tap a member to load+draw their trail (last 24h). Tracking modes
@@ -494,6 +540,14 @@ context and geofences, then reloads to the Connect screen.
   (`segmentTrips` over that day's breadcrumbs, classified walk/drive
   from GPS speed with a distance/time fallback). Queries run on demand
   when the tab opens; tapping a trip draws it via the trail machinery.
+  `segmentTrips` ends a trip on a **stationary stretch** as well as a
+  silence — the silence never opens on a phone that doze-cycles, because
+  each wake pushes a fresh fix. `isRealTrip` is the one definition of a
+  trip worth showing, used by the timeline, the map and the trail pill
+  alike (they disagreed before it existed): far enough (`TRIP_MIN_M`),
+  *gone* far enough (`TRIP_SPAN_MIN_M` — drift's summed path grows while
+  its distance from the start does not), and not a loop that began and
+  ended at one saved place inside ten minutes.
 - **Per-place notifications (v13).** `keep_notify_prefs` holds *exception
   rows only* — a row means "don't tell me about this person at this
   place", no row means notify — so an empty table is exactly pre-v13
