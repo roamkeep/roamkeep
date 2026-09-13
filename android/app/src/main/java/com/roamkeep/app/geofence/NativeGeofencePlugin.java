@@ -284,6 +284,13 @@ public class NativeGeofencePlugin extends Plugin {
         res.put("breadcrumbCount", prefs.getBreadcrumbCount());
         res.put("suppressedCount", prefs.getSuppressedCount());
         res.put("rejectedCount", prefs.getRejectedCount());
+        // Split by reason. The total above says a gate fired; these say
+        // WHICH, which is the question a single number could never answer
+        // and the reason the gates have been so hard to judge from a phone.
+        res.put("rejStillCount", prefs.getRejStillCount());
+        res.put("rejDriftCount", prefs.getRejDriftCount());
+        res.put("rejUnusableCount", prefs.getRejUnusableCount());
+        res.put("dbSchemaVersion", prefs.getSchemaVersion());
         call.resolve(res);
     }
 
@@ -373,6 +380,17 @@ public class NativeGeofencePlugin extends Plugin {
         PrefsStore prefs = new PrefsStore(getContext());
         prefs.setContext(supabaseUrl, anonKey, userId, keepId, memberId, memberName, memberAvatar);
         prefs.setTokens(accessToken, refreshToken);
+
+        // Mirror the database's schema version so the headless write path
+        // can tell whether an optional column exists before it writes one.
+        // JS leaves this absent when the version could NOT be read (offline,
+        // project asleep), and setSchemaVersion ignores a non-positive value
+        // for that reason: a failed read must never overwrite good state.
+        // Nullable read on purpose: JS sends null, not a missing key, when
+        // the version could not be determined, so a defaulted unbox would
+        // throw on the exact case this is written to tolerate.
+        Integer dbSchema = call.getInt("schemaVersion");
+        prefs.setSchemaVersion(dbSchema == null ? 0 : dbSchema);
 
         // Seed the receiver's "currently inside" set from what JS
         // knows. Merge rather than overwrite so any unmatched ENTERs

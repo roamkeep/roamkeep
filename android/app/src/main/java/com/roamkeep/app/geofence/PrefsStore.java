@@ -75,12 +75,43 @@ public class PrefsStore {
     // count, because nothing was ever rejected — which read as healthy and
     // was in fact the bug.
     private static final String K_REJECTED_COUNT   = "rejected_count";
+    // The same rejections split by REASON, because the combined number
+    // above says that a gate fired without saying which one. "Still" and
+    // "drift" answer different questions and a fix for one is the wrong
+    // fix for the other, so a single total cannot tell anybody whether the
+    // gates are working — which was the complaint that produced these.
+    private static final String K_REJ_STILL        = "rej_still_count";
+    private static final String K_REJ_DRIFT        = "rej_drift_count";
+    private static final String K_REJ_UNUSABLE     = "rej_unusable_count";
     // Rate-limit stamp for the rejection journal summary. PERSISTED, not a
     // static: this path runs in short-lived processes, and an in-memory
     // stamp would emit a line on the first rejection after every process
     // death — every few minutes on a doze-cycling device, which is exactly
     // the journal noise that makes a journal useless.
     private static final String K_LAST_REJ_JOURNAL = "last_rej_journal";
+    // The accumulating window BEHIND that stamp, persisted for the same
+    // reason the stamp is. These were static fields, so they reset to zero
+    // on every process death while the stamp survived — which meant the
+    // half-hourly line reported only the rejections since the last time
+    // the process happened to be rebuilt. A line reading "4 fixes dropped
+    // in 27m" was therefore a floor and not a count, and reading it as a
+    // count once led this investigation down the wrong path entirely.
+    private static final String K_PEND_STILL     = "rej_pend_still";
+    private static final String K_PEND_DRIFT     = "rej_pend_drift";
+    private static final String K_PEND_UNUSABLE  = "rej_pend_unusable";
+    private static final String K_PEND_WORST_ACC = "rej_pend_worst_acc";
+    private static final String K_PEND_WORST_DST = "rej_pend_worst_dist";
+    private static final String K_PEND_SINCE     = "rej_pend_since";
+
+    // What the family's database reported for roamkeep_schema_version(),
+    // mirrored here by the plugin on every app launch so the headless
+    // write path can tell whether a column exists before writing to it.
+    //
+    // Zero means "not known yet", and every gate that reads this must
+    // treat unknown as "the column is absent" — the cost of that is
+    // missing diagnostic data, while the cost of guessing the other way
+    // is a rejected INSERT and a silently lost breadcrumb trail.
+    private static final String K_SCHEMA_VERSION = "db_schema_version";
 
     // ── Breadcrumb drift anchor ────────────────────────────────────
     //
@@ -277,13 +308,18 @@ public class PrefsStore {
      *  {@code written + suppressed + rejected} summing to the fixes seen is
      *  a real check rather than an accident of nothing ever being dropped. */
     public synchronized void recordLocationFire(long whenMs, int crumbsWritten,
-                                                int suppressed, int rejected) {
+                                                int suppressed, int rejStill,
+                                                int rejDrift, int rejUnusable) {
+        final int rejected = rejStill + rejDrift + rejUnusable;
         sp.edit()
                 .putLong(K_LAST_LOC_FIRE, whenMs)
                 .putInt(K_LOC_FIRE_COUNT, sp.getInt(K_LOC_FIRE_COUNT, 0) + 1)
                 .putInt(K_CRUMB_COUNT, sp.getInt(K_CRUMB_COUNT, 0) + crumbsWritten)
                 .putInt(K_SUPPRESSED_COUNT, sp.getInt(K_SUPPRESSED_COUNT, 0) + suppressed)
                 .putInt(K_REJECTED_COUNT, sp.getInt(K_REJECTED_COUNT, 0) + rejected)
+                .putInt(K_REJ_STILL, sp.getInt(K_REJ_STILL, 0) + rejStill)
+                .putInt(K_REJ_DRIFT, sp.getInt(K_REJ_DRIFT, 0) + rejDrift)
+                .putInt(K_REJ_UNUSABLE, sp.getInt(K_REJ_UNUSABLE, 0) + rejUnusable)
                 .apply();
     }
     public long getLastLocationFire() { return sp.getLong(K_LAST_LOC_FIRE, 0); }
@@ -291,9 +327,67 @@ public class PrefsStore {
     public int getBreadcrumbCount()   { return sp.getInt(K_CRUMB_COUNT, 0); }
     public int getSuppressedCount()   { return sp.getInt(K_SUPPRESSED_COUNT, 0); }
     public int getRejectedCount()     { return sp.getInt(K_REJECTED_COUNT, 0); }
+    public int getRejStillCount()     { return sp.getInt(K_REJ_STILL, 0); }
+    public int getRejDriftCount()     { return sp.getInt(K_REJ_DRIFT, 0); }
+    public int getRejUnusableCount()  { return sp.getInt(K_REJ_UNUSABLE, 0); }
 
     public long getLastRejectJournal()          { return sp.getLong(K_LAST_REJ_JOURNAL, 0); }
     public void setLastRejectJournal(long ms)   { sp.edit().putLong(K_LAST_REJ_JOURNAL, ms).apply(); }
+
+    /** The schema version the database last reported, or 0 if never read.
+     *  See K_SCHEMA_VERSION: 0 must be treated as "the column is absent". */
+    public int getSchemaVersion() { return sp.getInt(K_SCHEMA_VERSION, 0); }
+
+    /** Mirror the version JS read from the database.
+     *
+     *  Ignores a non-positive value rather than storing it. The JS side
+     *  leaves its own copy null when the read FAILED — offline, project
+     *  asleep, a tunnel — and a failed read must never overwrite good
+     *  state, which is the rule the members-list bug wrote down the hard
+     *  way. Keeping the last known number costs nothing: it is only ever
+     *  used to decide whether to include one optional field. */
+    public void setSchemaVersion(int v) {
+        if (v > 0) sp.edit().putInt(K_SCHEMA_VERSION, v).apply();
+    }
+
+    /** Force the mirrored version DOWN, when the database has proven it
+     *  does not have what that version promises. Separate from the setter
+     *  above precisely because it must bypass the "never go backwards"
+     *  guard: here the evidence is a rejected write, not a stale read. */
+    public void demoteSchemaVersion(int v) {
+        sp.edit().putInt(K_SCHEMA_VERSION, v).apply();
+    }
+
+    /** The pending rejection window behind the half-hourly journal line.
+     *  Read, added to, and written back by LocationUpdateReceiver, which
+     *  runs every one of those calls on a single serial worker thread. */
+    public static final class RejectWindow {
+        public int still, drift, unusable;
+        public float worstAcc, worstDist;
+        public long sinceMs;
+    }
+
+    public synchronized RejectWindow getRejectWindow() {
+        RejectWindow w = new RejectWindow();
+        w.still     = sp.getInt(K_PEND_STILL, 0);
+        w.drift     = sp.getInt(K_PEND_DRIFT, 0);
+        w.unusable  = sp.getInt(K_PEND_UNUSABLE, 0);
+        w.worstAcc  = sp.getFloat(K_PEND_WORST_ACC, 0f);
+        w.worstDist = sp.getFloat(K_PEND_WORST_DST, 0f);
+        w.sinceMs   = sp.getLong(K_PEND_SINCE, 0);
+        return w;
+    }
+
+    public synchronized void setRejectWindow(RejectWindow w) {
+        sp.edit()
+                .putInt(K_PEND_STILL, w.still)
+                .putInt(K_PEND_DRIFT, w.drift)
+                .putInt(K_PEND_UNUSABLE, w.unusable)
+                .putFloat(K_PEND_WORST_ACC, w.worstAcc)
+                .putFloat(K_PEND_WORST_DST, w.worstDist)
+                .putLong(K_PEND_SINCE, w.sinceMs)
+                .apply();
+    }
 
     /** The last position accepted as real. Null until one has been recorded
      *  (fresh install, or after a sign-out clears everything). */

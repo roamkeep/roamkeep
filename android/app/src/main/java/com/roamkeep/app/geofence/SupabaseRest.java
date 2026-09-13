@@ -90,9 +90,20 @@ public class SupabaseRest {
      * carry no client-supplied id, so there's no duplicate-key case to
      * special-case — just success or failure.
      */
-    public boolean insertLocationHistory(JSONObject body) {
-        int status = doJsonWithRefresh("POST", "/rest/v1/location_history", body, "return=minimal");
-        return status >= 200 && status < 300;
+    /**
+     * Returns the raw HTTP status rather than a boolean.
+     *
+     * The caller needs to tell "the network is down" (retry later, the row
+     * is gone) from "PostgREST refused this payload" (400 — the row will
+     * never land while it looks like this), because the breadcrumb writer
+     * includes an optional column that only exists from schema v15 and a
+     * database that lacks it rejects the WHOLE insert, not just the field.
+     * Silently losing every breadcrumb on a family whose owner has not
+     * migrated is precisely the invisible headless failure this codebase
+     * keeps being bitten by, so the status is worth surfacing.
+     */
+    public int insertLocationHistoryStatus(JSONObject body) {
+        return doJsonWithRefresh("POST", "/rest/v1/location_history", body, "return=minimal");
     }
 
     /** Epoch-ms → the ISO-8601 UTC form PostgREST expects in filters. */

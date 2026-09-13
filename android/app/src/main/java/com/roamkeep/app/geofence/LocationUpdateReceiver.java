@@ -128,13 +128,11 @@ public class LocationUpdateReceiver extends BroadcastReceiver {
     // than no line at all.
     private static final long REJECT_JOURNAL_EVERY_MS = 30 * 60_000;
 
-    // Pending detail for that summary. Statics, not prefs: a process death
-    // under-reports one window, and the lifetime counter in Diagnostics is
-    // the authoritative number. Four more prefs keys would cost more than the
-    // extra precision is worth.
-    private static volatile int   pendDrift, pendStill, pendUnusable;
-    private static volatile float pendWorstAcc, pendWorstDist;
-    private static volatile long  pendSinceMs;
+    // The schema version at which location_history gained its accuracy
+    // column. Below this the column does not exist and PostgREST rejects the
+    // whole insert rather than ignoring the field, so the write path has to
+    // know before it sends. See PrefsStore.getSchemaVersion.
+    private static final int SCHEMA_WITH_ACCURACY = 15;
 
     @Override
     public void onReceive(Context context, Intent intent) {
@@ -253,6 +251,14 @@ public class LocationUpdateReceiver extends BroadcastReceiver {
         double stillLat = m.stillLat, stillLng = m.stillLng;
         long movingUntilMs = m.movingUntilMs;
 
+        // Does this family's database have location_history.accuracy?
+        // Read once per batch from the version the app last mirrored here.
+        // Unknown (0, a device that has not opened the app since upgrading)
+        // reads as NO: the cost of omitting the field is a gap in diagnostic
+        // data, and the cost of guessing wrong the other way is a rejected
+        // INSERT on every fix, headless, with no screen to report it.
+        boolean writeAcc = prefs.getSchemaVersion() >= SCHEMA_WITH_ACCURACY;
+
         int written = 0, suppressed = 0, rejDrift = 0, rejStill = 0, rejUnusable = 0;
         float worstAcc = 0f, worstDist = 0f;
         for (int i = 0; i < lats.length; i++) {
@@ -305,9 +311,15 @@ public class LocationUpdateReceiver extends BroadcastReceiver {
 
             // 4. Still, and imprecise: write nothing. A PRECISE fix is never
             //    suppressed here — the rule is that a real GPS fix is always
-            //    recorded, and a tight cluster of precise fixes is harmless
-            //    anyway because the timeline's span test refuses to call
-            //    something that never left a 120 m circle a trip.
+            //    recorded, so that no journey can lose its start.
+            //
+            //    That rule used to lean on the timeline refusing to call
+            //    anything that never left a 120 m circle a trip. It no
+            //    longer can: 4.8.6 removed that test, so a cluster of fixes
+            //    claiming to be precise now reaches the timeline unopposed.
+            //    Whether that matters depends on something this build
+            //    cannot yet see — what those fixes reported for accuracy —
+            //    which is exactly what the new column is here to record.
             if (times[i] > movingUntilMs && acc > GeofenceReceiver.DRIFT_MIN_ACC_M) {
                 rejStill++;
                 worstAcc = Math.max(worstAcc, acc);
@@ -372,7 +384,38 @@ public class LocationUpdateReceiver extends BroadcastReceiver {
                         && acc < LocationForegroundService.SPEED_TRUST_ACC_M) {
                     row.put("speed", (double) speeds[i]);
                 }
-                if (rest.insertLocationHistory(row)) written++;
+                // The fix's own error radius, recorded at ANY value — note
+                // the deliberate polarity difference from speed above.
+                // Speed is withheld from a fuzzy fix because an invented
+                // speed poisons the classifier. Accuracy is never withheld,
+                // because the fixes worth interrogating later are precisely
+                // the confident-looking ones: every gate above waves those
+                // through untested, and this column is the only way to find
+                // out afterwards whether they deserved it.
+                boolean sentAcc = false;
+                if (writeAcc && acc >= 0) { row.put("accuracy", (double) acc); sentAcc = true; }
+
+                int status = rest.insertLocationHistoryStatus(row);
+                // A 400 on a row carrying accuracy means the column is not
+                // there, whatever the version number said. Verify OBJECTS,
+                // not the number — a database has already reported a version
+                // it did not fully contain once in this project's history.
+                // Drop the field, re-send this row, and stop sending it: the
+                // alternative is every breadcrumb silently failing on a
+                // family whose owner has not run the migration.
+                if (status == 400 && sentAcc) {
+                    row.remove("accuracy");
+                    status = rest.insertLocationHistoryStatus(row);
+                    if (status / 100 == 2) {
+                        writeAcc = false;
+                        prefs.demoteSchemaVersion(SCHEMA_WITH_ACCURACY - 1);
+                        // Once, on the transition — not per row. A line that
+                        // repeats every fix is a line nobody reads.
+                        prefs.journal("crumbs: no accuracy column on this database "
+                                + "— v15 not applied, field dropped");
+                    }
+                }
+                if (status / 100 == 2) written++;
             } catch (JSONException e) {
                 Log.w(TAG, "breadcrumb payload build failed", e);
             }
@@ -386,7 +429,8 @@ public class LocationUpdateReceiver extends BroadcastReceiver {
         // is running — and whether a low breadcrumb count is throttling,
         // home-suppression, or the drift gate doing its job.
         final int rejected = rejDrift + rejStill + rejUnusable;
-        prefs.recordLocationFire(System.currentTimeMillis(), written, suppressed, rejected);
+        prefs.recordLocationFire(System.currentTimeMillis(), written, suppressed,
+                                 rejStill, rejDrift, rejUnusable);
         Log.i(TAG, "location fire: " + lats.length + " fixes, " + written
                 + " written, " + suppressed + " suppressed, " + rejected + " rejected");
         if (rejected > 0) journalRejects(prefs, rejDrift, rejStill, rejUnusable, worstAcc, worstDist);
@@ -452,44 +496,60 @@ public class LocationUpdateReceiver extends BroadcastReceiver {
     private static void journalRejects(PrefsStore prefs, int drift, int still, int unusable,
                                        float worstAcc, float worstDist) {
         final long now = System.currentTimeMillis();
-        if (pendSinceMs == 0) pendSinceMs = now;
-        pendDrift += drift;
-        pendStill += still;
-        pendUnusable += unusable;
-        pendWorstAcc = Math.max(pendWorstAcc, worstAcc);
-        pendWorstDist = Math.max(pendWorstDist, worstDist);
+
+        // PERSISTED, not static. These counters used to live in fields on
+        // this class, so every process death silently zeroed the window
+        // while the half-hourly stamp behind it survived — and the line
+        // then described only the rejections since the process was last
+        // rebuilt. On a doze-cycling device that is minutes, which made
+        // "4 fixes dropped in 27m" a floor rather than a count. It was
+        // read as a count, and that misreading sent the phantom-trip
+        // investigation after the wrong mechanism for a week.
+        PrefsStore.RejectWindow w = prefs.getRejectWindow();
+        if (w.sinceMs == 0) w.sinceMs = now;
+        w.drift += drift;
+        w.still += still;
+        w.unusable += unusable;
+        w.worstAcc = Math.max(w.worstAcc, worstAcc);
+        w.worstDist = Math.max(w.worstDist, worstDist);
 
         long lastJournal = prefs.getLastRejectJournal();
         // First ever window: start the clock rather than emitting at once, so
         // a fresh install doesn't open its journal with a rejection line.
-        if (lastJournal == 0) { prefs.setLastRejectJournal(now); return; }
-        if (now - lastJournal < REJECT_JOURNAL_EVERY_MS) return;
+        if (lastJournal == 0) {
+            prefs.setRejectWindow(w);
+            prefs.setLastRejectJournal(now);
+            return;
+        }
+        if (now - lastJournal < REJECT_JOURNAL_EVERY_MS) {
+            prefs.setRejectWindow(w);
+            return;
+        }
 
         StringBuilder sb = new StringBuilder("crumbs: ")
-                .append(pendDrift + pendStill + pendUnusable)
-                .append(" fixes dropped in ").append((now - pendSinceMs) / 60_000).append("m — ");
+                .append(w.drift + w.still + w.unusable)
+                .append(" fixes dropped in ").append((now - w.sinceMs) / 60_000).append("m — ");
         boolean first = true;
-        if (pendStill > 0) {
-            sb.append(pendStill).append(" still");
+        if (w.still > 0) {
+            sb.append(w.still).append(" still");
             first = false;
         }
-        if (pendDrift > 0) {
+        if (w.drift > 0) {
             if (!first) sb.append(", ");
-            sb.append(pendDrift).append(" drift (max ")
-              .append(Math.round(pendWorstDist)).append("m from anchor)");
+            sb.append(w.drift).append(" drift (max ")
+              .append(Math.round(w.worstDist)).append("m from anchor)");
             first = false;
         }
-        if (pendUnusable > 0) {
+        if (w.unusable > 0) {
             if (!first) sb.append(", ");
-            sb.append(pendUnusable).append(" unusable (>")
+            sb.append(w.unusable).append(" unusable (>")
               .append(Math.round(BREADCRUMB_MAX_ACC_M)).append("m)");
             first = false;
         }
-        sb.append(", worst ±").append(Math.round(pendWorstAcc)).append("m");
+        sb.append(", worst ±").append(Math.round(w.worstAcc)).append("m");
         prefs.journal(sb.toString());
         prefs.setLastRejectJournal(now);
-        pendDrift = 0; pendStill = 0; pendUnusable = 0;
-        pendWorstAcc = 0f; pendWorstDist = 0f; pendSinceMs = 0;
+        prefs.setRejectWindow(new PrefsStore.RejectWindow());
     }
 
     /**

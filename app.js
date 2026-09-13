@@ -91,7 +91,20 @@
   //
   // NEEDS_SCHEMA is the minimum version THIS build requires. Raise it in
   // the same commit that starts using a new table, column or RPC.
+  //
+  // Deliberately NOT raised for v15's location_history.accuracy. Raising
+  // it would refuse to start against every family database whose owner
+  // has not run the migration, to gain a column nothing reads — spending
+  // an outage on other people's servers to buy ourselves diagnostics.
+  // The write sites gate on SCHEMA_WITH_ACCURACY below instead, so a
+  // family still on 13 or 14 keeps working and simply records no
+  // accuracy. This is the per-feature fallback the marker was designed
+  // for; the hard gate stays reserved for things the app cannot run
+  // without.
   const NEEDS_SCHEMA = 13;
+
+  // The version at which location_history gained its accuracy column.
+  const SCHEMA_WITH_ACCURACY = 15;
 
   // What to assume when roamkeep_meta / roamkeep_schema_version() is
   // absent. Every database provisioned before v12 is at 11 (the last
@@ -808,6 +821,12 @@
         memberId: S.myId,
         memberName: (me && me.name) || 'Someone',
         memberAvatar: (me && me.avatar) || '📍',
+        // The headless write path has no way to ask the database its
+        // version, so mirror what checkSchemaCompatible already read.
+        // boot() runs that before this, so it is populated by now; it
+        // stays null if the read FAILED, and the native side ignores a
+        // null rather than overwriting a good value with ignorance.
+        schemaVersion: S.schemaVersion,
         // Seed native state with places we currently consider inside.
         // The receiver union-merges this with what it already has, so
         // ENTERs it captured while the app was closed are preserved.
@@ -1320,10 +1339,12 @@
       const Geo = window.Capacitor?.Plugins?.Geolocation;
       if (Geo && typeof Geo.getCurrentPosition === 'function') {
         const pos = await Geo.getCurrentPosition({ enableHighAccuracy: true, maximumAge: 0, timeout: 15000 });
-        if (pos?.coords) pushLocation(pos.coords.latitude, pos.coords.longitude, pos.timestamp);
+        if (pos?.coords) pushLocation(pos.coords.latitude, pos.coords.longitude, pos.timestamp,
+          pos.coords.speed, pos.coords.accuracy);
       } else if (navigator.geolocation) {
         navigator.geolocation.getCurrentPosition(
-          (pos) => pushLocation(pos.coords.latitude, pos.coords.longitude, pos.timestamp),
+          (pos) => pushLocation(pos.coords.latitude, pos.coords.longitude, pos.timestamp,
+            pos.coords.speed, pos.coords.accuracy),
           () => {},
           { enableHighAccuracy: true, maximumAge: 0, timeout: 15000 }
         );
@@ -2396,7 +2417,16 @@
         // stays flat is a stationary phone behaving correctly. Both climbing
         // together on a real journey would mean the drift gate is eating
         // trail, and the journal's "max Nm from anchor" line says which.
+        //
+        // Split by reason, because the total says only that SOME gate
+        // fired. "Still" and "drift" answer different questions and a fix
+        // for one is the wrong fix for the other, so a single number could
+        // never tell anyone whether the gates were working — which is
+        // precisely what made them so hard to judge from a phone.
         rows.push(['Imprecise fixes ignored', String(st.rejectedCount || 0), null]);
+        rows.push([' · judged stationary', String(st.rejStillCount || 0), null]);
+        rows.push([' · too close to anchor', String(st.rejDriftCount || 0), null]);
+        rows.push([' · unusable (>150 m)', String(st.rejUnusableCount || 0), null]);
         rows.push(['Last background fix',
           st.lastLocationFireMs ? timeAgo(new Date(st.lastLocationFireMs).toISOString()) : 'never',
           st.lastLocationFireMs > 0]);
@@ -2456,7 +2486,7 @@
   // buffered samples in rapid succession, each geofence check-in is
   // written with the time the user actually crossed the boundary,
   // not the (near-identical) time the inserts ran on resume.
-  function pushLocation(lat, lng, whenMs, speed) {
+  function pushLocation(lat, lng, whenMs, speed, acc) {
     if (typeof lat !== 'number' || typeof lng !== 'number') return;
     // Belt-and-braces: if a foreground watch fires while we're paused
     // (e.g. it was armed before the pause), write nothing. No pin push,
@@ -2514,7 +2544,7 @@
           (histMoved != null && histMoved >= TRAIL_IDLE_MIN_M && sinceHist >= TRAIL_IDLE_MS)) {
         _lastHistWriteMs = now;
         _lastHistLat = lat; _lastHistLng = lng;
-        writeBreadcrumb(lat, lng, whenIso, speed);
+        writeBreadcrumb(lat, lng, whenIso, speed, acc);
       }
     }
 
@@ -2530,14 +2560,44 @@
   // Web / PWA breadcrumb write (native owns this on the app). The trail
   // extends via the location_history realtime subscription — one source
   // for both write paths — so there's no local append here.
-  async function writeBreadcrumb(lat, lng, iso, speed) {
+  // Set once, for the session, when a database turns out not to have the
+  // accuracy column despite reporting a version that should include it.
+  // The version is the cheap check; a rejected write is the authoritative
+  // one, and this codebase has already seen a version number that promised
+  // more than the database contained.
+  let _noAccuracyColumn = false;
+
+  async function writeBreadcrumb(lat, lng, iso, speed, acc) {
     if (!S.keepId || !S.myId) return;
     const row = { keep_id: S.keepId, member_id: S.myId, lat, lng, recorded_at: iso };
     // GPS speed feeds the timeline's walk/drive classifier; leave the
     // column NULL when the fix doesn't report one.
     if (typeof speed === 'number' && isFinite(speed) && speed >= 0) row.speed = speed;
+    // The fix's own error radius (v15+). Recorded at any value — unlike
+    // speed, which is withheld from a fuzzy fix — because the whole point
+    // is to be able to check afterwards whether the confident-looking
+    // fixes deserved the free pass the write gates give them.
+    //
+    // S.schemaVersion is null when the version could not be read, and
+    // `null >= 15` is false, so an outage omits the field rather than
+    // risking a rejected insert. That is the safe direction: the cost is
+    // a gap in diagnostics, not a lost trail.
+    const sendAcc = !_noAccuracyColumn && S.schemaVersion >= SCHEMA_WITH_ACCURACY
+      && typeof acc === 'number' && isFinite(acc) && acc >= 0;
+    if (sendAcc) row.accuracy = acc;
     try {
-      await S.sb.from('location_history').insert(row);
+      // supabase-js RESOLVES with { error } rather than throwing on an HTTP
+      // error, so the catch below has never seen a 4xx — a rejected
+      // breadcrumb was silently dropped with nothing logged anywhere.
+      let { error } = await S.sb.from('location_history').insert(row);
+      if (error && sendAcc && isMissingColumn(error)) {
+        // The column isn't there. Drop it and re-send, then stop trying.
+        _noAccuracyColumn = true;
+        delete row.accuracy;
+        ({ error } = await S.sb.from('location_history').insert(row));
+        console.info('breadcrumb: no accuracy column (v15 not applied) — field dropped');
+      }
+      if (error) console.warn('breadcrumb insert', error.code || '', error.message || '');
     } catch (e) { console.warn('breadcrumb insert', e); }
   }
 
@@ -3188,7 +3248,8 @@
             { enableHighAccuracy: true, timeout: 20000 },
             (pos, err) => {
               if (err || !pos || !pos.coords) return;
-              pushLocation(pos.coords.latitude, pos.coords.longitude, pos.timestamp, pos.coords.speed);
+              pushLocation(pos.coords.latitude, pos.coords.longitude, pos.timestamp,
+                pos.coords.speed, pos.coords.accuracy);
             }
           );
         } catch (e) { console.warn('watchPosition failed', e); }
@@ -3199,7 +3260,8 @@
     // Web / PWA path
     if (!navigator.geolocation) return;
     navigator.geolocation.watchPosition(
-      (pos) => pushLocation(pos.coords.latitude, pos.coords.longitude, pos.timestamp),
+      (pos) => pushLocation(pos.coords.latitude, pos.coords.longitude, pos.timestamp,
+        pos.coords.speed, pos.coords.accuracy),
       null,
       { enableHighAccuracy: true, maximumAge: 10000, timeout: 20000 }
     );
@@ -5029,6 +5091,17 @@
     const code = (error && error.code) || '';
     if (code === 'PGRST202' || code === '42883' || code === '42P01') return true;
     return /does not exist|could not find the function/i.test((error && error.message) || '');
+  }
+
+  // A missing COLUMN, which is a different question from the above and
+  // deliberately not folded into it: isMissingDbObject is what decides
+  // "this database predates the version marker", and a missing column
+  // reaching that path would report a modern database as pre-v12.
+  function isMissingColumn(error) {
+    const code = (error && error.code) || '';
+    if (code === 'PGRST204' || code === '42703') return true;
+    return /column .* does not exist|could not find the '.*' column/i
+      .test((error && error.message) || '');
   }
 
   // Read the database's schema version.

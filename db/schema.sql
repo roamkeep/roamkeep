@@ -118,6 +118,16 @@ CREATE TABLE IF NOT EXISTS keep_places (
 -- map trail and the per-day history timeline. speed is the GPS-reported
 -- speed in m/s (nullable — the timeline uses it to tell walks from
 -- drives, falling back to distance/time when absent).
+--
+-- accuracy (v15) is the fix's own horizontal error radius in metres, as
+-- the OS reported it. Nullable, and nothing reads it yet: it exists so
+-- that a wrong row can be told apart from a merely imprecise one after
+-- the fact. Every drift defence on the write path keys on accuracy, so
+-- when a stationary phone records a journey anyway there are exactly two
+-- explanations — the fix was imprecise and cleared the thresholds, or it
+-- claimed to be precise and was wrong — and without this column they are
+-- indistinguishable in the stored data. That ambiguity has blocked the
+-- same diagnosis four times.
 CREATE TABLE IF NOT EXISTS location_history (
   id          uuid PRIMARY KEY DEFAULT gen_random_uuid(),
   keep_id     uuid NOT NULL REFERENCES keeps(id) ON DELETE CASCADE,
@@ -125,6 +135,7 @@ CREATE TABLE IF NOT EXISTS location_history (
   lat         double precision NOT NULL,
   lng         double precision NOT NULL,
   speed       double precision,
+  accuracy    double precision,
   recorded_at timestamptz NOT NULL DEFAULT now()
 );
 
@@ -239,7 +250,8 @@ ALTER TABLE keeps
   ADD COLUMN IF NOT EXISTS code_expires_at timestamptz;
 
 ALTER TABLE location_history
-  ADD COLUMN IF NOT EXISTS speed double precision;
+  ADD COLUMN IF NOT EXISTS speed double precision,
+  ADD COLUMN IF NOT EXISTS accuracy double precision;
 
 
 -- ── INDEXES ───────────────────────────────────────────────
@@ -1651,9 +1663,9 @@ END$$;
 -- upgrade path, and it must never walk a database BACKWARDS if someone
 -- runs an older checkout of it against a newer database.
 
-INSERT INTO roamkeep_meta (id, schema_version) VALUES (true, 14)
+INSERT INTO roamkeep_meta (id, schema_version) VALUES (true, 15)
   ON CONFLICT (id) DO UPDATE
-    SET schema_version = GREATEST(roamkeep_meta.schema_version, 14),
+    SET schema_version = GREATEST(roamkeep_meta.schema_version, 15),
         updated_at = now();
 
 

@@ -333,9 +333,25 @@ Rules that follow from it:
   Corollary: **verify OBJECTS, not the number** — count the columns,
   tables, functions and triggers you expect. `docs/OWNER_SETUP.md` has
   the query.
-- Every release that starts using something new raises `NEEDS_SCHEMA` in
-  the same commit, and `SCHEMA_VERSION` in `cli/src/steps.js` tracks what
-  `db/schema.sql` stamps.
+- Every release that starts **depending** on something new raises
+  `NEEDS_SCHEMA` in the same commit, and `SCHEMA_VERSION` in
+  `cli/src/steps.js` tracks what `db/schema.sql` stamps.
+
+  **"Depends on" is the test, not "uses".** A hard gate spends an outage
+  on every family whose owner hasn't migrated yet, so it is worth it only
+  for something the app genuinely cannot run without. v15's
+  `location_history.accuracy` is the first case that isn't: the write
+  sites gate on `S.schemaVersion >= SCHEMA_WITH_ACCURACY` (and a mirrored
+  copy in `PrefsStore` for the headless path), so a family still on 13 or
+  14 keeps working and just records no accuracy. `NEEDS_SCHEMA` stayed at
+  13. This is the per-feature fallback the marker was designed for.
+
+  A gate like that needs a **second, object-level check**, because the
+  number can be right and the object still missing (the `checkins.lat/lng`
+  incident below). PostgREST rejects the WHOLE insert on an unknown
+  column, so both write paths retry once without the field on a 400 and
+  then stop sending it. Verify objects, not the number — cheaply, at the
+  one call site that cares, rather than with a round trip.
 - `roamkeep_schema_version()` returns a **number, never a verdict**. A
   database that answered "compatible: yes/no" would bake one client's
   policy into every family's server, and changing that policy later would
@@ -501,7 +517,19 @@ context and geofences, then reloads to the Connect screen.
   client-side filter.
 - `location_history` is the per-member breadcrumb trail (7 days:
   client-pruned on launch, plus a pg_cron sweep from the v7 migration if
-  the extension is enabled). Rows carry the GPS `speed` (m/s, nullable).
+  the extension is enabled). Rows carry the GPS `speed` (m/s, nullable)
+  and, since **v15**, the fix's own `accuracy` (m, nullable). Nothing
+  reads `accuracy` — it is an instrument, not a feature. Every drift
+  defence on the write path keys on the error radius, and a precise-looking
+  fix is written with no further questions asked, so when a stationary
+  phone files a journey anyway there are exactly two explanations: the
+  fixes were imprecise and cleared the thresholds, or they claimed to be
+  precise and were wrong. Without the column those are indistinguishable
+  after the fact, which blocked the same diagnosis four times. Note the
+  deliberate polarity difference from `speed`, which is withheld from a
+  fuzzy fix because an invented speed poisons the classifier: `accuracy`
+  is recorded at any value, because the fixes worth interrogating later
+  are precisely the confident-looking ones.
   On the **Android app** it's written natively by
   `LocationUpdateReceiver` — a `FusedLocationProvider` PendingIntent
   target that records points even while the WebView is suspended, so a
