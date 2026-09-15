@@ -48,6 +48,20 @@ public class GeofenceReceiver extends BroadcastReceiver {
     // counts as a real fix is how this bug happened in the first place.
     static final float DRIFT_MIN_ACC_M = 20f;
 
+    // How long "we are inside, but state says we left" must hold before
+    // repairMissedArrival believes it and files an arrival.
+    //
+    // Sized against what it is distinguishing, not picked for feel. Play
+    // Services delivers a real ENTER within its own responsiveness window —
+    // tens of seconds to a couple of minutes — while a device whose ENTER was
+    // lost waits forever. Three minutes sits clear of the first and costs the
+    // second nothing, since by then it has usually been stranded for hours.
+    //
+    // Without a wait the repair simply won the race on EVERY arrival, because
+    // "state says outside" is the ordinary condition while you are travelling
+    // somewhere. That is not a divergence to repair.
+    private static final long REPAIR_SETTLE_MS = 3 * 60_000;
+
     @Override
     public void onReceive(Context context, Intent intent) {
         GeofencingEvent event = GeofencingEvent.fromIntent(intent);
@@ -196,15 +210,37 @@ public class GeofenceReceiver extends BroadcastReceiver {
                 Location.distanceBetween(p.lat, p.lng, tLat, tLng, d);
                 float distFromEdge = Math.abs(d[0] - p.radius);
                 if (distFromEdge < tAcc) {
+                    // ENTER records state; EXIT does NOT. The asymmetry is
+                    // the same one stated above, and 4.8.8 got it wrong by
+                    // treating the two alike.
+                    //
+                    // Recording a gated ENTER is what stops the stranding:
+                    // state says inside, which is where we are, and a later
+                    // real EXIT is then accepted.
+                    //
+                    // Recording a gated EXIT looked symmetrical and was a
+                    // regression. It sets state OUTSIDE while the device is
+                    // sitting inside — and Play Services, which fired that
+                    // EXIT, also believes outside. So the next ordinary
+                    // precise fix produces an ENTER that nothing can tell
+                    // apart from a real arrival, and it gets announced. A
+                    // phone parked near a boundary then wakes the whole keep
+                    // with "arrived" all night: exactly the flapping this
+                    // gate exists to stop, leaking out one side of it.
+                    //
+                    // Leaving state alone restores the absorption — the
+                    // follow-up ENTER lands on state that already says
+                    // inside and is dropped as a duplicate. Nothing is
+                    // stranded by that, because stranding needs state to say
+                    // OUTSIDE while we are inside, which this can no longer
+                    // produce. A genuine later departure still announces.
                     if ("arrived".equals(type)) {
                         prefs.addInsidePlace(placeId);
-                    } else {
-                        prefs.removeInsidePlace(placeId);
                     }
                     prefs.journal("geo: " + type + " " + p.name + " fuzzy fix ±"
                             + Math.round(tAcc) + "m within " + Math.round(distFromEdge)
                             + "m of edge — drift, not announced (state: "
-                            + ("arrived".equals(type) ? "inside" : "outside") + ")");
+                            + ("arrived".equals(type) ? "inside" : "unchanged") + ")");
                     Log.i(TAG, "drift-gated " + type + " for " + p.name + " (acc " + Math.round(tAcc) + "m)");
                     continue;
                 }
@@ -395,6 +431,12 @@ public class GeofenceReceiver extends BroadcastReceiver {
      * else, and acting on it here would manufacture the arrivals the drift
      * gate above exists to suppress.
      *
+     * And the divergence must PERSIST — see REPAIR_SETTLE_MS. Being inside a
+     * place that state says you left is the ordinary condition on the way to
+     * arriving anywhere; only its failure to resolve marks a missed crossing.
+     * Acting immediately made this the primary arrival path rather than the
+     * backstop it is, beating the geofence to every homecoming.
+     *
      * Self-limiting: it fires only while state disagrees with position, and
      * its first action makes them agree. A real ENTER arriving afterwards is
      * absorbed by the duplicate-ENTER guard.
@@ -409,17 +451,60 @@ public class GeofenceReceiver extends BroadcastReceiver {
         String memberId = prefs.getMemberId();
         if (keepId == null || memberId == null) return;
 
+        JSONObject watch = prefs.getRepairWatch();
+        boolean watchChanged = false;
+
         float[] d = new float[1];
         for (PrefsStore.Place p : places) {
-            if (prefs.isInsidePlace(p.id)) continue;    // cheap pre-check
-            Location.distanceBetween(lat, lng, p.lat, p.lng, d);
-            // Inside by a clear margin — the entire error radius within the
-            // boundary, so no plausible reading of this fix puts us outside.
-            if (d[0] >= p.radius - acc) continue;
+            boolean diverged = !prefs.isInsidePlace(p.id);
+            if (diverged) {
+                Location.distanceBetween(lat, lng, p.lat, p.lng, d);
+                // Inside by a clear margin — the entire error radius within
+                // the boundary, so no plausible reading of this fix puts us
+                // outside.
+                diverged = d[0] < p.radius - acc;
+            }
+            if (!diverged) {
+                // Agrees, or too close to the edge to tell. Either way this
+                // is not the condition we are waiting on; forget the clock.
+                if (watch.has(p.id)) { watch.remove(p.id); watchChanged = true; }
+                continue;
+            }
 
-            // Claim it atomically. The pre-check above is only an
-            // optimisation: this runs on the location worker thread while a
-            // real ENTER may be landing on the geofence worker, and a
+            // Inside, while state says we left. WAIT before acting on it.
+            //
+            // This is a backstop for a crossing that is never coming, not a
+            // competitor to Play Services. Without the wait it fired on every
+            // ordinary arrival, because "state says outside" is simply what
+            // state says while you are on your way somewhere — and it beat
+            // the geofence by seconds, so each homecoming produced a
+            // "recovered from position" line followed by a dropped duplicate.
+            // That is a journal crying wolf on the one instrument used to
+            // diagnose everything else, and it also manufactured arrived/left
+            // pairs for places merely passed through.
+            //
+            // Waiting separates the two cases by the only thing that actually
+            // distinguishes them: a real arrival gets its ENTER within the
+            // geofence's own responsiveness window, and a stranded device
+            // never does. A device that has been stranded for hours can
+            // certainly wait REPAIR_SETTLE_MS more.
+            long since = watch.optLong(p.id, 0L);
+            if (since <= 0L || since > whenMs) {
+                // Also resets a stamp that is in the FUTURE: a clock change
+                // or a fix with a bad timestamp would otherwise park the wait
+                // beyond any elapsed time and disable the repair silently.
+                try {
+                    watch.put(p.id, whenMs);
+                    watchChanged = true;
+                } catch (JSONException e) {
+                    Log.w(TAG, "repair watch update failed", e);
+                }
+                continue;                      // start the clock, act later
+            }
+            if (whenMs - since < REPAIR_SETTLE_MS) continue;
+
+            // Claim it atomically. This runs on the location worker thread
+            // while a real ENTER may be landing on the geofence worker, and a
             // check-then-act across those two would file the arrival twice.
             // Whoever loses the claim says nothing.
             //
@@ -427,9 +512,11 @@ public class GeofenceReceiver extends BroadcastReceiver {
             // optimistic ordering the transition path uses: a failed POST
             // costs a row, but never leaves state disagreeing with position,
             // which is the condition this function exists to end.
+            watch.remove(p.id);
+            watchChanged = true;
             if (!prefs.claimInsidePlace(p.id)) continue;
-            prefs.journal("geo: arrived " + p.name
-                    + " — recovered from position (state had us outside)");
+            prefs.journal("geo: arrived " + p.name + " — recovered from position (no"
+                    + " geofence enter in " + ((whenMs - since) / 60_000) + "m)");
             Log.i(TAG, "repaired missed ENTER for " + p.name
                     + " (±" + Math.round(acc) + "m, " + Math.round(d[0]) + "m from centre)");
 
@@ -455,6 +542,7 @@ public class GeofenceReceiver extends BroadcastReceiver {
                 Log.w(TAG, "repair payload build failed", e);
             }
         }
+        if (watchChanged) prefs.setRepairWatch(watch);
     }
 
     private static String toIso8601Utc(long ms) {

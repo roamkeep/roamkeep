@@ -106,6 +106,35 @@ public class LocationUpdateReceiver extends BroadcastReceiver {
     // departure is noticed within ~100 m of walking — and MOVING_SPEED_MS
     // below usually notices it long before that anyway.
     private static final long CENTROID_TAU_MS = 90_000;
+    // Ceiling on how far ONE fix may drag that average, whatever the gap
+    // before it.
+    //
+    // The time weighting is right in principle and was wrong in practice.
+    // Its comment promises "the same smoothing whether the profile is
+    // delivering every 4 s or every 30 s" — but those are not the rates that
+    // occur. auto's low-power profile carries setMinUpdateDistanceMeters(30)
+    // (saver, 50 m), so the OS withholds every delivery until the device has
+    // moved that far, and a still phone on BALANCED_POWER network fixes only
+    // produces one when drift happens to cross the bar. The journal shows
+    // 8-20 MINUTES between deliveries, and 1 - exp(-600s/90s) is 0.9987: the
+    // "average" is simply the latest fix.
+    //
+    // So the gate degenerated into the single-sample test the comment above
+    // explains cannot answer the question — in the one mode where the fixes
+    // are tens of metres wide, which is where the phantom trips came from.
+    //
+    // 0.20 keeps roughly five fixes of memory. It is a CEILING, not a
+    // replacement: while the device is genuinely moving the profile is dense,
+    // dt is seconds, the computed weight is ~0.043 and this never binds.
+    //
+    // Note what this deliberately is NOT. It does not raise any bar for
+    // concluding "moving" — MOVING_SPEED_MS, MOVING_DISP_M, MOVING_ACC_MULT
+    // and CENTROID_MOVE_M are untouched, because raising one of those is what
+    // cost trail density in 3.0.2 and again in 4.5.4. It pays on the
+    // stillness side instead, by making the reference stable, which is the
+    // "anchor position held over a window rather than the previous fix" the
+    // design already intended. An average at alpha ~ 1.0 IS the previous fix.
+    private static final double CENTROID_ALPHA_MAX = 0.20;
     // How far the average must move before the device is credited with having
     // gone somewhere. A FLOOR, then scaled by the fix's own error radius —
     // because the averaged noise scales with it too, so a fixed number is
@@ -284,9 +313,17 @@ public class LocationUpdateReceiver extends BroadcastReceiver {
             } else {
                 double dt = times[i] - emaMs;
                 // Weight by elapsed time, so the smoothing is the same
-                // whether the profile is delivering every 4 s or every 30 s.
+                // whether the profile is delivering every 4 s or every 30 s —
+                // then clamp, because the low-power profile's distance filter
+                // stretches the real gaps to minutes and the weight to ~1.0,
+                // which leaves no average at all. See CENTROID_ALPHA_MAX.
+                // The clamp replaces an "alpha > 1.0" guard that could never
+                // fire (1 - exp(-x) < 1 for every finite x). It does change
+                // the dt <= 0 case — an out-of-order fix inside a batch — from
+                // 1.0 to the ceiling, which is the same correction: a fix with
+                // a stale timestamp has no business replacing the average.
                 double alpha = dt <= 0 ? 1.0 : 1.0 - Math.exp(-dt / (double) CENTROID_TAU_MS);
-                if (alpha > 1.0) alpha = 1.0;
+                if (alpha > CENTROID_ALPHA_MAX) alpha = CENTROID_ALPHA_MAX;
                 emaLat += alpha * (lats[i] - emaLat);
                 emaLng += alpha * (lngs[i] - emaLng);
             }

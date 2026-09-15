@@ -171,6 +171,17 @@ public class PrefsStore {
     // never actually entered this session.
     private static final String K_INSIDE_PLACE_IDS = "inside_place_ids";
 
+    // {placeId: epoch-ms} — when repairMissedArrival FIRST saw itself inside
+    // a place that the inside-set says we left. It waits for that to persist
+    // before acting, so it repairs a divergence rather than racing Play
+    // Services to every ordinary arrival, and this is the clock.
+    //
+    // PERSISTED, because the pipeline is headless: an in-memory stamp would
+    // reset on every process death, the wait would never elapse on a
+    // doze-cycling device, and the repair would never fire at all — the
+    // opposite failure to the one it is being given.
+    private static final String K_REPAIR_WATCH = "repair_inside_since";
+
     // Black-box event journal: JSON array of { t: epochMs, e: text },
     // capped at JOURNAL_CAP (oldest dropped). Written by the service,
     // receivers and plugin at lifecycle-significant moments (doze
@@ -646,6 +657,20 @@ public class PrefsStore {
         if (ids == null || ids.isEmpty()) return;
         Set<String> existing = getInsidePlaceIds();
         if (existing.addAll(ids)) setInsidePlaceIds(existing);
+    }
+
+    /** The repair watch map, {placeId: epoch-ms}. Never null; an empty
+     *  object when nothing is being watched. See K_REPAIR_WATCH. */
+    public synchronized JSONObject getRepairWatch() {
+        try {
+            return new JSONObject(sp.getString(K_REPAIR_WATCH, "{}"));
+        } catch (JSONException e) {
+            return new JSONObject();
+        }
+    }
+
+    public synchronized void setRepairWatch(JSONObject watch) {
+        sp.edit().putString(K_REPAIR_WATCH, watch == null ? "{}" : watch.toString()).apply();
     }
 
     /**
