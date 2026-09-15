@@ -77,7 +77,7 @@ function bakedBackendLine() {
 //
 // If a release ever has a real reason to break the pairing, move
 // CACHE_VERSION_OFFSET in the same commit and say why.
-const CACHE_VERSION_OFFSET = 7;   // roamkeep-v75 ↔ versionCode 68
+const CACHE_VERSION_OFFSET = 7;   // roamkeep-v76 ↔ versionCode 69
 
 function checkCacheVersion() {
   const swPath = path.join(ROOT, 'sw.js');

@@ -648,6 +648,50 @@ public class PrefsStore {
         if (existing.addAll(ids)) setInsidePlaceIds(existing);
     }
 
+    /**
+     * Record that we are inside a place, and report whether THIS caller is
+     * the one that changed it.
+     *
+     * Two independent threads now decide someone has arrived: the geofence
+     * receiver, from a Play Services transition, and the breadcrumb pipeline,
+     * from a precise fix inside a place whose state says otherwise. Both
+     * follow "is it already set? no — then file an arrival and set it", and
+     * as separate check-then-act pairs that races into two arrivals for one
+     * homecoming.
+     *
+     * `synchronized` on the methods around it does NOT prevent that: it locks
+     * the PrefsStore INSTANCE, and every one of these call sites constructs
+     * its own. The lock has always been decorative across threads. This one
+     * takes the class-level LOCK, which is shared, and folds the test and the
+     * set into a single guarded step — so the loser is told it lost and stays
+     * quiet, rather than both deciding they won.
+     *
+     * Lock order note: LOCK is only ever taken on its own here (the body
+     * touches `sp` directly rather than calling the synchronized accessors),
+     * and nothing anywhere holds LOCK while reaching for an instance monitor.
+     * Keep it that way.
+     *
+     * @return true if this call added the place; false if it was already set.
+     */
+    public boolean claimInsidePlace(String id) {
+        if (id == null) return false;
+        synchronized (LOCK) {
+            Set<String> set = new HashSet<>();
+            try {
+                JSONArray arr = new JSONArray(sp.getString(K_INSIDE_PLACE_IDS, "[]"));
+                for (int i = 0; i < arr.length(); i++) {
+                    String v = arr.optString(i, null);
+                    if (v != null) set.add(v);
+                }
+            } catch (JSONException ignored) {}
+            if (!set.add(id)) return false;
+            JSONArray out = new JSONArray();
+            for (String v : set) out.put(v);
+            sp.edit().putString(K_INSIDE_PLACE_IDS, out.toString()).commit();
+            return true;
+        }
+    }
+
     public synchronized void addInsidePlace(String id) {
         if (id == null) return;
         Set<String> set = getInsidePlaceIds();

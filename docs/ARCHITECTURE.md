@@ -249,6 +249,48 @@ screen. The diagnostics counters even looked healthy, because
 only because nothing was ever rejected. There is now a fourth counter, so
 that identity means something.
 
+### A dropped event is not the same as a dropped announcement
+
+Found in 4.8.7. `GeofenceReceiver`'s drift gate refuses to act on a fuzzy fix
+near a boundary — correct, and it is what stops a phone by the front gate
+spamming arrived/left all night. But it `continue`d **before** the state flip,
+so a gated ENTER never reached `addInsidePlace`, and the device recorded itself
+*outside* a place it was sitting inside.
+
+Nothing could put it back. **Play Services fires only on a CROSSING**, the phone
+never crossed again, and both arm paths use `setInitialTrigger(0)`, so
+re-registering synthesises nothing. Only someone opening the app repaired it.
+Meanwhile the next genuine departure was discarded as a "spurious EXIT", so the
+damage compounded.
+
+Two lessons, and the second is the general one:
+
+- **`insidePlaceIds` exists to pair up Play Services' own event stream, so it
+  must track what Play Services believes** — not what we decided to tell the
+  family. "Is this fix good enough to announce?" and "where does the OS think we
+  are?" are different questions; one `continue` was answering both.
+- **Dropping an EXIT is recoverable; dropping an ENTER is not**, because ENTER
+  is the only event that re-establishes inside-ness. Before you discard an
+  event, ask what re-sends it. If the answer is "a transition that can only
+  happen if the user moves, and they haven't", discarding is permanent and the
+  filter needs a reconcile behind it — which is the same rule as the divergence
+  bug above: **a delta handler is an optimisation, never the only path.**
+
+`GeofenceReceiver.repairMissedArrival` is that reconcile, called from the
+breadcrumb pipeline because that path has what the receiver lacks — a position,
+several times a minute, whether or not anything crossed a boundary. It is
+deliberately ENTER-only (the EXIT direction heals itself when the person really
+leaves) and it demands a precise fix inside by its whole error radius, so drift
+cannot manufacture the arrivals the gate above exists to suppress.
+
+It also exposed a lock that never locked. Two threads now file arrivals — the
+geofence worker and the location worker — and every call site builds its **own**
+`PrefsStore`, so the `synchronized` on those methods had only ever guarded an
+instance nobody shared. `claimInsidePlace` folds the test and the set into one
+step under the class-level `LOCK`; the loser stays quiet. **If two paths can
+decide the same thing, they need a shared lock and a compare-and-set, not a
+check followed by an act.**
+
 ## Build & release pipeline
 
 ```powershell

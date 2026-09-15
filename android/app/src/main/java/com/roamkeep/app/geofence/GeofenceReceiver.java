@@ -157,9 +157,9 @@ public class GeofenceReceiver extends BroadcastReceiver {
                 continue;
             }
 
-            // Anti-drift accuracy gate. Drop a "crossing" only when the fix
-            // is BOTH imprecise (error radius > DRIFT_MIN_ACC_M) AND lands
-            // within that error of the boundary — i.e. a fuzzy fix that
+            // Anti-drift accuracy gate. Suppress a "crossing" only when the
+            // fix is BOTH imprecise (error radius > DRIFT_MIN_ACC_M) AND
+            // lands within that error of the boundary — i.e. a fuzzy fix that
             // genuinely can't tell which side you're on. That's GPS drift,
             // not real movement, and it's what spammed arrived/left on
             // stationary phones sitting near a place overnight. A PRECISE
@@ -168,13 +168,43 @@ public class GeofenceReceiver extends BroadcastReceiver {
             // earlier version wrongly dropped one of those, which then also
             // orphaned its EXIT (state never recorded the ENTER). Radius-
             // independent, so even a small 50 m home stays reliable.
+            //
+            // IT SUPPRESSES THE ANNOUNCEMENT, NOT THE STATE. Two different
+            // questions were being answered by one `continue` here, and
+            // conflating them stranded a device. "Is this fix good enough to
+            // tell the family about?" is this gate's question. "Where does
+            // Play Services think we are?" is what insidePlaceIds is FOR —
+            // it exists to pair up Play Services' own event stream, so it has
+            // to track what Play Services believes, whatever we decide to say
+            // out loud.
+            //
+            // The failure that forced this: a fuzzy ENTER was dropped, so
+            // addInsidePlace never ran, and the device recorded itself
+            // OUTSIDE a place it was sitting inside. Play Services only fires
+            // on transitions and the phone never crossed the boundary again,
+            // so nothing could ever put it back — and the next genuine
+            // departure was then discarded as a "spurious EXIT". Dropping an
+            // EXIT is recoverable; dropping an ENTER is not, because ENTER is
+            // the only event that re-establishes inside-ness.
+            //
+            // Known, pre-existing exposure: a synthetic EXIT for a fence we
+            // now believe we are inside can be announced. That was already
+            // true after every genuine arrival — this only makes our state
+            // agree with the OS more often, never less.
             if (tLat != null && tLng != null && tAcc != null && tAcc > DRIFT_MIN_ACC_M) {
                 float[] d = new float[1];
                 Location.distanceBetween(p.lat, p.lng, tLat, tLng, d);
                 float distFromEdge = Math.abs(d[0] - p.radius);
                 if (distFromEdge < tAcc) {
+                    if ("arrived".equals(type)) {
+                        prefs.addInsidePlace(placeId);
+                    } else {
+                        prefs.removeInsidePlace(placeId);
+                    }
                     prefs.journal("geo: " + type + " " + p.name + " fuzzy fix ±"
-                            + Math.round(tAcc) + "m within " + Math.round(distFromEdge) + "m of edge — drift, dropped");
+                            + Math.round(tAcc) + "m within " + Math.round(distFromEdge)
+                            + "m of edge — drift, not announced (state: "
+                            + ("arrived".equals(type) ? "inside" : "outside") + ")");
                     Log.i(TAG, "drift-gated " + type + " for " + p.name + " (acc " + Math.round(tAcc) + "m)");
                     continue;
                 }
@@ -188,34 +218,38 @@ public class GeofenceReceiver extends BroadcastReceiver {
             // ENTER for eliminates those, at the cost of losing any
             // truly-first EXIT after a fresh install (which has no
             // prior ENTER either, so no activity-log asymmetry).
-            boolean currentlyInside = prefs.isInsidePlace(placeId);
-            if ("arrived".equals(type) && currentlyInside) {
-                Log.i(TAG, "duplicate ENTER for " + p.name + " — already inside, skipping");
-                prefs.journal("geo: duplicate ENTER " + p.name + " dropped");
-                continue;
-            }
-            if ("left".equals(type) && !currentlyInside) {
-                Log.i(TAG, "spurious EXIT for " + p.name + " — not currently inside, skipping");
-                prefs.journal("geo: spurious EXIT " + p.name + " dropped");
-                continue;
-            }
-            prefs.journal("geo: " + type + " " + p.name);
-
-            // Flip local state OPTIMISTICALLY — before the DB writes —
-            // so a transient network failure can't permanently desync
-            // us from the OS's view. If the writes below fail, we lose
-            // one check-in row, but the next legitimate transition
-            // still gets through (because state matches reality). The
-            // earlier "update only on success" version had a real-world
-            // failure mode where a flaky network on the EXIT (e.g. WiFi
-            // → cellular handoff while leaving home) would leave state
-            // stuck at "inside home" forever, silently deduping every
-            // future ENTER for that place.
+            // State-gate, and for an arrival claim it in the same step.
+            //
+            // Flip local state OPTIMISTICALLY — before the DB writes — so a
+            // transient network failure can't permanently desync us from the
+            // OS's view. If the writes below fail, we lose one check-in row,
+            // but the next legitimate transition still gets through (because
+            // state matches reality). The earlier "update only on success"
+            // version had a real-world failure mode where a flaky network on
+            // the EXIT (e.g. WiFi → cellular handoff while leaving home)
+            // would leave state stuck at "inside home" forever, silently
+            // deduping every future ENTER for that place.
+            //
+            // The ENTER case tests and sets atomically, because the
+            // breadcrumb pipeline now also files arrivals (see
+            // repairMissedArrival) from a different thread. A separate
+            // isInsidePlace + addInsidePlace would let one homecoming be
+            // announced twice.
             if ("arrived".equals(type)) {
-                prefs.addInsidePlace(placeId);
+                if (!prefs.claimInsidePlace(placeId)) {
+                    Log.i(TAG, "duplicate ENTER for " + p.name + " — already inside, skipping");
+                    prefs.journal("geo: duplicate ENTER " + p.name + " dropped");
+                    continue;
+                }
             } else {
+                if (!prefs.isInsidePlace(placeId)) {
+                    Log.i(TAG, "spurious EXIT for " + p.name + " — not currently inside, skipping");
+                    prefs.journal("geo: spurious EXIT " + p.name + " dropped");
+                    continue;
+                }
                 prefs.removeInsidePlace(placeId);
             }
+            prefs.journal("geo: " + type + " " + p.name);
             anyAccepted = true;
 
             try {
@@ -327,6 +361,100 @@ public class GeofenceReceiver extends BroadcastReceiver {
             Log.i(TAG, "drained " + drained + " pending checkin(s)");
         }
         return drained;
+    }
+
+    /**
+     * File an arrival we should have had, when the position says we are
+     * inside a place our own state thinks we left.
+     *
+     * WHY THIS EXISTS. Every other path here is a delta handler: it reacts to
+     * a transition Play Services reports. The codebase's standing rule is that
+     * a delta handler is an optimisation and never the only path, because the
+     * one event you miss is the one nothing comes back for. Geofencing is the
+     * sharpest case of that — transitions fire only on a CROSSING, so an ENTER
+     * that is lost, dropped or never delivered can never be re-sent while the
+     * phone sits still inside the place. The device is then stranded: no
+     * arrival is ever filed, the timeline keeps a departure with no return,
+     * and the next genuine departure is discarded as spurious. Until now the
+     * only repair was somebody opening the app.
+     *
+     * So this reconciles against the authoritative answer — where the device
+     * actually is — rather than waiting for another delta.
+     *
+     * DELIBERATELY ENTER-ONLY. The missing-EXIT direction heals itself: the
+     * moment the person really leaves, Play Services fires again and the
+     * normal path handles it. Only the ENTER direction is unrecoverable by
+     * construction, so only the ENTER direction is repaired here. Symmetry
+     * would cost blast radius and buy nothing.
+     *
+     * The conditions are strict so that drift can never trigger it: the fix
+     * must be PRECISE (the same bar GeofenceReceiver uses to trust a crossing
+     * at all), and we must be inside by a clear margin — its whole error
+     * radius clear of the boundary, not merely inside it. A fuzzy fix, or one
+     * hovering near the edge, is exactly what we refuse to act on everywhere
+     * else, and acting on it here would manufacture the arrivals the drift
+     * gate above exists to suppress.
+     *
+     * Self-limiting: it fires only while state disagrees with position, and
+     * its first action makes them agree. A real ENTER arriving afterwards is
+     * absorbed by the duplicate-ENTER guard.
+     */
+    static void repairMissedArrival(PrefsStore prefs, SupabaseRest rest,
+                                    double lat, double lng, float acc, long whenMs) {
+        if (acc < 0 || acc > DRIFT_MIN_ACC_M) return;   // not precise enough to act on
+        List<PrefsStore.Place> places = prefs.getPlaces();
+        if (places == null || places.isEmpty()) return;
+
+        String keepId   = prefs.getKeepId();
+        String memberId = prefs.getMemberId();
+        if (keepId == null || memberId == null) return;
+
+        float[] d = new float[1];
+        for (PrefsStore.Place p : places) {
+            if (prefs.isInsidePlace(p.id)) continue;    // cheap pre-check
+            Location.distanceBetween(lat, lng, p.lat, p.lng, d);
+            // Inside by a clear margin — the entire error radius within the
+            // boundary, so no plausible reading of this fix puts us outside.
+            if (d[0] >= p.radius - acc) continue;
+
+            // Claim it atomically. The pre-check above is only an
+            // optimisation: this runs on the location worker thread while a
+            // real ENTER may be landing on the geofence worker, and a
+            // check-then-act across those two would file the arrival twice.
+            // Whoever loses the claim says nothing.
+            //
+            // The claim also flips state BEFORE the POST, matching the
+            // optimistic ordering the transition path uses: a failed POST
+            // costs a row, but never leaves state disagreeing with position,
+            // which is the condition this function exists to end.
+            if (!prefs.claimInsidePlace(p.id)) continue;
+            prefs.journal("geo: arrived " + p.name
+                    + " — recovered from position (state had us outside)");
+            Log.i(TAG, "repaired missed ENTER for " + p.name
+                    + " (±" + Math.round(acc) + "m, " + Math.round(d[0]) + "m from centre)");
+
+            try {
+                JSONObject ci = new JSONObject();
+                ci.put("id", UUID.randomUUID().toString());
+                ci.put("keep_id", keepId);
+                ci.put("member_id", memberId);
+                ci.put("member_name", prefs.getMemberName());
+                ci.put("member_avatar", prefs.getMemberAvatar());
+                ci.put("type", "arrived");
+                ci.put("place", p.icon + " " + p.name);
+                ci.put("place_id", p.id);
+                ci.put("created_at", toIso8601Utc(whenMs));
+                if (rest.insertCheckin(ci) == SupabaseRest.Result.FAILED) {
+                    prefs.appendPendingCheckin(ci);
+                    prefs.journal("geo: arrived " + p.name + " POST failed — queued");
+                }
+                JSONObject upd = new JSONObject();
+                upd.put("last_place_id", p.id);
+                rest.updateMember(memberId, upd);
+            } catch (JSONException e) {
+                Log.w(TAG, "repair payload build failed", e);
+            }
+        }
     }
 
     private static String toIso8601Utc(long ms) {

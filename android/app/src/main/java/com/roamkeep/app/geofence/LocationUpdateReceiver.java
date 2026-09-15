@@ -464,6 +464,26 @@ public class LocationUpdateReceiver extends BroadcastReceiver {
             Log.w(TAG, "pin update payload build failed", e);
         }
 
+        // Reconcile the inside-place set against where we actually are.
+        //
+        // Geofence transitions fire only on a CROSSING, so an ENTER that is
+        // dropped or never delivered can never be re-sent while the phone
+        // sits still inside the place — the device records itself outside
+        // somewhere it is sitting, files no arrival, and discards its next
+        // real departure as spurious. This path has what the receiver lacks:
+        // a position, several times a minute, whether or not anything
+        // crossed a boundary. Use the most PRECISE fix in the batch, not the
+        // most recent — the whole judgement rests on trusting the reading.
+        int best = -1;
+        for (int i = 0; i < accs.length; i++) {
+            if (accs[i] < 0) continue;
+            if (best < 0 || accs[i] < accs[best]) best = i;
+        }
+        if (best >= 0) {
+            GeofenceReceiver.repairMissedArrival(prefs, rest,
+                    lats[best], lngs[best], accs[best], times[best]);
+        }
+
         // Retry any check-ins parked by GeofenceReceiver. A queued entry
         // means the POST failed at the boundary crossing (classically the
         // WiFi → cellular handoff while leaving home), and until now the
