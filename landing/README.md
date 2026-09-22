@@ -84,7 +84,16 @@ signed two different ways depending on how it was installed:
 | fingerprint | signs | comes from |
 |---|---|---|
 | `2C:8F:69:…:AE:FA` | sideloaded APKs | the local release keystore |
-| `27:59:DB:…:D6:E1` | Play installs | Play App Signing (Google holds this key) |
+| `A0:E8:6E:…:D6:8D` | Play installs | Play App Signing (Google holds this key) |
+
+⚠ **Take the Play value from "App signing key certificate", NOT "Upload key
+certificate".** Both are on the same App integrity page and both are SHA-256
+fingerprints of your app. The upload key is what you sign the AAB with; the
+app signing key is what Google re-signs with and what reaches devices. Only
+the second belongs here. Listing the upload key by mistake is the same as
+listing nothing: `pm get-app-links` reports a numeric error state
+instead of `verified`, and every link opens the browser. That is exactly what
+happened between the first Play upload and 2026-09-22.
 
 Play App Signing re-signs the upload, so a Play build's certificate is
 **not** the one you built with. List only one and App Links silently fail
