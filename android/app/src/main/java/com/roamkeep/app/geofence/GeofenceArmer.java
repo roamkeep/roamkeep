@@ -56,6 +56,8 @@ import java.util.Set;
 final class GeofenceArmer {
     private static final String TAG = "RoamkeepGeo";
     private static final int PI_REQUEST_CODE = 0;
+    /** Play Services' per-app geofence limit. */
+    private static final int MAX_FENCES = 100;
 
     private GeofenceArmer() {}
 
@@ -144,6 +146,17 @@ final class GeofenceArmer {
                     .setTransitionTypes(Geofence.GEOFENCE_TRANSITION_ENTER
                             | Geofence.GEOFENCE_TRANSITION_EXIT)
                     .build());
+        }
+
+        // Play Services allows an app 100 geofences, and addGeofences is
+        // all-or-nothing: one fence over and NOTHING is armed, on every
+        // device, with only an "ARM FAILED" line to show for it. Schema v16
+        // caps a keep at 90 places, but a database older than that has no
+        // cap — so arm the first 100 rather than none, and say so.
+        if (fences.size() > MAX_FENCES) {
+            prefs.journal("geo: " + fences.size() + " places exceed Android's " + MAX_FENCES
+                    + "-geofence limit — arming the first " + MAX_FENCES);
+            fences = new ArrayList<>(fences.subList(0, MAX_FENCES));
         }
 
         // Anything still registered that is not in the list has been

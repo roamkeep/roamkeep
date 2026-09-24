@@ -18,6 +18,15 @@ routes = [
   { pattern = "relay.roamkeep.app", custom_domain = true }
 ]
 
+# Pinned OFF here rather than left to Wrangler's defaults and dashboard state.
+# The abuse guard above only exists on relay.roamkeep.app; any other URL the
+# Worker answers on skips it, and a flood there spends the single global
+# ceiling below — push down for every family at once. After deploying, check:
+#   curl -s https://roamkeep-relay.roamkeep.workers.dev/v1/health
+# must NOT print {"ok":true}.
+workers_dev = false
+preview_urls = false
+
 # No KV, no D1, no R2, no Durable Objects — the relay is stateless by
 # design. There is nowhere for it to keep anything even if it wanted to.
 

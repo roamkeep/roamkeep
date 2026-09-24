@@ -16,6 +16,7 @@ import androidx.core.app.NotificationManagerCompat;
 import com.capacitorjs.plugins.pushnotifications.MessagingService;
 import com.google.firebase.messaging.RemoteMessage;
 import com.roamkeep.app.MainActivity;
+import com.roamkeep.app.R;
 
 import org.json.JSONArray;
 import org.json.JSONObject;
@@ -25,6 +26,7 @@ import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 
 /**
  * Turns a content-free push wake-up into a real notification.
@@ -51,11 +53,43 @@ public class RoamkeepMessagingService extends MessagingService {
 
     private static final String CH_PLACES = "roamkeep_places";
     private static final String CH_SOS    = "roamkeep_sos";
-    // Cap what one wake-up can raise, so a burst can't spam the shade.
+    // Cap on ordinary (arrive/leave) notifications per wake-up, so a burst
+    // cannot spam the shade; anything over it is summarised in one line.
+    // SOS is never capped.
     private static final int MAX_PER_WAKE = 5;
     // First wake-up after an install has no watermark; only look back
     // this far so we don't replay old history as fresh notifications.
     private static final long COLD_START_LOOKBACK_MS = 10 * 60 * 1000L;
+    // How far BEHIND the watermark each fetch re-reads. A check-in can land
+    // after a newer one — a crossing queued through a Wi-Fi→cellular
+    // handoff, or Play Services delivering one phone's ENTER a minute late —
+    // and a strict "newer than the newest I've seen" query skipped it for
+    // good. The seen-ID set stops the overlap raising anything twice.
+    private static final long OVERLAP_MS = 30 * 60 * 1000L;
+    // Pre-v16 databases only (paging by the device-supplied created_at):
+    // ignore rows dated further ahead than this. One row dated tomorrow used
+    // to pin the watermark to tomorrow and silence every alert until then.
+    private static final long FUTURE_SLACK_MS = 60 * 60 * 1000L;
+    private static final int FETCH_LIMIT = 50;
+    // checkins.inserted_at (server receipt time) exists from schema v16.
+    private static final int SCHEMA_WITH_INSERTED_AT = 16;
+
+    /**
+     * FCM rotated this device's token. Saved natively as well as handed to
+     * the JS registration listener (super), because that listener only runs
+     * while the app is open — until 4.9.0 a token that rotated with the app
+     * closed was not saved until the next app open, and meanwhile the old
+     * token was dead: this phone received no alerts at all.
+     */
+    @Override
+    public void onNewToken(@NonNull String token) {
+        super.onNewToken(token);
+        PrefsStore prefs = new PrefsStore(getApplicationContext());
+        if (!prefs.hasContext() || prefs.isServerRejected()) return;
+        boolean ok = new SupabaseRest(getApplicationContext())
+                .upsertPushToken(prefs.getMemberId(), prefs.getKeepId(), token);
+        prefs.journal("push: new FCM token " + (ok ? "saved" : "NOT saved — the app will save it when next opened"));
+    }
 
     @Override
     public void onMessageReceived(@NonNull RemoteMessage remoteMessage) {
@@ -93,11 +127,42 @@ public class RoamkeepMessagingService extends MessagingService {
         reconcilePlaces(ctx, prefs);
     }
 
-    /** Fetch anything newer than the watermark and notify about it. */
+    /**
+     * Fetch what arrived since the watermark and notify about it.
+     *
+     * WHICH CLOCK. From schema v16 this pages by checkins.inserted_at — the
+     * server's receipt time, set by a trigger no client can override. Before
+     * that it pages by created_at, which is whatever time the WRITING device
+     * reported; that is what let one future-dated row silence the keep and a
+     * late row slip past. On an older database the old clock stays, fenced by
+     * FUTURE_SLACK_MS and the overlap.
+     */
     private void notifyNewCheckins(Context ctx, PrefsStore prefs) {
-        String since = prefs.getLastPushSeen();
-        if (since == null) {
-            since = SupabaseRest.toIso8601Utc(System.currentTimeMillis() - COLD_START_LOOKBACK_MS);
+        final boolean serverClock = prefs.getSchemaVersion() >= SCHEMA_WITH_INSERTED_AT;
+        final String col = serverClock ? "inserted_at" : "created_at";
+        final long nowMs = System.currentTimeMillis();
+
+        String mark = serverClock ? prefs.getLastPushSeenInserted() : prefs.getLastPushSeen();
+        // First run on the server clock: carry the old watermark across. For
+        // historical rows inserted_at was backfilled from created_at, so the
+        // two agree where it matters.
+        if (mark == null && serverClock) mark = prefs.getLastPushSeen();
+        long markMs = parseIsoMs(mark);
+        // A watermark already pinned in the future by a poisoned row (device
+        // clock only means anything on the device-reported clock).
+        if (!serverClock && markMs > nowMs + FUTURE_SLACK_MS) { mark = null; markMs = -1; }
+
+        final Set<String> seen = prefs.getPushSeenIds();
+        final String from;
+        if (mark == null || markMs < 0) {
+            from = SupabaseRest.toIso8601Utc(nowMs - COLD_START_LOOKBACK_MS);
+        } else if (seen.isEmpty()) {
+            // Nothing recorded as seen yet (first run of this logic): no
+            // overlap this once, or everything in the window would be raised
+            // again. The exact watermark string, so the boundary row is excluded.
+            from = mark;
+        } else {
+            from = SupabaseRest.toIso8601Utc(markMs - OVERLAP_MS);
         }
 
         // my_checkin_feed, not checkins. The view applies the caller's own
@@ -116,63 +181,156 @@ public class RoamkeepMessagingService extends MessagingService {
         // PrefsStore would be a fourth store of database state that can
         // silently drift, which is the failure this codebase keeps paying
         // for.
-        String path = "/rest/v1/my_checkin_feed"
-                + "?select=id,member_name,member_avatar,type,place,created_at"
-                + "&created_at=gt." + enc(since)
-                + "&order=created_at.desc"
-                + "&limit=" + MAX_PER_WAKE;
+        //
+        // SOS is fetched on its own and never capped. It used to share one
+        // newest-first query with a limit of five, so an SOS sixth from the
+        // top of a burst was skipped — and the watermark then moved past it.
+        String select = "?select=id,member_name,member_avatar,type,place,created_at"
+                + (serverClock ? ",inserted_at" : "");
+        String window = "&" + col + "=gt." + enc(from)
+                // Only the device-reported clock needs a ceiling: the server's
+                // cannot run ahead of itself, and comparing it against this
+                // phone's clock would hide rows from a phone that runs slow.
+                + (serverClock ? "" : "&" + col + "=lte." + enc(SupabaseRest.toIso8601Utc(nowMs + FUTURE_SLACK_MS)))
+                + "&order=" + col + ".desc&limit=" + FETCH_LIMIT;
 
         SupabaseRest rest = new SupabaseRest(ctx);
-        String body = rest.getWithRefresh(path);
+        SupabaseRest.GetResult sosRes = rest.getResult("/rest/v1/my_checkin_feed" + select + window + "&type=eq.sos");
+        SupabaseRest.GetResult otherRes = rest.getResult("/rest/v1/my_checkin_feed" + select + window + "&type=in.(arrived,left)");
 
-        if (body == null) {
-            // The view is missing on a database that has not run the v13
-            // migration. Fall back to the pre-v13 query so an app that
-            // arrives ahead of its family's schema update still raises
-            // notifications, rather than going silently deaf.
-            Log.w(TAG, "sync: feed fetch failed — falling back to checkins");
-            body = rest.getWithRefresh("/rest/v1/checkins"
-                    + "?select=id,member_name,member_avatar,type,place,created_at"
+        if (sosRes.status == 404 || otherRes.status == 404) {
+            // The view does not exist: a database that never ran v13. Fall
+            // back to the table so an app ahead of its family's schema still
+            // raises notifications. ONLY on 404 — this query applies no
+            // mutes, and taking it on any failure (a timeout, an expired
+            // session) leaked muted notifications through.
+            Log.w(TAG, "sync: my_checkin_feed missing — falling back to checkins");
+            String base = "/rest/v1/checkins" + "?select=id,member_name,member_avatar,type,place,created_at"
                     + "&keep_id=eq." + enc(prefs.getKeepId())
                     + "&member_id=neq." + enc(prefs.getMemberId())
-                    + "&created_at=gt." + enc(since)
-                    + "&type=in.(arrived,left,sos)"
-                    + "&order=created_at.desc"
-                    + "&limit=" + MAX_PER_WAKE);
+                    + "&created_at=gt." + enc(from)
+                    + "&created_at=lte." + enc(SupabaseRest.toIso8601Utc(nowMs + FUTURE_SLACK_MS))
+                    + "&order=created_at.desc&limit=" + FETCH_LIMIT;
+            sosRes = rest.getResult(base + "&type=eq.sos");
+            otherRes = rest.getResult(base + "&type=in.(arrived,left)");
         }
-        if (body == null) { Log.w(TAG, "sync: fetch failed"); return; }
+        if (!sosRes.ok() || !otherRes.ok()) {
+            // Say so: a wake-up that fetched nothing is otherwise invisible,
+            // and it is exactly how a missed SOS would look from the outside.
+            prefs.journal("push: wake-up — feed fetch failed (" + sosRes.status + "/" + otherRes.status
+                    + "), nothing raised; retried on the next wake-up");
+            return;
+        }
 
-        JSONArray rows;
-        try { rows = new JSONArray(body); } catch (Exception e) {
-            Log.w(TAG, "sync: bad payload", e); return;
+        List<JSONObject> sos, others;
+        try {
+            sos = unseen(new JSONArray(sosRes.body), seen);
+            others = unseen(new JSONArray(otherRes.body), seen);
+        } catch (Exception e) {
+            Log.w(TAG, "sync: bad payload", e);
+            return;
         }
-        if (rows.length() == 0) return;
+
+        // Advance the watermark to the newest row either query returned —
+        // seen before or not — so it keeps moving even through a burst of
+        // rows already raised on an earlier wake.
+        String newest = mark;
+        for (String b : new String[] { sosRes.body, otherRes.body }) {
+            try {
+                JSONArray arr = new JSONArray(b);
+                for (int i = 0; i < arr.length(); i++) {
+                    String at = arr.optJSONObject(i) == null ? null : arr.optJSONObject(i).optString(col, null);
+                    if (at != null && (newest == null || parseIsoMs(at) > parseIsoMs(newest))) newest = at;
+                }
+            } catch (Exception ignored) {}
+        }
+
+        if (sos.isEmpty() && others.isEmpty()) {
+            if (newest != null) saveMark(prefs, serverClock, newest);
+            prefs.journal("push: wake-up → 0 new");
+            return;
+        }
 
         ensureChannels(ctx);
-        String newest = null;
-
-        // Rows arrive newest-first; walk backwards so the shade ends up in
-        // chronological order.
-        for (int i = rows.length() - 1; i >= 0; i--) {
-            JSONObject r = rows.optJSONObject(i);
-            if (r == null) continue;
-            String type   = r.optString("type", "");
-            String name   = r.optString("member_name", "Someone");
-            String avatar = r.optString("member_avatar", "📍");
-            String place  = r.optString("place", "");
-            String at     = r.optString("created_at", null);
-            if (newest == null || (at != null && at.compareTo(newest) > 0)) newest = at;
-
-            boolean sos = "sos".equals(type);
-            String title = sos
-                    ? "🆘 " + name + " sent an SOS"
-                    : avatar + " " + name + " " + ("arrived".equals(type) ? "arrived at" : "left") + " " + place;
-            String text = sos ? "Tap to see their location on the map" : "";
-            notify(ctx, r.optString("id", String.valueOf(i)), title, text, sos);
+        List<String> raised = new ArrayList<>();
+        // Every SOS, oldest first.
+        for (int i = sos.size() - 1; i >= 0; i--) {
+            JSONObject r = sos.get(i);
+            notify(ctx, r.optString("id", "sos-" + i),
+                    "🆘 " + r.optString("member_name", "Someone") + " sent an SOS",
+                    "Tap to see their location on the map", true);
+            raised.add(r.optString("id", null));
         }
+        // The newest MAX_PER_WAKE arrivals/departures, oldest first; the rest
+        // are summarised rather than silently dropped.
+        int shown = Math.min(MAX_PER_WAKE, others.size());
+        for (int i = shown - 1; i >= 0; i--) {
+            JSONObject r = others.get(i);
+            String type = r.optString("type", "");
+            notify(ctx, r.optString("id", "ci-" + i),
+                    r.optString("member_avatar", "📍") + " " + r.optString("member_name", "Someone") + " "
+                            + ("arrived".equals(type) ? "arrived at" : "left") + " " + r.optString("place", ""),
+                    "", false);
+        }
+        if (others.size() > shown) {
+            notify(ctx, "roamkeep-summary", "+" + (others.size() - shown) + " more updates",
+                    "Open Roamkeep to see them all", false);
+        }
+        for (JSONObject r : others) raised.add(r.optString("id", null));
 
-        if (newest != null) prefs.setLastPushSeen(newest);
-        prefs.journal("push: wake-up → " + rows.length() + " notification(s)");
+        prefs.addPushSeenIds(raised);
+        if (newest != null) saveMark(prefs, serverClock, newest);
+        prefs.journal("push: wake-up → " + (sos.size() + shown) + " notification(s)"
+                + (others.size() > shown ? " + " + (others.size() - shown) + " summarised" : ""));
+    }
+
+    /** Rows of `arr` (newest first) not already raised. */
+    private static List<JSONObject> unseen(JSONArray arr, Set<String> seen) {
+        List<JSONObject> out = new ArrayList<>();
+        for (int i = 0; i < arr.length(); i++) {
+            JSONObject r = arr.optJSONObject(i);
+            if (r == null) continue;
+            String id = r.optString("id", null);
+            if (id != null && seen.contains(id)) continue;
+            out.add(r);
+        }
+        return out;
+    }
+
+    private static void saveMark(PrefsStore prefs, boolean serverClock, String iso) {
+        if (serverClock) prefs.setLastPushSeenInserted(iso); else prefs.setLastPushSeen(iso);
+    }
+
+    /**
+     * Epoch-ms of a PostgREST timestamptz ("2026-09-23T10:33:48.581234+00:00"
+     * or "...Z"), or -1. Hand-rolled because java.time needs API 26 and this
+     * app supports 23. Sub-second digits are kept to the millisecond.
+     */
+    static long parseIsoMs(String s) {
+        if (s == null || s.length() < 19) return -1;
+        try {
+            java.text.SimpleDateFormat f = new java.text.SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss", java.util.Locale.US);
+            f.setTimeZone(java.util.TimeZone.getTimeZone("UTC"));
+            long ms = f.parse(s.substring(0, 19).replace(' ', 'T')).getTime();
+            int i = 19;
+            if (i < s.length() && s.charAt(i) == '.') {
+                int j = i + 1;
+                while (j < s.length() && Character.isDigit(s.charAt(j))) j++;
+                String frac = (s.substring(i + 1, j) + "000").substring(0, 3);
+                ms += Integer.parseInt(frac);
+                i = j;
+            }
+            if (i < s.length() && (s.charAt(i) == '+' || s.charAt(i) == '-')) {
+                int sign = s.charAt(i) == '+' ? 1 : -1;
+                String off = s.substring(i + 1).replace(":", "");
+                int hh = Integer.parseInt(off.substring(0, 2));
+                int mm = off.length() >= 4 ? Integer.parseInt(off.substring(2, 4)) : 0;
+                ms -= sign * (hh * 3_600_000L + mm * 60_000L);
+            }
+            return ms;
+        } catch (Exception e) {
+            return -1;
+        }
     }
 
     /**
@@ -254,7 +412,11 @@ public class RoamkeepMessagingService extends MessagingService {
                 PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
 
         NotificationCompat.Builder b = new NotificationCompat.Builder(ctx, sos ? CH_SOS : CH_PLACES)
-                .setSmallIcon(ctx.getApplicationInfo().icon)
+                // Alpha-only Roamkeep mark, tinted by the system like every
+                // other status-bar icon. The launcher icon used to go here,
+                // and Android flattens a full-colour icon to its alpha — a
+                // blank white blob.
+                .setSmallIcon(R.drawable.ic_stat_roamkeep)
                 .setContentTitle(title)
                 .setAutoCancel(true)
                 .setContentIntent(pi)

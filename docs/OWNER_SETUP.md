@@ -319,21 +319,32 @@ select (select schema_version from roamkeep_meta)                    as version,
        (select project_url    from roamkeep_meta)                    as url,
        (select count(*) from information_schema.columns
          where table_name = 'checkins'
-           and column_name in ('place_id','lat','lng'))              as checkin_cols,
+           and column_name in ('place_id','lat','lng','inserted_at')) as checkin_cols,
        (select count(*) from information_schema.tables
          where table_name = 'keep_notify_prefs')                     as prefs_table,
        (select count(*) from information_schema.routines
          where routine_name = 'checkin_recipients')                  as recipients_fn,
        (select count(*) from information_schema.views
          where table_name = 'my_checkin_feed')                       as feed_view,
+       (select count(*) from information_schema.routines
+         where routine_name in ('get_invite','prune_keep_history'))  as v16_fns,
        (select count(*) from pg_trigger
-         where tgname in ('on_checkin_notify','on_place_notify')
-           and not tgisinternal)                                     as triggers;
+         where tgname in ('on_checkin_notify','on_place_notify',
+                          'trg_checkin_normalise','trg_place_cap')
+           and not tgisinternal)                                     as triggers,
+       (select bool_and(prosrc like '%x-roamkeep-webhook%') from pg_proc
+         where proname = 'roamkeep_notify_checkin')                  as sends_secret;
 ```
 
-A finished v13 reads `version 13`, `url` set to **this** project,
-`checkin_cols 3`, `prefs_table 1`, `recipients_fn 1`, `feed_view 1`,
-`triggers 2`.
+A finished v16 reads `version 16`, `url` set to **this** project,
+`checkin_cols 4`, `prefs_table 1`, `recipients_fn 1`, `feed_view 1`,
+`v16_fns 2`, `triggers 4`, `sends_secret true`.
+
+(A finished v13–v15 reads `checkin_cols 3`, `v16_fns 0`, `triggers 2` and
+the rest the same.) If `sends_secret` is **false**, check-in notifications
+are being refused: re-run `db/schema.sql` once `url` is set — it replaces a
+notification trigger that doesn't send the secret. If it is empty, there is
+no check-in trigger at all; set `url` and re-run `db/schema.sql`.
 
 It counts objects rather than trusting `version` on purpose. The version
 number tells you which migration *last ran to completion* — it cannot

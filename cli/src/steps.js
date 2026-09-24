@@ -59,7 +59,7 @@ export async function applySchema(api, ref) {
  * needs: asserting it is strictly stronger than counting tables, because
  * the stamp only lands if everything before it in the file succeeded.
  */
-export const SCHEMA_VERSION = 15;
+export const SCHEMA_VERSION = 16;
 
 /**
  * The database's own schema version, or null if it predates the marker.
@@ -152,84 +152,71 @@ export async function configureAuth(api, ref) {
 }
 
 /**
- * Wire the checkins → notify-checkin webhook.
+ * The checkins → notify-checkin trigger, exactly as db/schema.sql defines it.
  *
- * Deliberately NOT `supabase_functions.http_request`, which is what the
- * dashboard's Webhooks UI generates. That helper lives in a
- * `supabase_functions` schema which only exists once someone has used
- * that UI — on a brand-new project it is absent and the trigger fails
- * with `schema "supabase_functions" does not exist`. Depending on it
- * would mean depending on the manual step this wizard exists to remove.
+ * Taken FROM schema.sql rather than written out here, because a second copy
+ * is precisely what broke push. Until 4.9.0 this step carried its own
+ * hand-written body — hardcoded URL, and no x-roamkeep-webhook header. v14
+ * added that header to schema.sql and taught notify-checkin to demand it,
+ * but this copy was never updated. Since this step runs AFTER the schema,
+ * every provision and every --upgrade replaced the working trigger with the
+ * header-less one, notify-checkin answered 403 to every check-in, and — the
+ * trigger being async and error-swallowing — arrive, leave and SOS push died
+ * in silence on every project the wizard touched.
  *
- * So we own the trigger function and call pg_net directly. The payload is
- * built to match the shape notify-checkin already parses, so the edge
- * function is identical whether it was wired by the wizard or by hand in
- * the dashboard.
- *
- * No Authorization header: the function is deployed --no-verify-jwt (the
- * dashboard's own webhooks are called the same way), so it needs none —
- * and this avoids writing a service-role key into a function body that
- * any sufficiently privileged role could read back.
+ * Deliberately NOT `supabase_functions.http_request` (the dashboard Webhooks
+ * helper): its schema only exists once someone has used that UI, so on a
+ * brand-new project it is absent. pg_net directly, as schema.sql does.
  */
-export async function createWebhook(api, ref) {
-  const url = `https://${ref}.supabase.co/functions/v1/notify-checkin`;
-  const sql = `
-    create extension if not exists pg_net;
-
-    create or replace function public.roamkeep_notify_checkin()
-      returns trigger
-      language plpgsql
-      security definer
-      set search_path = public, net
-    as $fn$
-    begin
-      perform net.http_post(
-        url     := '${url}',
-        headers := jsonb_build_object('Content-Type', 'application/json'),
-        body    := jsonb_build_object(
-                     'type',       'INSERT',
-                     'table',      'checkins',
-                     'schema',     'public',
-                     'record',     to_jsonb(new),
-                     'old_record', null
-                   ),
-        timeout_milliseconds := 5000
-      );
-      return new;
-    exception when others then
-      -- Push is best-effort: a webhook problem must never block the
-      -- check-in itself from being written.
-      return new;
-    end;
-    $fn$;
-
-    -- Trigger-only: fires from the trigger below, never as an RPC. Supabase's
-    -- default privileges grant EXECUTE on every new public function to anon and
-    -- authenticated by name, so revoking PUBLIC alone leaves it exposed at
-    -- /rest/v1/rpc/roamkeep_notify_checkin (Supabase advisor 0028/0029). Revoke
-    -- the client roles explicitly. Not exploitable either way — Postgres
-    -- refuses to run a trigger function called directly — but this keeps a
-    -- provisioned family's advisor clean.
-    revoke all on function public.roamkeep_notify_checkin() from public, anon, authenticated;
-
-    drop trigger if exists on_checkin_notify on public.checkins;
-    create trigger on_checkin_notify
-      after insert on public.checkins
-      for each row
-      execute function public.roamkeep_notify_checkin();`;
-  await api.query(ref, sql);
+export function webhookSql() {
+  const schema = readSchema().replace(/\r\n/g, '\n');
+  const start = schema.indexOf('CREATE OR REPLACE FUNCTION public.roamkeep_notify_checkin()');
+  const end = start < 0 ? -1 : schema.indexOf('$fn$;', start);
+  if (start < 0 || end < 0) {
+    throw new Error('could not find roamkeep_notify_checkin() in db/schema.sql');
+  }
+  const fn = schema.slice(start, end + '$fn$;'.length);
+  return [
+    'create extension if not exists pg_net;',
+    fn,
+    // Trigger-only: never an RPC. Supabase's default privileges grant EXECUTE
+    // on every new public function to anon and authenticated by name, so
+    // revoking PUBLIC alone leaves it at /rest/v1/rpc/ (advisor 0028/0029).
+    'revoke all on function public.roamkeep_notify_checkin() from public, anon, authenticated;',
+    'drop trigger if exists on_checkin_notify on public.checkins;',
+    'create trigger on_checkin_notify after insert on public.checkins '
+      + 'for each row execute function public.roamkeep_notify_checkin();',
+  ].join('\n\n');
 }
 
 /**
- * Both webhook triggers must exist.
+ * Wire the checkins → notify-checkin webhook.
+ *
+ * The body reads the URL from roamkeep_meta.project_url, so it must run
+ * after setProjectUrl — and refuses to install a trigger that would send
+ * nothing if that is still unset.
+ */
+export async function createWebhook(api, ref) {
+  const rows = await api.query(ref, `select project_url from roamkeep_meta;`);
+  const url = (Array.isArray(rows) ? rows[0] : rows)?.project_url;
+  if (!url) {
+    throw new Error('roamkeep_meta.project_url is not set — record the project URL first');
+  }
+  await api.query(ref, webhookSql());
+}
+
+/**
+ * Both webhook triggers must exist, and the check-in one must send the
+ * webhook secret.
  *
  * on_checkin_notify is created above (or by db/schema.sql on a project
  * that has never had one). on_place_notify comes from db/schema.sql only,
  * because place sync has to reach owners who upgrade by pasting that file
  * into the SQL editor rather than running this wizard.
  *
- * Checked together so a missing one is named rather than the pair being
- * reported as a single vague failure.
+ * The secret check is here because its absence is silent everywhere else:
+ * the trigger swallows errors and pg_net is async, so a header-less trigger
+ * looks wired and simply never gets a notification delivered.
  */
 export async function verifyWebhook(api, ref) {
   const rows = await api.query(ref, `
@@ -240,6 +227,12 @@ export async function verifyWebhook(api, ref) {
   const missing = ['on_checkin_notify', 'on_place_notify'].filter((t) => !found.has(t));
   if (missing.length) {
     throw new Error(`webhook trigger(s) missing: ${missing.join(', ')}`);
+  }
+  const src = await api.query(ref, `
+    select prosrc like '%x-roamkeep-webhook%' as sends_secret
+      from pg_proc where proname = 'roamkeep_notify_checkin';`);
+  if (!(Array.isArray(src) ? src[0] : src)?.sends_secret) {
+    throw new Error('roamkeep_notify_checkin does not send the webhook secret — notify-checkin will reject every call');
   }
   return true;
 }
@@ -306,12 +299,21 @@ const PROBE_PAYLOAD = {
   },
 };
 
-export async function probeFunction(ref, slug = 'notify-checkin') {
+/**
+ * Sends the webhook secret, as the real trigger does. Since v14 both
+ * functions answer 403 to a caller without it, so a probe that omitted it —
+ * as this one did until 4.9.0 — could never pass on a current project.
+ */
+export async function probeFunction(api, ref, slug = 'notify-checkin') {
   const body = { ...PROBE_PAYLOAD[slug] };
   if (body.record) body.record = { ...body.record, created_at: new Date().toISOString() };
+  const rows = await api.query(ref, `select webhook_secret from roamkeep_secrets;`).catch(() => null);
+  const secret = (Array.isArray(rows) ? rows[0] : rows)?.webhook_secret;
+  const headers = { 'Content-Type': 'application/json' };
+  if (secret) headers['x-roamkeep-webhook'] = secret;
   const res = await fetch(`https://${ref}.supabase.co/functions/v1/${slug}`, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers,
     body: JSON.stringify(body),
   });
   const text = await res.text();

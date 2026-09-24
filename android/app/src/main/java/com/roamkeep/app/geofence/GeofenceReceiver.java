@@ -28,12 +28,12 @@ import java.util.UUID;
  * Supabase, done.
  *
  * Uses goAsync() to hold the receiver alive while the HTTP request
- * runs on a worker thread. The Android docs guarantee ~10s of
- * wall-clock before the system can kill the receiver, which is
- * well above our 15s HTTP timeout budget — but on flaky networks
- * this can still fail. The SupabaseRest helper handles one 401
- * retry via token refresh; any other failure is logged and the
- * transition is lost. No retry queue yet (see follow-up).
+ * runs on a worker thread. That buys a bounded window (the broadcast
+ * timeout), and a chain of 15 s HTTP timeouts on a bad link can outlast
+ * it — which is why every check-in is written to the pending queue
+ * BEFORE its POST and leaves it only once it has landed: a process
+ * killed mid-request loses nothing. The SupabaseRest helper handles one
+ * 401 retry via token refresh.
  */
 public class GeofenceReceiver extends BroadcastReceiver {
     private static final String TAG = "RoamkeepGeo";
@@ -69,8 +69,10 @@ public class GeofenceReceiver extends BroadcastReceiver {
         // While the member has self-paused, ignore transitions entirely —
         // don't write check-ins and don't re-register dropped fences. The
         // fences are unregistered on pause, but a straggler intent could
-        // still arrive; drop it.
-        if (new PrefsStore(context.getApplicationContext()).isPaused()) return;
+        // still arrive; drop it. Same for a device the server has stopped
+        // accepting writes from (member removed — see LocationUpdateReceiver).
+        PrefsStore gate = new PrefsStore(context.getApplicationContext());
+        if (gate.isPaused() || gate.isServerRejected()) return;
         if (event.hasError()) {
             Log.w(TAG, "geofence event error code: " + event.getErrorCode());
             // GEOFENCE_NOT_AVAILABLE (1000): Play Services dropped ALL
@@ -306,14 +308,28 @@ public class GeofenceReceiver extends BroadcastReceiver {
                 ci.put("place_id", placeId);
                 ci.put("created_at", isoTime);
 
+                // WRITE-AHEAD. Queue first, POST second, and only a landed
+                // row leaves the queue. State flipped above, before this, so
+                // if the process died mid-request — memory pressure, or the
+                // broadcast deadline passing on a slow link — the check-in
+                // used to be lost with nothing to re-send it: never queued,
+                // and state already saying the crossing was handled.
+                prefs.appendPendingCheckin(ci);
                 SupabaseRest.Result ciResult = rest.insertCheckin(ci);
-                if (ciResult == SupabaseRest.Result.FAILED) {
+                if (ciResult == SupabaseRest.Result.SUCCESS || ciResult == SupabaseRest.Result.DUPLICATE) {
+                    prefs.removePendingCheckin(ci.optString("id", null));
+                } else if (ciResult == SupabaseRest.Result.REJECTED) {
+                    // The server will never take this payload; keeping it
+                    // would only wedge the queue behind it.
+                    prefs.removePendingCheckin(ci.optString("id", null));
+                    prefs.journal("geo: " + type + " " + p.name + " refused by server ("
+                            + rest.lastSqlState() + ") — dropped");
+                } else {
                     // Network blip at the boundary crossing — most
                     // commonly a WiFi → cellular handoff while leaving
-                    // home. Park the payload; the next breadcrumb fire
+                    // home. It is already queued; the next breadcrumb fire
                     // (seconds away on the move), geofence fire, or app
                     // launch will retry it.
-                    prefs.appendPendingCheckin(ci);
                     prefs.journal("geo: " + type + " " + p.name + " POST failed — queued");
                     Log.w(TAG, "checkin insert failed for " + p.name + " — queued for retry (pending=" + prefs.pendingCount() + ")");
                     // Don't `continue` — still try to push the live
@@ -367,13 +383,14 @@ public class GeofenceReceiver extends BroadcastReceiver {
     }
 
     /** Iterate the pending-checkin queue, retry each entry, drop on
-     *  success or 409 (already there). Static so the
-     *  NativeGeofencePlugin's flushPending() entrypoint can reuse it
+     *  success, duplicate (already there) or a permanent rejection. Static
+     *  so the NativeGeofencePlugin's flushPending() entrypoint can reuse it
      *  without instantiating a receiver. */
     static int drainPendingCheckins(PrefsStore prefs, SupabaseRest rest) {
         List<JSONObject> pending = prefs.getPendingCheckins();
         if (pending.isEmpty()) return 0;
-        int drained = 0;
+        int drained = 0, dropped = 0;
+        String droppedWhy = null;
         for (JSONObject entry : pending) {
             String id = entry.optString("id", null);
             if (id == null) {
@@ -385,16 +402,29 @@ public class GeofenceReceiver extends BroadcastReceiver {
             if (r == SupabaseRest.Result.SUCCESS || r == SupabaseRest.Result.DUPLICATE) {
                 prefs.removePendingCheckin(id);
                 drained++;
+            } else if (r == SupabaseRest.Result.REJECTED) {
+                // The server refused this payload and always will. It used
+                // to stop the drain like a network failure, so one such
+                // entry at the head held every later check-in back until 50
+                // newer ones pushed it out of the queue.
+                prefs.removePendingCheckin(id);
+                dropped++;
+                droppedWhy = rest.lastSqlState();
             } else {
-                // Stop on first hard failure — the network is still
+                // Stop on first transient failure — the network is still
                 // down (or our token can't refresh). Try again next
-                // fire. Avoids burning 50 PATCHes against a dead link.
-                Log.w(TAG, "drain stalled at " + id + "; " + (pending.size() - drained) + " still pending");
+                // fire. Avoids burning 50 POSTs against a dead link.
+                Log.w(TAG, "drain stalled at " + id + "; " + (pending.size() - drained - dropped) + " still pending");
                 break;
             }
         }
         if (drained > 0) {
             Log.i(TAG, "drained " + drained + " pending checkin(s)");
+        }
+        if (dropped > 0) {
+            // Say how many: a drop is otherwise invisible, and the journal
+            // is the only witness this path has.
+            prefs.journal("drain: dropped " + dropped + " check-in(s) the server refused (" + droppedWhy + ")");
         }
         return drained;
     }
@@ -531,9 +561,18 @@ public class GeofenceReceiver extends BroadcastReceiver {
                 ci.put("place", p.icon + " " + p.name);
                 ci.put("place_id", p.id);
                 ci.put("created_at", toIso8601Utc(whenMs));
-                if (rest.insertCheckin(ci) == SupabaseRest.Result.FAILED) {
-                    prefs.appendPendingCheckin(ci);
+                // Write-ahead, as in handleTransitions: queued before the
+                // POST, removed once it lands or is refused for good.
+                prefs.appendPendingCheckin(ci);
+                SupabaseRest.Result rr = rest.insertCheckin(ci);
+                if (rr == SupabaseRest.Result.FAILED) {
                     prefs.journal("geo: arrived " + p.name + " POST failed — queued");
+                } else {
+                    prefs.removePendingCheckin(ci.optString("id", null));
+                    if (rr == SupabaseRest.Result.REJECTED) {
+                        prefs.journal("geo: arrived " + p.name + " refused by server ("
+                                + rest.lastSqlState() + ") — dropped");
+                    }
                 }
                 JSONObject upd = new JSONObject();
                 upd.put("last_place_id", p.id);

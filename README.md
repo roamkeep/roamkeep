@@ -118,10 +118,8 @@ available on request — see the contact in [`LICENSE`](LICENSE).
 Roamkeep is free, has no paid features, and runs no author-operated tier — the
 model is deliberately **self-host plus donations**. If it's useful to your
 family and you'd like to help cover the cost of the one shared piece (the push
-relay) and continued development, you can chip in:
-
-- **GitHub Sponsors** — https://github.com/sponsors/roamkeep
-- **Ko-fi** — https://ko-fi.com/Roamkeep
+relay) and continued development, you can chip in on
+[**Ko-fi**](https://ko-fi.com/Roamkeep).
 
 Donations support development only; they don't unlock features (there aren't
 any to unlock) and confer no commercial license — see the section above for

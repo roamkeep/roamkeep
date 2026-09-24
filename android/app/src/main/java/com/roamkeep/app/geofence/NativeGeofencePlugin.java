@@ -381,6 +381,13 @@ public class NativeGeofencePlugin extends Plugin {
         prefs.setContext(supabaseUrl, anonKey, userId, keepId, memberId, memberName, memberAvatar);
         prefs.setTokens(accessToken, refreshToken);
 
+        // The app only gets here with a membership it has just read back from
+        // the server, so a "server rejected this member" stop is over — clear
+        // it, and the streak that set it. Everything else re-arms below.
+        if (prefs.isServerRejected()) prefs.journal("app: membership confirmed — server-rejected stop cleared");
+        prefs.setServerRejected(false);
+        prefs.resetRejectStreak();
+
         // Mirror the database's schema version so the headless write path
         // can tell whether an optional column exists before it writes one.
         // JS leaves this absent when the version could NOT be read (offline,

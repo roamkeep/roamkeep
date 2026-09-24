@@ -346,7 +346,7 @@ async function main() {
 
   results.ext = await step(3, 'Enabling database extensions', () => steps.enableExtensions(api, ref));
   if (results.ext.ok && !results.ext.out.pg_cron) {
-    log.warn('pg_cron unavailable — old breadcrumbs will be pruned by the app rather than the server. Harmless.');
+    log.warn('pg_cron unavailable — breadcrumbs and check-ins older than 7 days will be deleted when a family member opens the app, not nightly by the server. Enable pg_cron (Database → Extensions) and re-run to guarantee it.');
   }
 
   results.schema = await step(4, 'Applying the Roamkeep schema', () => steps.applySchema(api, ref),
@@ -419,7 +419,7 @@ async function main() {
     await step(10, 'Checking the functions answer on THIS project', async () => {
       const results = {};
       for (const slug of steps.FUNCTIONS) {
-        const r = await steps.probeFunction(ref, slug);
+        const r = await steps.probeFunction(api, ref, slug);
         if (r.status === 404) {
           throw new Error(
             `${slug} not found on ${ref} — it was probably deployed to a different ` +
@@ -502,7 +502,6 @@ async function main() {
     'useful to your family, you can help cover the push relay and keep',
     'development going:',
     '',
-    '  ' + color.cyan('https://github.com/sponsors/roamkeep'),
     '  ' + color.cyan('https://ko-fi.com/roamkeep'),
     '',
     'Entirely optional — nothing here is gated behind it.',

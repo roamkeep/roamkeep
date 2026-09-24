@@ -72,17 +72,51 @@ const RELAY_BATCH = 20;   // relay's per-call token cap
  * because most owners will never run the command — and a check that is off
  * for most deployments is not a check.
  *
- * `undefined` = not looked up yet. `null` = looked up, nothing there, which
- * is the expand case: a function deployed against a database that has not
- * run the v14 migration keeps working exactly as it did before.
+ * `null` = looked up, no secret there, which is the expand case: a function
+ * deployed against a database that has not run the v14 migration keeps
+ * working exactly as it did before.
+ *
+ * FAILS CLOSED. Until 4.9.0 a lookup that ERRORED was also cached as null,
+ * for the life of the isolate — so one database blip during a cold start
+ * switched the check off, and anyone who knew the project ref could invoke
+ * this function until the isolate recycled. Only a missing TABLE means
+ * "pre-v14"; any other error answers 503 and is not cached.
+ *
+ * Cached for SECRET_TTL_MS, not forever: rotating the secret after an
+ * incident used to leave warm isolates rejecting the new one until they
+ * happened to recycle, which is a push outage of unknown length.
  */
-let cachedSecret: string | null | undefined;
+const SECRET_TTL_MS = 10 * 60 * 1000;
+let cachedSecret: { value: string | null; at: number } | undefined;
 
 async function webhookSecret(sb: ReturnType<typeof createClient>): Promise<string | null> {
-  if (cachedSecret !== undefined) return cachedSecret;
-  const { data } = await sb.from('roamkeep_secrets').select('webhook_secret').maybeSingle();
-  cachedSecret = (data as { webhook_secret?: string } | null)?.webhook_secret ?? null;
-  return cachedSecret;
+  if (cachedSecret && Date.now() - cachedSecret.at < SECRET_TTL_MS) return cachedSecret.value;
+  const { data, error } = await sb.from('roamkeep_secrets').select('webhook_secret').maybeSingle();
+  if (error) {
+    // 42P01 from Postgres, PGRST205 from PostgREST: the table does not exist.
+    if (error.code === '42P01' || error.code === 'PGRST205') {
+      cachedSecret = { value: null, at: Date.now() };
+      return null;
+    }
+    throw new Error(`webhook secret lookup failed: ${error.code || error.message}`);
+  }
+  const value = (data as { webhook_secret?: string } | null)?.webhook_secret ?? null;
+  cachedSecret = { value, at: Date.now() };
+  return value;
+}
+
+/** Constant-time comparison: hash both sides, then compare every byte. */
+async function secretMatches(got: string | null, want: string): Promise<boolean> {
+  if (got === null) return false;
+  const enc = new TextEncoder();
+  const [a, b] = await Promise.all([
+    crypto.subtle.digest('SHA-256', enc.encode(got)),
+    crypto.subtle.digest('SHA-256', enc.encode(want)),
+  ]);
+  const x = new Uint8Array(a), y = new Uint8Array(b);
+  let diff = 0;
+  for (let i = 0; i < x.length; i++) diff |= x[i] ^ y[i];
+  return diff === 0;
 }
 
 /**
@@ -141,8 +175,14 @@ Deno.serve(async (req) => {
   // the project ref could invoke it — and the ref is in every setup link
   // and QR code. Checked before the body is read, so a forged call is
   // rejected as cheaply as possible.
-  const want = await webhookSecret(sb);
-  if (want && req.headers.get('x-roamkeep-webhook') !== want) {
+  let want: string | null;
+  try {
+    want = await webhookSecret(sb);
+  } catch (e) {
+    console.error(String(e));
+    return new Response('secret unavailable', { status: 503 });
+  }
+  if (want !== null && !(await secretMatches(req.headers.get('x-roamkeep-webhook'), want))) {
     return new Response('forbidden', { status: 403 });
   }
 
@@ -178,7 +218,7 @@ Deno.serve(async (req) => {
   if (!recipients.length) return new Response('no recipients', { status: 200 });
 
   const relayUrl = relayEndpoint();
-  const dead: string[] = [];
+  const dead: Recipient[] = [];
   let sent = 0;
 
   // Push is BEST-EFFORT. The check-in row is already committed, so a
@@ -203,20 +243,21 @@ Deno.serve(async (req) => {
       // `stale` is a list of INDICES into the batch we sent.
       for (const idx of (out?.stale ?? [])) {
         const r = batch[idx];
-        // checkin_recipients() names the column member_id, not id.
-        if (r) dead.push(r.member_id);
+        if (r) dead.push(r);
       }
     } catch (e) {
       console.warn('relay call failed', e);
     }
   }
 
-  if (dead.length) {
-    // Null out stale tokens so we stop trying. The next time the
-    // affected device opens the app, the registration listener
-    // re-populates with a fresh token. Since v14 the token lives in
-    // keep_member_push, keyed on member_id.
-    await sb.from('keep_member_push').update({ fcm_token: null }).in('member_id', dead);
+  // Null out stale tokens so we stop trying. The next time the affected
+  // device opens the app (or FCM hands it a new token), it re-registers.
+  // Matched on the TOKEN as well as the member: a device can register a
+  // fresh token between the recipient read above and this write, and
+  // clearing by member_id alone wiped that fresh token too.
+  for (const r of dead) {
+    await sb.from('keep_member_push').update({ fcm_token: null })
+      .eq('member_id', r.member_id).eq('fcm_token', r.fcm_token);
   }
 
   return new Response(

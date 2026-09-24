@@ -107,6 +107,27 @@ check('notify-checkin source is readable', fn.length > 500);
 check('function targets the relay, not FCM directly',
   fn.includes('relayEndpoint') && !fn.includes('fcm.googleapis.com'));
 
+// The wizard's check-in trigger once carried its own hand-written body with
+// no x-roamkeep-webhook header, and since it runs after the schema it
+// replaced the working trigger on every provision and --upgrade: notify-
+// checkin answered 403 to every check-in, silently. It now takes the body
+// from schema.sql; these pin both halves of that.
+{
+  const sql = steps.webhookSql();
+  check('wizard webhook sends the x-roamkeep-webhook secret',
+    sql.includes("'x-roamkeep-webhook'") && sql.includes('roamkeep_secrets'));
+  check('wizard webhook reads the URL from roamkeep_meta, not a hardcoded one',
+    sql.includes('FROM roamkeep_meta') && !/https:\/\/[a-z0-9]+\.supabase\.co/.test(sql));
+  check('wizard webhook is taken verbatim from schema.sql',
+    schema.replace(/\r\n/g, '\n').includes(
+      sql.split('\n\n').find((s) => s.includes('CREATE OR REPLACE FUNCTION public.roamkeep_notify_checkin()'))));
+  check('probeFunction takes the api client (it reads the secret)', steps.probeFunction.length >= 2);
+  const stamp = (schema.match(/VALUES \(true, (\d+)\)\s*ON CONFLICT[\s\S]*?GREATEST\(roamkeep_meta\.schema_version, (\d+)\)/) || []);
+  check('SCHEMA_VERSION matches the version schema.sql stamps',
+    Number(stamp[1]) === steps.SCHEMA_VERSION && Number(stamp[2]) === steps.SCHEMA_VERSION,
+    `schema.sql ${stamp[1]}/${stamp[2]}, steps.js ${steps.SCHEMA_VERSION}`);
+}
+
 console.log('\nwizard: landing assets');
 
 const al = JSON.parse(fs.readFileSync(path.join(REPO, 'landing', '.well-known', 'assetlinks.json'), 'utf8'));

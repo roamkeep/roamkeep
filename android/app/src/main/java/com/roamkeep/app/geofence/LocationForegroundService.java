@@ -28,6 +28,7 @@ import com.google.android.gms.location.LocationRequest;
 import com.google.android.gms.location.LocationResult;
 import com.google.android.gms.location.LocationServices;
 import com.google.android.gms.location.Priority;
+import com.roamkeep.app.R;
 
 import java.util.Collections;
 import java.util.List;
@@ -148,31 +149,37 @@ public class LocationForegroundService extends Service {
     private volatile long dozeMsSinceFix = 0;
     private volatile long dozeEnteredMs = 0;
 
-    // ── The dismissable "permanent" notification ──────────────────────
+    // ── The "permanent" notification, and what Android allows ─────────
     //
-    // From Android 13 a user can SWIPE AWAY a foreground-service
-    // notification. setOngoing(true) no longer prevents it — that flag
-    // only ever stopped a clear-all, and 13 deliberately handed the
-    // dismissal back to the user. The service keeps running; only the
-    // notification goes.
+    // Android 13 made foreground-service notifications dismissable by
+    // default, but setOngoing(true) still held them in place. Android 14
+    // took that away for every app: an ongoing notification can now be
+    // swiped, and stays put only on the lock screen and against "Clear
+    // all". The exemptions — calls, media sessions, enterprise device
+    // policy — do not describe a location app, and borrowing one of their
+    // styles would be misrepresentation. No API makes this notification
+    // undismissable on 14+. setOngoing(true) is still set below, because
+    // on 13, on the lock screen and against Clear all it still works.
     //
-    // It is posted once, by startForeground() in onStartCommand, and
-    // onStartCommand does not fire again while the service is already
-    // alive. So once dismissed it stayed dismissed for the whole session
-    // — which quietly falsified the claim in landing/privacy that
-    // Roamkeep "shows a permanent notification whenever it is recording
-    // your location", and left tracking running with nothing on screen
-    // to say so.
+    // It is posted once, by startForeground() in onStartCommand, which does
+    // not fire again while the service lives. So a swipe used to leave
+    // tracking running with nothing on screen to say so — quietly
+    // falsifying landing/privacy's "shows a permanent notification
+    // whenever it is recording your location".
     //
-    // So: notice it is gone and put it back, at the next moment tracking
-    // actually happens. Re-posting the same id on an IMPORTANCE_LOW
-    // channel makes no sound, no vibration and no heads-up — it simply
-    // reappears in the shade alongside everything else.
+    // So the notification carries a deleteIntent, and a swipe re-posts it
+    // at once (NotificationRestoreReceiver -> onTrackingNotificationDismissed).
+    // Same id on an IMPORTANCE_LOW channel: no sound, no vibration, no
+    // heads-up — it simply reappears. That is the closest to "cannot be
+    // dismissed" the platform allows, and for an app that is recording
+    // someone's location, the disclosure staying on screen is the point.
     //
-    // Deliberately NOT instant-on-dismiss (a deleteIntent that re-posts
-    // immediately). That reads as the app fighting the user's swipe. It
-    // comes back on the next location fix or the next 5-minute re-arm,
-    // because that is when the disclosure is due again.
+    // This replaced restoring at the next fix (up to one 5-minute re-arm
+    // later), which was chosen so as not to fight the user's swipe.
+    // Keeping the disclosure continuously visible was judged to matter
+    // more. The per-fix check (restoreNotificationIfDismissed) stays as the
+    // backstop, for a deleteIntent the system never delivered.
+    private static final int DISMISS_REQ = 4712;
     private volatile long lastNotifRestoreJournalMs = 0;
     private volatile int  restoresSinceJournal = 0;
     // Journal restorations at most this often. One swipe is worth a line;
@@ -266,8 +273,10 @@ public class LocationForegroundService extends Service {
                         // order. A doze exit landing beside a callback
                         // delivery was one of the ways two batches used to
                         // read the same state and clobber each other.
+                        // forcePin: the family should see the phone catch up
+                        // the moment it wakes, whatever the pin cadence says.
                         LocationUpdateReceiver.submit(getApplicationContext(),
-                                Collections.singletonList(loc), null);
+                                Collections.singletonList(loc), null, true);
                     })
                     .addOnFailureListener(e -> Log.w(TAG, "doze-exit getCurrentLocation failed", e));
         } catch (SecurityException e) {
@@ -424,8 +433,11 @@ public class LocationForegroundService extends Service {
         // paused, stop right back out instead of arming location. We had to
         // startForeground first (the startForegroundService contract), so
         // drop the notification on the way out.
-        if (new PrefsStore(this).isPaused()) {
-            new PrefsStore(this).journal("fgs: start skipped (paused)");
+        // The same for a device the server has stopped accepting writes from
+        // (see LocationUpdateReceiver.stopForServerRejection).
+        final PrefsStore gate = new PrefsStore(this);
+        if (gate.isPaused() || gate.isServerRejected()) {
+            gate.journal("fgs: start skipped (" + (gate.isPaused() ? "paused" : "server rejected this member") + ")");
             stopForeground(true);
             stopSelf();
             return START_NOT_STICKY;
@@ -508,7 +520,12 @@ public class LocationForegroundService extends Service {
     }
 
     /**
-     * Put the tracking notification back if the user swiped it away.
+     * BACKSTOP: put the tracking notification back if it is missing.
+     *
+     * A swipe is normally undone at once by the deleteIntent path
+     * (onTrackingNotificationDismissed). This runs on every fix and every
+     * re-arm for the case that path cannot see — a deleteIntent the system
+     * never delivered — so the worst case stays one re-arm period.
      *
      * Checked rather than re-posted blindly: getActiveNotifications() is
      * cheap, and a needless notify() every five minutes would churn the
@@ -531,8 +548,8 @@ public class LocationForegroundService extends Service {
         // read came back empty, so the journal reported a dismissal that
         // never happened — a line claiming something untrue, in a journal
         // whose only value is being believed. Nobody can swipe a
-        // notification they have not seen yet; if they do, the next fix or
-        // the 5-minute re-arm catches it.
+        // notification they have not seen yet; if they do, the deleteIntent
+        // path restores it regardless of this window.
         if (System.currentTimeMillis() - promotedAtMs < PROMOTE_SETTLE_MS) return;
         // Notifications switched off for the app entirely: there is no
         // notification to restore and notify() would throw on every fix.
@@ -547,13 +564,47 @@ public class LocationForegroundService extends Service {
                 if (sbn.getId() == NOTIF_ID) { present = true; break; }
             }
             if (present) return;
+            repostNotification();
+        } catch (Exception e) {
+            // getActiveNotifications can throw on some OEM builds. Not worth
+            // killing the tracking service over.
+            Log.w(TAG, "notification check failed", e);
+        }
+    }
 
+    /**
+     * The user just swiped the tracking notification away (its deleteIntent
+     * fired). Called on the main thread by NotificationRestoreReceiver.
+     *
+     * A no-op unless this process is running the service: if it is not,
+     * nothing is being recorded and there is nothing to disclose. The
+     * system does not fire a deleteIntent when the app itself removes the
+     * notification — stopForeground on pause, stopSelf — so a pause never
+     * brings it back; the pause check below is belt and braces.
+     */
+    static void onTrackingNotificationDismissed() {
+        LocationForegroundService svc = instance;
+        if (svc == null || !svc.promoted) return;
+        if (new PrefsStore(svc).isPaused()) return;
+        svc.repostNotification();
+    }
+
+    /** Put the tracking notification back and journal it, rate-limited.
+     *  Shared by the immediate deleteIntent path and the per-fix backstop. */
+    private void repostNotification() {
+        // Notifications switched off for the app entirely: there is nothing
+        // to restore and notify() would throw. The setup sheet is what asks
+        // for this permission, and it already flags the absence.
+        if (!NotificationManagerCompat.from(this).areNotificationsEnabled()) return;
+        NotificationManager nm = (NotificationManager) getSystemService(Context.NOTIFICATION_SERVICE);
+        if (nm == null) return;
+        try {
             createChannel();
             nm.notify(NOTIF_ID, buildNotification());
 
-            // Rate-limited so one swipe reads clearly and a pathological
-            // loop cannot drown the journal — the count carries what the
-            // suppressed lines would have said.
+            // Rate-limited so one swipe reads clearly and someone swiping
+            // repeatedly cannot drown the journal — the count carries what
+            // the suppressed lines would have said.
             restoresSinceJournal++;
             long now = System.currentTimeMillis();
             if (now - lastNotifRestoreJournalMs >= RESTORE_JOURNAL_EVERY_MS) {
@@ -564,9 +615,8 @@ public class LocationForegroundService extends Service {
                 restoresSinceJournal = 0;
             }
         } catch (Exception e) {
-            // getActiveNotifications can throw on some OEM builds, and
-            // notify() throws without POST_NOTIFICATIONS on API 33+.
-            // Neither is worth killing the tracking service over.
+            // notify() throws without POST_NOTIFICATIONS on API 33+. Not
+            // worth killing the tracking service over.
             Log.w(TAG, "notification restore failed", e);
         }
     }
@@ -579,13 +629,24 @@ public class LocationForegroundService extends Service {
                     | (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M ? PendingIntent.FLAG_IMMUTABLE : 0);
             tap = PendingIntent.getActivity(this, 0, launch, flags);
         }
+        // Fired by the system when the user swipes the notification away —
+        // not when the app removes it — so it can be put straight back. See
+        // the note on the "permanent" notification above.
+        PendingIntent onDismiss = PendingIntent.getBroadcast(this, DISMISS_REQ,
+                new Intent(this, NotificationRestoreReceiver.class),
+                PendingIntent.FLAG_UPDATE_CURRENT
+                        | (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M ? PendingIntent.FLAG_IMMUTABLE : 0));
         return new NotificationCompat.Builder(this, CHANNEL_ID)
                 .setContentTitle("🏰 Roamkeep")
                 .setContentText("Keeping track of where your family roams")
-                .setSmallIcon(android.R.drawable.ic_menu_mylocation)
+                // The Roamkeep mark as an alpha-only glyph: the system tints
+                // it to match the other status-bar icons. No setColor(), so
+                // the shade uses the system colour too.
+                .setSmallIcon(R.drawable.ic_stat_roamkeep)
                 .setOngoing(true)
                 .setPriority(NotificationCompat.PRIORITY_LOW)
                 .setContentIntent(tap)
+                .setDeleteIntent(onDismiss)
                 .build();
     }
 }

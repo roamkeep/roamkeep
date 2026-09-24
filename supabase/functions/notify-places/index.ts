@@ -77,16 +77,43 @@ const RELAY_BATCH = 20;   // relay's per-call token cap
  * and this function reads the same row with the service-role key — so there
  * is nothing for an owner to configure and no way for the two to drift.
  *
- * `undefined` = not looked up. `null` = nothing there, which leaves the
- * check open so a function deployed ahead of the v14 migration keeps working.
+ * `null` = no secret there, which leaves the check open so a function
+ * deployed ahead of the v14 migration keeps working.
+ *
+ * Fails CLOSED on any other lookup error (503, not cached), and expires after
+ * SECRET_TTL_MS so a rotated secret is picked up — see notify-checkin, where
+ * the reasoning is written out.
  */
-let cachedSecret: string | null | undefined;
+const SECRET_TTL_MS = 10 * 60 * 1000;
+let cachedSecret: { value: string | null; at: number } | undefined;
 
 async function webhookSecret(sb: ReturnType<typeof createClient>): Promise<string | null> {
-  if (cachedSecret !== undefined) return cachedSecret;
-  const { data } = await sb.from('roamkeep_secrets').select('webhook_secret').maybeSingle();
-  cachedSecret = (data as { webhook_secret?: string } | null)?.webhook_secret ?? null;
-  return cachedSecret;
+  if (cachedSecret && Date.now() - cachedSecret.at < SECRET_TTL_MS) return cachedSecret.value;
+  const { data, error } = await sb.from('roamkeep_secrets').select('webhook_secret').maybeSingle();
+  if (error) {
+    if (error.code === '42P01' || error.code === 'PGRST205') {
+      cachedSecret = { value: null, at: Date.now() };
+      return null;
+    }
+    throw new Error(`webhook secret lookup failed: ${error.code || error.message}`);
+  }
+  const value = (data as { webhook_secret?: string } | null)?.webhook_secret ?? null;
+  cachedSecret = { value, at: Date.now() };
+  return value;
+}
+
+/** Constant-time comparison: hash both sides, then compare every byte. */
+async function secretMatches(got: string | null, want: string): Promise<boolean> {
+  if (got === null) return false;
+  const enc = new TextEncoder();
+  const [a, b] = await Promise.all([
+    crypto.subtle.digest('SHA-256', enc.encode(got)),
+    crypto.subtle.digest('SHA-256', enc.encode(want)),
+  ]);
+  const x = new Uint8Array(a), y = new Uint8Array(b);
+  let diff = 0;
+  for (let i = 0; i < x.length; i++) diff |= x[i] ^ y[i];
+  return diff === 0;
 }
 
 /** Accept RELAY_URL with or without the endpoint path — see notify-checkin. */
@@ -127,8 +154,14 @@ Deno.serve(async (req) => {
   // Deployed --no-verify-jwt, so without this anyone who knew the project
   // ref could invoke it and wake every device in a keep, repeatedly. See
   // notify-checkin. Checked before the body is read.
-  const want = await webhookSecret(sb);
-  if (want && req.headers.get('x-roamkeep-webhook') !== want) {
+  let want: string | null;
+  try {
+    want = await webhookSecret(sb);
+  } catch (e) {
+    console.error(String(e));
+    return new Response('secret unavailable', { status: 503 });
+  }
+  if (want !== null && !(await secretMatches(req.headers.get('x-roamkeep-webhook'), want))) {
     return new Response('forbidden', { status: 403 });
   }
 
@@ -162,7 +195,7 @@ Deno.serve(async (req) => {
   if (!recipients.length) return new Response('no recipients', { status: 200 });
 
   const relayUrl = relayEndpoint();
-  const dead: string[] = [];
+  const dead: Recipient[] = [];
   let sent = 0;
 
   // Best-effort, exactly like notify-checkin: the keep_places row is
@@ -187,17 +220,18 @@ Deno.serve(async (req) => {
       // `stale` is a list of INDICES into the batch we sent.
       for (const idx of (out?.stale ?? [])) {
         const r = batch[idx];
-        // keep_push_recipients() names the column member_id, not id.
-        if (r) dead.push(r.member_id);
+        if (r) dead.push(r);
       }
     } catch (e) {
       console.warn('relay call failed', e);
     }
   }
 
-  if (dead.length) {
-    // Since v14 the token lives in keep_member_push, keyed on member_id.
-    await sb.from('keep_member_push').update({ fcm_token: null }).in('member_id', dead);
+  // Matched on the token as well as the member, so a token re-registered
+  // since the recipient read is not wiped — see notify-checkin.
+  for (const r of dead) {
+    await sb.from('keep_member_push').update({ fcm_token: null })
+      .eq('member_id', r.member_id).eq('fcm_token', r.fcm_token);
   }
 
   return new Response(

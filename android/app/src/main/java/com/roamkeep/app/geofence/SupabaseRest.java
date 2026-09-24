@@ -14,6 +14,7 @@ import java.io.InputStreamReader;
 import java.io.OutputStream;
 import java.net.HttpURLConnection;
 import java.net.URL;
+import java.net.URLEncoder;
 import java.nio.charset.StandardCharsets;
 
 /**
@@ -39,33 +40,60 @@ public class SupabaseRest {
      *  already consumed. */
     private static final String CAP_PREFS_NAME = "CapacitorStorage";
 
+    /** One refresh at a time, process-wide. The geofence worker, the
+     *  location worker, the messaging service and the plugin's flush thread
+     *  can all hit an expired token in the same second; without this each
+     *  spent the same refresh token. */
+    private static final Object REFRESH_LOCK = new Object();
+
+    /** PostgREST's SQLSTATE for "new row violates row-level security". */
+    static final String RLS_DENIED = "42501";
+
     private final Context appCtx;
     private final PrefsStore prefs;
+
+    /** SQLSTATE of this instance's most recent failed request, or null. */
+    private volatile String lastSqlState;
 
     public SupabaseRest(Context ctx) {
         this.appCtx = ctx.getApplicationContext();
         this.prefs = new PrefsStore(ctx);
     }
 
-    /** Outcome buckets for callers that need to distinguish "row already
-     *  landed" (a duplicate retry hitting the primary-key UNIQUE
-     *  constraint) from real failures. The retry queue treats DUPLICATE
-     *  as success — the row IS in the DB, we just didn't see the 2xx
-     *  the first time around. */
-    public enum Result { SUCCESS, DUPLICATE, FAILED }
+    /** SQLSTATE of the last failed request made through this instance —
+     *  "never a row value" (see sqlStateOf), so safe to log and branch on. */
+    public String lastSqlState() { return lastSqlState; }
+
+    /** Outcome buckets for callers that need to tell a row that landed from
+     *  one that will land later and one that never will.
+     *
+     *  SUCCESS   — inserted now.
+     *  DUPLICATE — already there: a retry hit the primary key (23505). The
+     *              row IS in the DB; we just missed the first 2xx.
+     *  FAILED    — transient (network, 5xx, an expired session): keep it
+     *              and try again later.
+     *  REJECTED  — the server refused THIS payload and always will (a
+     *              constraint, an RLS denial after removal, a foreign key
+     *              to a deleted place). Retrying cannot help; holding it
+     *              would wedge the queue behind it. */
+    public enum Result { SUCCESS, DUPLICATE, FAILED, REJECTED }
 
     /**
      * POST /rest/v1/checkins with the given body. Retries once after a
      * token refresh if the first attempt returns 401.
      */
     public Result insertCheckin(JSONObject body) {
-        int status = doJsonWithRefresh("POST", "/rest/v1/checkins", body, "return=minimal");
+        int status = doJsonWithRefresh("POST", "/rest/v1/checkins", body.toString(), "return=minimal");
         if (status >= 200 && status < 300) return Result.SUCCESS;
-        // PostgREST surfaces a unique-violation as 409 with PG code 23505.
-        // For the retry queue's purposes any 409 on this endpoint means
-        // "the row with this client-generated id already exists" — safe
-        // to drop from the queue.
-        if (status == 409) return Result.DUPLICATE;
+        // PostgREST reports every constraint violation as 409 — the primary
+        // key (23505, a retried row that already landed) AND a foreign key
+        // (23503: e.g. a place deleted since the crossing). Only the first
+        // means "already there"; treating both as it used to drop the second
+        // silently as if it had been delivered.
+        if (status == 409 && "23505".equals(lastSqlState)) return Result.DUPLICATE;
+        if (status == 400 || status == 403 || status == 404 || status == 409 || status == 422) {
+            return Result.REJECTED;
+        }
         return Result.FAILED;
     }
 
@@ -81,29 +109,52 @@ public class SupabaseRest {
      */
     public boolean updateMember(String memberId, JSONObject body) {
         String path = "/rest/v1/keep_members?id=eq." + memberId;
-        int status = doJsonWithRefresh("PATCH", path, body, "return=minimal");
+        int status = doJsonWithRefresh("PATCH", path, body.toString(), "return=minimal");
         return status >= 200 && status < 300;
     }
 
     /**
-     * POST /rest/v1/location_history with the given body. Breadcrumb rows
-     * carry no client-supplied id, so there's no duplicate-key case to
-     * special-case — just success or failure.
-     */
-    /**
-     * Returns the raw HTTP status rather than a boolean.
+     * POST a whole batch of breadcrumbs as ONE request, returning the raw
+     * HTTP status.
      *
-     * The caller needs to tell "the network is down" (retry later, the row
-     * is gone) from "PostgREST refused this payload" (400 — the row will
-     * never land while it looks like this), because the breadcrumb writer
-     * includes an optional column that only exists from schema v15 and a
-     * database that lacks it rejects the WHOLE insert, not just the field.
-     * Silently losing every breadcrumb on a family whose owner has not
-     * migrated is precisely the invisible headless failure this codebase
-     * keeps being bitten by, so the status is worth surfacing.
+     * One request per batch rather than one per fix: every request wakes
+     * the cellular radio, which then idles in a high-power tail for
+     * seconds, so a dense trail written fix by fix cost far more battery
+     * than the same rows sent together.
+     *
+     * `columns` names every column any row may carry. PostgREST otherwise
+     * insists all objects in a bulk insert have identical keys, and ours do
+     * not (speed is withheld from a fuzzy fix); with `columns`, a key a row
+     * lacks is written NULL, which is what an absent speed or accuracy means.
+     *
+     * The raw status matters to the caller: a 400 on a batch carrying
+     * accuracy means the v15 column is missing, and the rows are re-sent
+     * without it rather than lost.
      */
-    public int insertLocationHistoryStatus(JSONObject body) {
-        return doJsonWithRefresh("POST", "/rest/v1/location_history", body, "return=minimal");
+    public int insertLocationHistoryBatchStatus(org.json.JSONArray rows, String columns) {
+        String path = "/rest/v1/location_history?columns=" + columns;
+        return doJsonWithRefresh("POST", path, rows.toString(), "return=minimal");
+    }
+
+    /**
+     * Upsert this member's push token (keep_member_push is keyed on
+     * member_id). Used when FCM rotates the token while the app is closed —
+     * otherwise the new token is only saved at the next app open, and until
+     * then the old one is dead and this phone gets no alerts at all.
+     */
+    public boolean upsertPushToken(String memberId, String keepId, String token) {
+        try {
+            JSONObject body = new JSONObject();
+            body.put("member_id", memberId);
+            body.put("keep_id", keepId);
+            body.put("fcm_token", token);
+            body.put("updated_at", toIso8601Utc(System.currentTimeMillis()));
+            int status = doJsonWithRefresh("POST", "/rest/v1/keep_member_push?on_conflict=member_id",
+                    body.toString(), "resolution=merge-duplicates,return=minimal");
+            return status >= 200 && status < 300;
+        } catch (JSONException e) {
+            return false;
+        }
     }
 
     /** Epoch-ms → the ISO-8601 UTC form PostgREST expects in filters. */
@@ -112,6 +163,12 @@ public class SupabaseRest {
                 "yyyy-MM-dd'T'HH:mm:ss.SSS'Z'", java.util.Locale.US);
         fmt.setTimeZone(java.util.TimeZone.getTimeZone("UTC"));
         return fmt.format(new java.util.Date(ms));
+    }
+
+    /** Percent-encode a value for a PostgREST query string. */
+    static String enc(String s) {
+        try { return URLEncoder.encode(s == null ? "" : s, StandardCharsets.UTF_8.name()); }
+        catch (Exception e) { return ""; }
     }
 
     /** Current battery percentage (0–100), or -1 if unavailable. Cheap
@@ -131,23 +188,36 @@ public class SupabaseRest {
 
     // ── internals ───────────────────────────────────────────────────
 
-    /** @return raw HTTP status, or -1 on IO error. */
-    /**
-     * GET a PostgREST path and return the response body, or null.
-     *
-     * Needed since push went content-free: the relay only wakes us, so the
-     * notification text has to be read back out of the family's own
-     * Supabase here on the device. Same one-shot 401 refresh as the
-     * write path.
-     */
-    public String getWithRefresh(String path) {
-        String out = doGet(path, prefs.getAccessToken());
-        if (out != null) return out;
-        if (refreshAccessToken()) return doGet(path, prefs.getAccessToken());
-        return null;
+    /** A GET's outcome: the HTTP status (-1 on IO error) and, on 2xx, the body. */
+    public static final class GetResult {
+        public final int status;
+        public final String body;
+        GetResult(int status, String body) { this.status = status; this.body = body; }
+        public boolean ok() { return status >= 200 && status < 300 && body != null; }
     }
 
-    private String doGet(String path, String bearerToken) {
+    /**
+     * GET a PostgREST path. Refreshes the session once on a 401.
+     *
+     * Returns the status as well as the body so a caller can tell "that
+     * view does not exist on this database" (404) from "the network is
+     * down" — the push path falls back to an unfiltered query only in the
+     * first case; doing it on every failure leaked muted notifications.
+     */
+    public GetResult getResult(String path) {
+        String token = prefs.getAccessToken();
+        GetResult r = doGet(path, token);
+        if (r.status == 401 && refreshAccessToken(token)) r = doGet(path, prefs.getAccessToken());
+        return r;
+    }
+
+    /** Body of a successful GET, or null. See getResult for the status. */
+    public String getWithRefresh(String path) {
+        GetResult r = getResult(path);
+        return r.ok() ? r.body : null;
+    }
+
+    private GetResult doGet(String path, String bearerToken) {
         HttpURLConnection conn = null;
         try {
             URL url = new URL(prefs.getSupabaseUrl() + path);
@@ -163,42 +233,59 @@ public class SupabaseRest {
             int code = conn.getResponseCode();
             if (code < 200 || code >= 300) {
                 Log.w(TAG, "GET " + path + " → " + code);
-                return null;
+                return new GetResult(code, null);
             }
             try (BufferedReader r = new BufferedReader(new InputStreamReader(
                     conn.getInputStream(), StandardCharsets.UTF_8))) {
                 StringBuilder sb = new StringBuilder();
                 String line;
                 while ((line = r.readLine()) != null) sb.append(line);
-                return sb.toString();
+                return new GetResult(code, sb.toString());
             }
         } catch (IOException e) {
             Log.w(TAG, "GET " + path + " IO error: " + e.getMessage());
-            return null;
+            return new GetResult(-1, null);
         } finally {
             if (conn != null) conn.disconnect();
         }
     }
 
-    private int doJsonWithRefresh(String method, String path, JSONObject body, String preferHeader) {
-        int status = doJson(method, path, body, preferHeader, prefs.getAccessToken());
-        if (status >= 200 && status < 300) return status;
-        if (status == 401 || status == 403) {
-            // Try one refresh, then retry once.
-            if (refreshAccessToken()) {
-                status = doJson(method, path, body, preferHeader, prefs.getAccessToken());
-                if (status >= 200 && status < 300) return status;
-            }
+    /**
+     * Send, and refresh the session once if — and only if — the server
+     * says the token is no good (401).
+     *
+     * It used to refresh on 403 as well. PostgREST answers 403 when ROW-
+     * LEVEL SECURITY refuses a write (42501), which no new token can fix —
+     * and which is exactly what a device sees after its member is removed
+     * from the Keep. Every rejected breadcrumb then rotated the refresh
+     * token, several times a minute, on a phone nobody was looking at.
+     *
+     * Also keeps the RLS-rejection streak (PrefsStore.bumpRejectStreak) for
+     * INSERTs: a successful insert resets it, a 42501 extends it. PATCHes
+     * are left out on purpose — updating a row that no longer exists
+     * matches nothing and PostgREST calls that success (204), which would
+     * reset a streak that is in fact running.
+     */
+    private int doJsonWithRefresh(String method, String path, String body, String preferHeader) {
+        String token = prefs.getAccessToken();
+        int status = doJson(method, path, body, preferHeader, token);
+        if (status == 401 && refreshAccessToken(token)) {
+            status = doJson(method, path, body, preferHeader, prefs.getAccessToken());
         }
-        Log.w(TAG, method + " " + path + " → " + status);
+        if ("POST".equals(method)) {
+            if (status >= 200 && status < 300) prefs.resetRejectStreak();
+            else if (status == 403 && RLS_DENIED.equals(lastSqlState)) prefs.bumpRejectStreak();
+        }
+        if (status < 200 || status >= 300) Log.w(TAG, method + " " + path + " → " + status);
         return status;
     }
 
     /**
      * @return HTTP status code, or -1 on IO error.
      */
-    private int doJson(String method, String path, JSONObject body, String preferHeader, String bearerToken) {
+    private int doJson(String method, String path, String body, String preferHeader, String bearerToken) {
         HttpURLConnection conn = null;
+        lastSqlState = null;
         try {
             URL url = new URL(prefs.getSupabaseUrl() + path);
             conn = (HttpURLConnection) url.openConnection();
@@ -215,7 +302,7 @@ public class SupabaseRest {
                 conn.setRequestProperty("Prefer", preferHeader);
             }
 
-            byte[] payload = body.toString().getBytes(StandardCharsets.UTF_8);
+            byte[] payload = body.getBytes(StandardCharsets.UTF_8);
             try (OutputStream os = conn.getOutputStream()) {
                 os.write(payload);
             }
@@ -238,7 +325,8 @@ public class SupabaseRest {
                     StringBuilder sb = new StringBuilder();
                     String line;
                     while ((line = r.readLine()) != null) sb.append(line);
-                    Log.w(TAG, "error sqlstate: " + sqlStateOf(sb.toString()));
+                    lastSqlState = sqlStateOf(sb.toString());
+                    Log.w(TAG, "error sqlstate: " + lastSqlState);
                 } catch (IOException ignored) {}
             }
             return code;
@@ -270,9 +358,24 @@ public class SupabaseRest {
 
     /**
      * Calls /auth/v1/token?grant_type=refresh_token, persists new tokens.
-     * @return true on success, false if refresh was rejected.
+     *
+     * Serialised process-wide. `staleAccessToken` is the token the failed
+     * request carried: if the stored one has changed since, another thread
+     * has already refreshed, and spending the refresh token again would at
+     * best waste a rotation and at worst trip Supabase's reuse detection,
+     * which revokes the whole session.
+     *
+     * @return true if a usable token is now stored, false if refresh was rejected.
      */
-    private boolean refreshAccessToken() {
+    private boolean refreshAccessToken(String staleAccessToken) {
+        synchronized (REFRESH_LOCK) {
+            String current = prefs.getAccessToken();
+            if (current != null && !current.equals(staleAccessToken)) return true;
+            return doRefresh();
+        }
+    }
+
+    private boolean doRefresh() {
         HttpURLConnection conn = null;
         try {
             String refresh = prefs.getRefreshToken();

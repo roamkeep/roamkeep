@@ -7,7 +7,9 @@ import android.location.Location;
 import android.util.Log;
 
 import com.google.android.gms.location.LocationResult;
+import com.google.android.gms.location.LocationServices;
 
+import org.json.JSONArray;
 import org.json.JSONException;
 import org.json.JSONObject;
 
@@ -18,6 +20,7 @@ import java.util.Locale;
 import java.util.TimeZone;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.atomic.AtomicInteger;
 
 /**
  * Target of the PendingIntent we hand to
@@ -26,8 +29,8 @@ import java.util.concurrent.Executors;
  * whole point of moving breadcrumb logging off the JS path, which Android
  * suspends whenever the WebView is backgrounded.
  *
- * For each location we POST a location_history breadcrumb and refresh the
- * live pin (keep_members.lat/lng).
+ * Each batch's breadcrumbs go up as ONE location_history POST, and the live
+ * pin (keep_members.lat/lng) is refreshed at the tracking mode's cadence.
  *
  * WHY THERE ARE GATES HERE AT ALL. This used to persist whatever the OS
  * handed it, leaning entirely on the request's setMinUpdateDistanceMeters.
@@ -163,6 +166,34 @@ public class LocationUpdateReceiver extends BroadcastReceiver {
     // know before it sends. See PrefsStore.getSchemaVersion.
     private static final int SCHEMA_WITH_ACCURACY = 15;
 
+    // ── Live-pin cadence ───────────────────────────────────────────
+    //
+    // How often keep_members.lat/lng is rewritten from here, by tracking
+    // mode — the same numbers the in-app path has always used (TRACK_PROFILES
+    // and AUTO_WRITE_* in app.js). This path used to PATCH the pin on EVERY
+    // batch: every 1–4 s while driving on the dense profile, each one a
+    // radio wake-up and a realtime event fanned out to every family member
+    // with the app open, where it rebuilt the member list and the map pins.
+    // Breadcrumbs, not the pin, carry the detail; the pin only has to be
+    // fresh. Geofence transitions and doze exits still write it at once.
+    private static final long PIN_EVERY_LIVE_MS     = 8_000;
+    private static final long PIN_EVERY_MOVING_MS   = 10_000;   // auto, moving
+    private static final long PIN_EVERY_BALANCED_MS = 30_000;
+    private static final long PIN_EVERY_STILL_MS    = 60_000;   // auto, still
+    private static final long PIN_EVERY_SAVER_MS    = 120_000;
+
+    // Consecutive INSERTs refused by row-level security before this device
+    // concludes the server no longer accepts it — in practice, that an owner
+    // removed this member. Generous, because acting on it stops tracking.
+    // Opening the app with a valid membership clears it (initialize()).
+    private static final int RLS_REJECTIONS_TO_STOP = 30;
+
+    /** Batches submitted and not yet started. A batch that sees another
+     *  waiting behind it skips its pin write — the newer one carries a
+     *  fresher position anyway, and on a slow link a backlog used to replay
+     *  every stale position in turn as the family's "live" pin. */
+    private static final AtomicInteger QUEUED = new AtomicInteger();
+
     @Override
     public void onReceive(Context context, Intent intent) {
         LocationResult result = LocationResult.extractResult(intent);
@@ -210,9 +241,18 @@ public class LocationUpdateReceiver extends BroadcastReceiver {
      *               the receiver uses it to release its goAsync() token.
      */
     static void submit(Context ctx, List<Location> locations, Runnable onDone) {
+        submit(ctx, locations, onDone, false);
+    }
+
+    /** @param forcePin write the live pin from this batch regardless of the
+     *                  cadence (the doze-exit fix: the family should see the
+     *                  phone catch up the moment it wakes). */
+    static void submit(Context ctx, List<Location> locations, Runnable onDone, boolean forcePin) {
+        QUEUED.incrementAndGet();
         WORKER.execute(() -> {
+            QUEUED.decrementAndGet();
             try {
-                processLocations(ctx, locations);
+                processLocations(ctx, locations, forcePin);
             } catch (Exception e) {
                 Log.w(TAG, "location worker failed", e);
             } finally {
@@ -231,7 +271,7 @@ public class LocationUpdateReceiver extends BroadcastReceiver {
      * that two concurrent calls would clobber. It used to be public and each
      * producer span its own thread — which is precisely how that happened.
      */
-    private static void processLocations(Context ctx, List<Location> locations) {
+    private static void processLocations(Context ctx, List<Location> locations, boolean forcePin) {
         if (locations == null || locations.isEmpty()) return;
         final int n = locations.size();
         final double[] lats = new double[n];
@@ -258,6 +298,7 @@ public class LocationUpdateReceiver extends BroadcastReceiver {
         PrefsStore prefs = new PrefsStore(ctx);
         if (!prefs.hasContext()) return;   // not signed in — nothing to write
         if (prefs.isPaused()) return;      // self-paused — write nothing
+        if (prefs.isServerRejected()) return;  // server stopped accepting us
         SupabaseRest rest = new SupabaseRest(ctx);
         String keepId   = prefs.getKeepId();
         String memberId = prefs.getMemberId();
@@ -290,6 +331,9 @@ public class LocationUpdateReceiver extends BroadcastReceiver {
 
         int written = 0, suppressed = 0, rejDrift = 0, rejStill = 0, rejUnusable = 0;
         float worstAcc = 0f, worstDist = 0f;
+        // The batch's breadcrumbs, sent as ONE request after the loop.
+        final JSONArray rows = new JSONArray();
+        boolean anyAcc = false;
         for (int i = 0; i < lats.length; i++) {
             final float acc = accs[i];
 
@@ -417,7 +461,10 @@ public class LocationUpdateReceiver extends BroadcastReceiver {
                 // cleared DRIVE_MAX_MS and labelled an hour of drift a Drive.
                 // A NULL here is not a loss: tripStats falls back to the
                 // trip's own distance over time.
-                if (speeds[i] >= 0 && acc >= 0
+                // Below 150 m/s too: that is the lh_speed_range CHECK, and now
+                // that a batch is one INSERT, one row violating it would take
+                // every other row in the batch down with it.
+                if (speeds[i] >= 0 && speeds[i] < 150f && acc >= 0
                         && acc < LocationForegroundService.SPEED_TRUST_ACC_M) {
                     row.put("speed", (double) speeds[i]);
                 }
@@ -429,33 +476,38 @@ public class LocationUpdateReceiver extends BroadcastReceiver {
                 // the confident-looking ones: every gate above waves those
                 // through untested, and this column is the only way to find
                 // out afterwards whether they deserved it.
-                boolean sentAcc = false;
-                if (writeAcc && acc >= 0) { row.put("accuracy", (double) acc); sentAcc = true; }
-
-                int status = rest.insertLocationHistoryStatus(row);
-                // A 400 on a row carrying accuracy means the column is not
-                // there, whatever the version number said. Verify OBJECTS,
-                // not the number — a database has already reported a version
-                // it did not fully contain once in this project's history.
-                // Drop the field, re-send this row, and stop sending it: the
-                // alternative is every breadcrumb silently failing on a
-                // family whose owner has not run the migration.
-                if (status == 400 && sentAcc) {
-                    row.remove("accuracy");
-                    status = rest.insertLocationHistoryStatus(row);
-                    if (status / 100 == 2) {
-                        writeAcc = false;
-                        prefs.demoteSchemaVersion(SCHEMA_WITH_ACCURACY - 1);
-                        // Once, on the transition — not per row. A line that
-                        // repeats every fix is a line nobody reads.
-                        prefs.journal("crumbs: no accuracy column on this database "
-                                + "— v15 not applied, field dropped");
-                    }
-                }
-                if (status / 100 == 2) written++;
+                if (writeAcc && acc >= 0) { row.put("accuracy", (double) acc); anyAcc = true; }
+                rows.put(row);
             } catch (JSONException e) {
                 Log.w(TAG, "breadcrumb payload build failed", e);
             }
+        }
+
+        if (rows.length() > 0) {
+            final String cols = "keep_id,member_id,lat,lng,recorded_at,speed";
+            int status = rest.insertLocationHistoryBatchStatus(rows, anyAcc ? cols + ",accuracy" : cols);
+            // A 400 on a batch carrying accuracy means the column is not
+            // there, whatever the version number said. Verify OBJECTS, not
+            // the number — a database has already reported a version it did
+            // not fully contain once in this project's history. Drop the
+            // field, re-send the batch, and stop sending it: the alternative
+            // is every breadcrumb silently failing on a family whose owner
+            // has not run the migration.
+            if (status == 400 && anyAcc) {
+                for (int r = 0; r < rows.length(); r++) {
+                    JSONObject o = rows.optJSONObject(r);
+                    if (o != null) o.remove("accuracy");
+                }
+                status = rest.insertLocationHistoryBatchStatus(rows, cols);
+                if (status / 100 == 2) {
+                    prefs.demoteSchemaVersion(SCHEMA_WITH_ACCURACY - 1);
+                    // Once, on the transition — not per batch. A line that
+                    // repeats every fix is a line nobody reads.
+                    prefs.journal("crumbs: no accuracy column on this database "
+                            + "— v15 not applied, field dropped");
+                }
+            }
+            if (status / 100 == 2) written = rows.length();
         }
         if (anchorMoved) prefs.setBreadcrumbAnchor(aLat, aLng, System.currentTimeMillis());
         if (motionValid) prefs.setMotion(emaLat, emaLng, emaMs, stillLat, stillLng, movingUntilMs);
@@ -476,29 +528,38 @@ public class LocationUpdateReceiver extends BroadcastReceiver {
         // map keeps moving for other members even when the BG-geolocation
         // foreground service has been killed by an OEM battery saver.
         //
-        // Deliberately NOT gated on any of the above. A drift-rejected fix is
-        // still a real location the OS handed us, and GeofenceReceiver sets
-        // the same precedent — the family's map must never go staler because
-        // we got fussier about the trail. The one exception is an unusable
-        // fix, which would teleport the avatar; prefer the last one that
-        // cleared the ceiling, and fall back to the raw last if none did.
+        // Deliberately NOT gated on the trail gates above. A drift-rejected
+        // fix is still a real location the OS handed us, and GeofenceReceiver
+        // sets the same precedent — the family's map must never go staler
+        // because we got fussier about the trail. The one exception is an
+        // unusable fix, which would teleport the avatar; prefer the last one
+        // that cleared the ceiling, and fall back to the raw last if none did.
+        //
+        // It IS paced, by tracking mode (see PIN_EVERY_*), and skipped when a
+        // newer batch is already waiting — that one carries a fresher fix.
         int last = lats.length - 1;
         for (int i = lats.length - 1; i >= 0; i--) {
             if (accs[i] <= BREADCRUMB_MAX_ACC_M) { last = i; break; }
         }
-        try {
-            JSONObject upd = new JSONObject();
-            upd.put("lat", lats[last]);
-            upd.put("lng", lngs[last]);
-            upd.put("last_seen", toIso8601Utc(times[last]));
-            upd.put("online", true);
-            // Piggyback the battery level so it stays current in the
-            // background (the JS battery listener only runs foreground).
-            int batt = SupabaseRest.currentBatteryLevel(ctx);
-            if (batt >= 0) upd.put("battery", batt);
-            rest.updateMember(memberId, upd);
-        } catch (JSONException e) {
-            Log.w(TAG, "pin update payload build failed", e);
+        final long nowMs = System.currentTimeMillis();
+        final long lastPin = prefs.getLastPinWriteMs();
+        final long every = pinInterval(prefs.getTrackMode(), times[last] <= movingUntilMs);
+        final boolean due = forcePin || lastPin == 0 || nowMs < lastPin || nowMs - lastPin >= every;
+        if (due && QUEUED.get() == 0) {
+            try {
+                JSONObject upd = new JSONObject();
+                upd.put("lat", lats[last]);
+                upd.put("lng", lngs[last]);
+                upd.put("last_seen", toIso8601Utc(times[last]));
+                upd.put("online", true);
+                // Piggyback the battery level so it stays current in the
+                // background (the JS battery listener only runs foreground).
+                int batt = SupabaseRest.currentBatteryLevel(ctx);
+                if (batt >= 0) upd.put("battery", batt);
+                if (rest.updateMember(memberId, upd)) prefs.setLastPinWriteMs(nowMs);
+            } catch (JSONException e) {
+                Log.w(TAG, "pin update payload build failed", e);
+            }
         }
 
         // Reconcile the inside-place set against where we actually are.
@@ -537,6 +598,40 @@ public class LocationUpdateReceiver extends BroadcastReceiver {
                 prefs.journal("drain: " + drained + " queued checkin(s) delivered on breadcrumb fire");
             }
         }
+
+        if (prefs.getRejectStreak() >= RLS_REJECTIONS_TO_STOP) stopForServerRejection(ctx, prefs);
+    }
+
+    /** Pin cadence for a tracking mode. See PIN_EVERY_*. */
+    private static long pinInterval(String mode, boolean moving) {
+        if ("live".equals(mode)) return PIN_EVERY_LIVE_MS;
+        if ("balanced".equals(mode)) return PIN_EVERY_BALANCED_MS;
+        if ("saver".equals(mode)) return PIN_EVERY_SAVER_MS;
+        return moving ? PIN_EVERY_MOVING_MS : PIN_EVERY_STILL_MS;
+    }
+
+    /**
+     * The server has refused this device's writes on row-level security
+     * RLS_REJECTIONS_TO_STOP times running. In practice an owner removed
+     * this member: the app shows the join screen when opened, but nothing
+     * told the headless pipeline, which went on running the foreground
+     * service and GPS for a Keep that would never accept a row — until 4.9.0
+     * it also rotated the refresh token on every rejection.
+     *
+     * Stops the service and removes the geofences, and sets a flag every
+     * start path (BootReceiver, the service, both receivers) respects. Not
+     * clearAll(): if this is ever wrong, opening the app — which re-runs
+     * initialize() — clears the flag and resumes everything intact.
+     */
+    private static void stopForServerRejection(Context ctx, PrefsStore prefs) {
+        if (prefs.isServerRejected()) return;
+        prefs.setServerRejected(true);
+        prefs.journal("server: " + RLS_REJECTIONS_TO_STOP + " writes in a row refused by row-level "
+                + "security — member probably removed from the Keep. Tracking stopped until the app is opened.");
+        try { LocationForegroundService.stop(ctx); } catch (Exception ignored) {}
+        try {
+            LocationServices.getGeofencingClient(ctx).removeGeofences(GeofenceArmer.pendingIntent(ctx));
+        } catch (Exception ignored) {}
     }
 
     /**

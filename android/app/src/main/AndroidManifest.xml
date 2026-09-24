@@ -104,6 +104,12 @@
              PendingIntent, so it needs no intent-filter. -->
         <receiver android:name="com.roamkeep.app.geofence.PauseExpiryReceiver" android:exported="false" />
 
+        <!-- The tracking notification's deleteIntent: a swipe re-posts it
+             at once, because from Android 14 nothing can stop the swipe
+             itself. Targeted by an explicit PendingIntent, so no
+             intent-filter and not exported. -->
+        <receiver android:name="com.roamkeep.app.geofence.NotificationRestoreReceiver" android:exported="false" />
+
         <!-- Push is content-free: the relay only sends {"t":"sync"}, and
              this service reads the actual check-in back out of the
              family's own Supabase to build the notification on-device.

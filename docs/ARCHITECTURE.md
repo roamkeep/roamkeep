@@ -97,21 +97,53 @@ it are correct.
    to **real GPS movement** decided in the service (dense while moving,
    low-power after 3 min still) — NOT the Activity Recognition sensor,
    which proved unreliable and got auto stuck both ways. A periodic
-   re-arm heals a stale callback on long sessions. **From Android 13 the
-   user can swipe the foreground-service notification away** —
-   `setOngoing(true)` never prevented that, it only blocked a clear-all —
-   and since it is posted once by `startForeground()` in `onStartCommand`,
-   which does not fire again while the service lives, it stayed gone for
-   the rest of the session. That silently falsified the "permanent
-   notification" claim in `landing/privacy`. `restoreNotificationIfDismissed()`
-   checks `getActiveNotifications()` on each fix and each re-arm and puts
-   it back — silently, because the channel is `IMPORTANCE_LOW`. It is
-   deliberately not restored instantly via a `deleteIntent`: that reads as
-   the app fighting the swipe, where returning at the next fix is the
-   disclosure simply falling due again. Replaced the old
+   re-arm heals a stale callback on long sessions. **From Android 14 the
+   user can swipe the foreground-service notification away, and no API
+   stops it.** Android 13 made FGS notifications dismissable by default but
+   still honoured `setOngoing(true)`; 14 removed that for every app —
+   ongoing notifications now hold only on the lock screen and against
+   Clear all. The exemptions (CallStyle, media, enterprise DPC) don't fit a
+   location app, and faking one would be misrepresentation. Because the
+   notification is posted once by `startForeground()` in `onStartCommand`,
+   which does not fire again while the service lives, a swipe used to leave
+   it gone for the session — silently falsifying the "permanent
+   notification" claim in `landing/privacy`. **Since 4.9.0 it carries a
+   `deleteIntent`** (`NotificationRestoreReceiver` →
+   `onTrackingNotificationDismissed`) that re-posts it at once, silently
+   (same id, `IMPORTANCE_LOW`). That reverses the earlier "don't fight the
+   swipe" choice (restore at the next fix, up to 5 min later): keeping the
+   disclosure continuously on screen was judged to matter more for an app
+   recording someone's location. `restoreNotificationIfDismissed()` still
+   checks `getActiveNotifications()` on each fix and re-arm as the backstop
+   for an undelivered `deleteIntent`. Its small icon is
+   `ic_stat_roamkeep` — the mark as an alpha-only glyph, with the window
+   punched out — so the system tints it like every other status-bar icon;
+   push notifications use the same one. Replaced the old
    `@capacitor-community/background-geolocation` plugin. NOT used for
    check-ins. Foreground map smoothness uses a plain
    `@capacitor/geolocation` `watchPosition` while the app is open.
+
+   **Write cost (4.9.0).** The JS path always throttled the live pin; the
+   native path, which is the one that runs in the background, PATCHed
+   `keep_members` after every batch and POSTed each breadcrumb separately —
+   two requests per fix, one per 1–4 s while driving, each one waking the
+   cellular radio and fanning out through Realtime to every open phone. Now
+   a batch's breadcrumbs go as **one** array POST, and the pin is written only
+   when it is due (`PIN_EVERY_*`, keyed on mode and moving/still, stamped in
+   `PrefsStore.getLastPinWriteMs`) and only if no newer batch is already queued
+   (`QUEUED`) — a backlog replayed after a slow link would otherwise PATCH a
+   stale position as the live pin. A doze exit forces the pin.
+
+   **A removed member stops, not retries.** A phone whose member row was
+   deleted kept its FGS running, every write rejected by RLS (42501), and
+   each 403 used to trigger a refresh-token rotation. `SupabaseRest` now
+   refreshes only on 401, serialises refresh under `REFRESH_LOCK`, and counts
+   consecutive 42501s; at `RLS_REJECTIONS_TO_STOP`,
+   `LocationUpdateReceiver.stopForServerRejection` stops the service, removes
+   the fences and sets `PrefsStore.isServerRejected`, which `BootReceiver`,
+   `PauseExpiryReceiver`, the FGS and `GeofenceReceiver` all honour. Only the
+   plugin's `initialize` — the app being opened and signed in — clears it.
+   JS mirrors it at launch: no membership row → `teardownNative()`.
 
 When the native plugin is active (`S._nativeGeoReady`), the JS-path
 `checkGeofenceTransitions` still maintains the `insidePlaces` Set for UI
@@ -388,6 +420,13 @@ Rules that follow from it:
   14 keeps working and just records no accuracy. `NEEDS_SCHEMA` stayed at
   13. This is the per-feature fallback the marker was designed for.
 
+  v16 is the same shape, several times over: `get_invite`
+  (`SCHEMA_WITH_GET_INVITE`), `prune_keep_history` (`SCHEMA_WITH_PRUNE`) and
+  the push watermark on `checkins.inserted_at`
+  (`RoamkeepMessagingService.SCHEMA_WITH_INSERTED_AT`) each have a pre-16
+  path, and everything else in v16 is enforced server-side with nothing for
+  the client to gate. `NEEDS_SCHEMA` is still 13.
+
   A gate like that needs a **second, object-level check**, because the
   number can be right and the object still missing (the `checkins.lat/lng`
   incident below). PostgREST rejects the WHOLE insert on an unknown
@@ -511,6 +550,11 @@ variant; without that the bundled detection model takes the APK from
 Settings → **Disconnect this device** clears the stored config, native
 context and geofences, then reloads to the Connect screen.
 
+Both it and sign-out call `signOut({ scope: 'local' })`. supabase-js
+defaults to `global`, which revokes **every** session the user holds — so
+disconnecting an old phone quietly killed the new one at its next token
+refresh, headless, with nothing on any screen. Don't drop the argument.
+
 ## Backend (Supabase)
 
 - The owner's own project ref is `<your-project-ref>`, kept in the
@@ -529,6 +573,13 @@ context and geofences, then reloads to the Connect screen.
   vector rather than pricing it; sign-in is a different endpoint, so a
   closed door costs existing members nothing, including after a reinstall.
 
+  **One Keep per account (v16).** `create_keep` raises `already_member` and
+  `join_keep_by_code` returns that status when the caller already has a
+  membership. The app only ever opened one (the launch query takes one row,
+  now `.order('created_at')` so it is at least the same one every time),
+  and a second membership was what let a user pair their own `member_id`
+  with someone else's `keep_id`.
+
 - **RLS cannot pin a column to its previous value.** An UPDATE policy's
   `WITH CHECK` only ever sees the NEW row, so it can say "user_id must be
   mine" but never "keep_id must be what it already was". That gap let a
@@ -538,6 +589,37 @@ context and geofences, then reloads to the Connect screen.
   (role/member_type/paused_until/keep_id/user_id) and
   `_roamkeep_guard_place_cols` (created_by/keep_id). Reach for the trigger,
   not a cleverer policy; the policy cannot express it.
+
+- **Check `(member_id, keep_id)` as a pair, never each on its own.** The
+  INSERT policies on `checkins` and `location_history`, and the
+  `keep_member_push` policy, used to ask "is this member_id mine?" and "is
+  this keep_id mine?" separately — both true for a member of two keeps
+  writing one keep's member id against the other keep. Since v16 they ask
+  `(member_id, keep_id) IN (SELECT id, keep_id FROM keep_members WHERE
+  user_id = auth.uid())`.
+
+- **A client-supplied field the server acts on is set by the server (v16).**
+  `_roamkeep_checkin_normalise` (BEFORE INSERT on `checkins`) stamps
+  `inserted_at := now()`, clamps `created_at` to at most five minutes ahead,
+  overwrites `member_name`/`member_avatar` from the member row, and nulls a
+  `place_id` from another keep. Each closed a real hole: the push watermark
+  trusted the sender's clock, so one future-dated row silenced every phone
+  in the keep until that date; and a member could file "🆘 Mum sent an SOS"
+  under their own id. Both writers already sent the true values, so the
+  trigger is invisible to them. `created_at` stays the *event* time the
+  timeline shows; `inserted_at` is *receipt* time, the only one a watermark
+  can use. `_roamkeep_place_cap` refuses the 91st place, because Play
+  Services refuses a registration of more than 100 fences **entirely** —
+  one place too many disarmed the whole family.
+
+- **`set_project_url` takes its answer from the caller's JWT.** It is where
+  both triggers POST every check-in and place row, secret header included,
+  and it used to accept any `*.supabase.co` from the owner of *any* keep —
+  including one an outsider had just created with open sign-ups. It now
+  requires `p_url` to equal the token's own issuer
+  (`https://<ref>.supabase.co/auth/v1`), which only this project's auth
+  server can sign, and falls back to owner-of-the-oldest-keep if a token
+  carries some other `iss`. Still write-once.
 
 - **Shared configuration the database issues to itself, not to owners.**
   `roamkeep_secrets.webhook_secret` is generated by `schema.sql` on first
@@ -549,6 +631,22 @@ context and geofences, then reloads to the Connect screen.
   `roamkeep_meta.project_url`: if every owner has to do it, assume most
   won't.
 
+  The functions **fail closed**: only a missing table (`42P01`/`PGRST205`,
+  a pre-v14 database) means "no secret, stay open"; any other lookup error
+  is a 503 and is not cached. The value is cached for `SECRET_TTL_MS`
+  (10 min), not for the isolate's life, so rotating it after an incident
+  stops breaking push within minutes instead of whenever isolates recycle.
+  Compared as SHA-256 digests, constant-time.
+
+  **One body for `roamkeep_notify_checkin`, and schema.sql owns it.** The
+  wizard's `createWebhook` used to install its own hand-written copy with no
+  secret header, and every check-in push on those projects was a silent 403
+  (R1 in the 2026-09 review). `webhookSql()` now extracts the function
+  verbatim from `schema.sql`, `cli/test.mjs` asserts it, and the schema's
+  own guard replaces an installed body lacking `x-roamkeep-webhook` once
+  `project_url` is set — the condition that keeps it from swapping a working
+  hardcoded-URL trigger for one that no-ops.
+
 - Push tokens live in **`keep_member_push`** (own-row RLS), not on
   `keep_members`. That table is readable across the whole keep and RLS
   cannot restrict columns, so a token there was a token every relative
@@ -556,10 +654,30 @@ context and geofences, then reloads to the Connect screen.
 - Realtime: `keep_members`, `checkins`, `keep_places`, `location_history`
   are in the `supabase_realtime` publication. `keep_places` needs
   `REPLICA IDENTITY FULL` so DELETE events carry `keep_id` past the
-  client-side filter.
-- `location_history` is the per-member breadcrumb trail (7 days:
-  client-pruned on launch, plus a pg_cron sweep from the v7 migration if
-  the extension is enabled). Rows carry the GPS `speed` (m/s, nullable)
+  client-side filter. The app handles a `keep_members` DELETE (a removed
+  member leaves every open map; a removal of *yourself* tears down native
+  tracking and reloads), but `keep_members` deliberately does **not** get
+  `REPLICA IDENTITY FULL` — it is the busiest table in the publication and
+  every pin update would carry the whole old row through WAL and Realtime.
+  If the filtered DELETE doesn't arrive, the next refetch drops the member,
+  as before.
+  `location_history` is published but **not** on the main `keep:` channel:
+  Realtime authorises each change per subscriber, breadcrumbs are the
+  highest-volume table, and the old handler discarded almost every row.
+  `subscribeTrail` opens a `trail:<member>` channel filtered on
+  `member_id` only while that member's 24h trail is on screen.
+- **Retention is 7 days for `location_history` AND `checkins` (v16),** and
+  does not depend on pg_cron. `prune_keep_history()` (DEFINER) deletes both
+  tables' expired rows for the caller's keep, and every member's app calls
+  it at launch — it deletes only what the privacy page already says is
+  gone, so any member may run it. The pg_cron jobs
+  (`roamkeep-prune-location-history`, `roamkeep-prune-checkins`) are the
+  backstop for a keep whose apps are never opened. Pre-v16 the app falls
+  back to pruning its own history rows. Check-ins used to be kept forever,
+  which the privacy page never said and which made the arrive/leave record
+  the most revealing thing in the database.
+- `location_history` is the per-member breadcrumb trail. Rows carry the
+  GPS `speed` (m/s, nullable)
   and, since **v15**, the fix's own `accuracy` (m, nullable). Nothing
   reads `accuracy` — it is an instrument, not a feature. Every drift
   defence on the write path keys on the error radius, and a precise-looking
@@ -597,7 +715,8 @@ context and geofences, then reloads to the Connect screen.
   unknown state is assumed to be moving — so a good fix is never dropped and
   no trip start is lost. On the **PWA** the JS path writes it
   (distance-gated in `pushLocation`). The trail extends live via a
-  `location_history` realtime subscription (one source for both paths).
+  per-member `location_history` realtime channel (one source for both
+  paths; see Realtime above).
   Tap a member to load+draw their trail (last 24h). Tracking modes
   (auto/live/balanced/saver) live in Capacitor Preferences (and
   `PrefsStore`, so `BootReceiver` can re-arm updates after a reboot) and
@@ -730,8 +849,23 @@ Details that bite:
 - `:app` needs its own `firebase-messaging` dependency (the plugin
   declares it `implementation`, so it doesn't reach our classpath);
   version pinned in `variables.gradle` to match.
-- `PrefsStore.lastPushSeen` is the watermark that stops a wake-up
-  re-notifying old rows; a cold start only looks back 10 minutes.
+- The watermark that stops a wake-up re-notifying old rows is keyed on
+  **server receipt time** (`checkins.inserted_at`, v16), never on
+  `created_at`. `created_at` is the sender's clock: a row delivered late
+  (a queued check-in, a slow ENTER) sat behind a watermark already moved
+  past it and was never notified, and a future-dated one pinned every
+  device's watermark in the future. The query re-reads `OVERLAP_MS`
+  (30 min) behind the mark and de-duplicates against `PrefsStore`'s seen-id
+  set (device-local bookkeeping, not a mirror of DB state). SOS rows are
+  fetched by a separate, uncapped query so a burst can't push one out of
+  the page, and more than 5 others collapse into one summary notification.
+  On a pre-v16 database it falls back to `created_at` with the same
+  overlap, plus an upper bound of `FUTURE_SLACK_MS` ahead so a future-dated
+  row can't pin the mark. A cold start still looks back only 10 minutes.
+- `RoamkeepMessagingService.onNewToken` upserts `keep_member_push`
+  natively. A token that rotated while the app was closed used to wait for
+  the WebView's registration listener, and `notify-checkin` nulled the
+  dead one in the meantime — no push at all until the app was next opened.
 - Push is best-effort: `notify-checkin` always returns 200, so a relay
   outage never fails the webhook — the notification simply appears when
   the app is next opened.
@@ -743,7 +877,21 @@ Details that bite:
   the native receiver does (`PrefsStore` pending queue, drained on
   resume, every receiver fire, and any breadcrumb fire with a non-empty
   queue — the breadcrumb path is the earliest proof the network is back
-  after the classic WiFi→cellular handoff failure at a boundary).
+  after the classic WiFi→cellular handoff failure at a boundary). Since
+  4.9.0 that queue is **write-ahead**: the payload is appended before the
+  POST and removed on success, so a process killed mid-request loses
+  nothing. A permanent rejection (`SupabaseRest.Result.REJECTED` — a 4xx
+  that retrying cannot fix, or a 409 that isn't 23505) is dropped and
+  journalled, not left at the head where it used to block every later
+  entry.
+  **SOS is the exception on the JS side.** postgrest-js *resolves*
+  `{ error }` on every failure, network included, so the old
+  `try { await insert } catch {}` confirmed "ALERT SENT" unconditionally.
+  `sendPendingSos` now shows sent only once the `checkins` row lands,
+  retries on a backoff (`SOS_RETRY_MS`), on `online` and on resume, and
+  reuses one client-generated id so a retry is idempotent (23505 = landed).
+  Any new write whose success the user is told about needs the same check:
+  **a resolved promise is not a successful write.**
 - The boot-time `LocationUpdateWorker` polls at WorkManager's 15-minute
   minimum; it only covers the window between reboot and first app open,
   then `MainActivity` cancels it and `LocationForegroundService` takes over.

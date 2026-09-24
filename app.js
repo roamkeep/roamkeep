@@ -49,7 +49,7 @@
   // Tracked separately because the two documents move independently — v14
   // changed only the privacy policy, and showing one date for both on the
   // very screen asking people to agree again would be its own small lie.
-  const PRIVACY_DATE = '31 August 2026';      // matches landing/privacy
+  const PRIVACY_DATE = '23 September 2026';   // matches landing/privacy
   const TERMS_URL = 'https://get.roamkeep.app/terms';
   const PRIVACY_URL = 'https://get.roamkeep.app/privacy';
   const TERMS_STORE_KEY = 'rk_terms';
@@ -105,6 +105,11 @@
 
   // The version at which location_history gained its accuracy column.
   const SCHEMA_WITH_ACCURACY = 15;
+
+  // v16: get_invite() (owner-only code read) and prune_keep_history() (the
+  // 7-day retention for the whole keep). Both fall back without it.
+  const SCHEMA_WITH_GET_INVITE = 16;
+  const SCHEMA_WITH_PRUNE = 16;
 
   // What to assume when roamkeep_meta / roamkeep_schema_version() is
   // absent. Every database provisioned before v12 is at 11 (the last
@@ -486,6 +491,8 @@
     if (code.includes('child_cannot_leave')) return 'Children can’t leave a Keep on their own — ask an adult in your family.';
     if (code.includes('invalid_pause')) return 'Pick a pause length up to 24 hours.';
     if (code.includes('protected_column')) return 'That change has to go through the family controls.';
+    if (code.includes('already_member')) return 'This account is already in a Keep. Leave it first (Settings → Leave this Keep), or sign up with a different email.';
+    if (code.includes('too_many_places')) return 'This Keep already has the maximum of 90 places. Delete one before adding another.';
     return error?.message || 'Something went wrong.';
   }
 
@@ -646,13 +653,19 @@
     }
     S._nativeGeoReady = false;
     S._nativeLocReady = false;
+    unsubscribeTrail();
     Object.assign(S, {
       user: null, keepId: null, myId: null,
       members: [], checkins: [], sosActive: false,
       channel: null,
       tlMemberId: null, tlDayOffset: 0, tlTrips: []
     });
-    await S.sb.auth.signOut();
+    // scope 'local': sign out THIS device. supabase-js defaults to 'global',
+    // which revokes every session the account holds — so signing out (or
+    // disconnecting an old phone after moving to a new one) logged the
+    // person's OTHER devices out too, and their native tracking stopped
+    // within the hour with no screen to say why.
+    await S.sb.auth.signOut({ scope: 'local' });
   }
 
   // ── AVATAR PICKER ──────────────────────────────────────────────
@@ -750,6 +763,19 @@
   // All four helpers are no-ops on web and iOS (plugin is Android-only).
   function nativeGeo() {
     return window.Capacitor?.Plugins?.NativeGeofence || null;
+  }
+
+  // Stop every native watcher and forget the stored context, places and
+  // queue. For a device that no longer belongs to the membership it was
+  // tracking for. Harmless where nothing was armed.
+  async function teardownNative() {
+    const NG = nativeGeo();
+    if (NG) {
+      try { await NG.clearAll(); } catch (_) {}
+      try { await NG.stopLocationUpdates(); } catch (_) {}
+    }
+    S._nativeGeoReady = false;
+    S._nativeLocReady = false;
   }
 
   // Pushes Supabase context (URL, keys, tokens, member identity) into
@@ -953,6 +979,8 @@
     return window.Capacitor?.Plugins?.PushNotifications || null;
   }
 
+  let _pushListenersBound = false;
+
   // fromSetupSheet: the user tapped Allow on the sheet's Notifications row,
   // which is the affirmative action the gate exists to wait for.
   async function initPushNotifications(fromSetupSheet) {
@@ -1017,43 +1045,50 @@
       // Listeners must be added BEFORE register() — the registration
       // event fires synchronously on the native side once FCM hands us
       // a token, and we don't want to miss it on a cold start.
-      Push.addListener('registration', async (token) => {
-        if (!token || !token.value || !S.myId || !S.keepId) return;
-        try {
-          // keep_member_push, not keep_members: that row is readable across
-          // the whole keep and RLS cannot restrict columns, so a token there
-          // was a token every relative could read. Upsert because the row
-          // may not exist yet on a first run.
-          await S.sb.from('keep_member_push')
-            .upsert({
-              member_id: S.myId,
-              keep_id: S.keepId,
-              fcm_token: token.value,
-              updated_at: new Date().toISOString()
-            }, { onConflict: 'member_id' });
-        } catch (e) {
-          console.warn('persist fcm_token failed', e);
-        }
-      });
+      //
+      // Added once per page. This function runs from launch AND from the
+      // setup sheet, and again after every sign-in without a reload; each
+      // run used to add another set, so one token event upserted N times.
+      if (!_pushListenersBound) {
+        _pushListenersBound = true;
+        Push.addListener('registration', async (token) => {
+          if (!token || !token.value || !S.myId || !S.keepId) return;
+          try {
+            // keep_member_push, not keep_members: that row is readable across
+            // the whole keep and RLS cannot restrict columns, so a token there
+            // was a token every relative could read. Upsert because the row
+            // may not exist yet on a first run.
+            await S.sb.from('keep_member_push')
+              .upsert({
+                member_id: S.myId,
+                keep_id: S.keepId,
+                fcm_token: token.value,
+                updated_at: new Date().toISOString()
+              }, { onConflict: 'member_id' });
+          } catch (e) {
+            console.warn('persist fcm_token failed', e);
+          }
+        });
 
-      Push.addListener('registrationError', (err) => {
-        console.warn('FCM registration error', err);
-      });
+        Push.addListener('registrationError', (err) => {
+          console.warn('FCM registration error', err);
+        });
 
-      // Foreground delivery. The realtime channel already shows a toast
-      // for the underlying check-in (see subscribeRT), so we don't add
-      // a second in-app toast here. The OS still drops the notification
-      // banner per capacitor.config.ts presentationOptions.
-      Push.addListener('pushNotificationReceived', (n) => {
-        console.info('push received (fg)', n?.title || n?.notification?.title);
-      });
+        // Foreground delivery. The realtime channel already shows a toast
+        // for the underlying check-in (see subscribeRT), so we don't add
+        // a second in-app toast here. The OS still drops the notification
+        // banner per capacitor.config.ts presentationOptions.
+        Push.addListener('pushNotificationReceived', (n) => {
+          console.info('push received (fg)', n?.title || n?.notification?.title);
+        });
 
-      // Tap-from-tray (cold start or backgrounded). data.member_id is
-      // the actor we want to focus on the map.
-      Push.addListener('pushNotificationActionPerformed', (a) => {
-        const data = a?.notification?.data || {};
-        if (data.member_id) focusMember(data.member_id);
-      });
+        // Tap-from-tray (cold start or backgrounded). data.member_id is
+        // the actor we want to focus on the map.
+        Push.addListener('pushNotificationActionPerformed', (a) => {
+          const data = a?.notification?.data || {};
+          if (data.member_id) focusMember(data.member_id);
+        });
+      }
 
       await Push.register();
     } catch (e) {
@@ -1183,20 +1218,26 @@
       _hadBackgroundLocation = st ? !!st.backgroundLocation : null;
       if (await setupIncomplete()) openSetup();
     }, 1200);
-    trackBattery();
     // If we launched into an active self-pause, make sure native is torn
     // down and the auto-resume timer is armed. No-op when not paused.
     reconcileMyPause();
-    setInterval(renderMembers, 60000);
-    // Keep the activity feed's relative stamps ("12m ago") ticking
-    // while they're still in the relative window; once they cross the
-    // 1h mark formatActivityTime switches to a static absolute time.
-    setInterval(renderCheckins, 60000);
-    // Re-evaluate the Live/Stale header badge every 30 s. The badge
-    // also updates immediately on every pushLocation, but a periodic
-    // tick is what catches the transition Live → Stale during long
-    // backgrounded stretches.
-    setInterval(refreshLiveBadge, 30000);
+    // Timers and the battery listener once per page, like bindResumeHandler:
+    // launchApp runs again after a sign-out and sign-in without a reload, and
+    // each run used to stack another set.
+    if (!S._timersBound) {
+      S._timersBound = true;
+      trackBattery();
+      setInterval(renderMembers, 60000);
+      // Keep the activity feed's relative stamps ("12m ago") ticking
+      // while they're still in the relative window; once they cross the
+      // 1h mark formatActivityTime switches to a static absolute time.
+      setInterval(renderCheckins, 60000);
+      // Re-evaluate the Live/Stale header badge every 30 s. The badge
+      // also updates immediately on every pushLocation, but a periodic
+      // tick is what catches the transition Live → Stale during long
+      // backgrounded stretches.
+      setInterval(refreshLiveBadge, 30000);
+    }
     refreshLiveBadge();
 
     // Android WebView suspends the realtime WebSocket when the app is
@@ -1239,6 +1280,10 @@
   async function _onResumeImpl() {
     if (!S.keepId) return;
 
+    // An SOS still waiting for the server goes first — coming back to the
+    // app is the likeliest moment the connection has returned.
+    if (_sosPending) sendPendingSos();
+
     // Settings changes made outside the app (notably "Allow all the
     // time", which from API 30 can only be granted in Settings) come back
     // to us here or nowhere. This also re-arms geofences that were
@@ -1263,6 +1308,12 @@
         try { S.sb.removeChannel(S.channel); } catch (_) {}
         S.channel = null;
         subscribeRT();
+      }
+      // The trail channel died with it; bring it back if a live trail is up.
+      if (_trailChannelFor) {
+        const id = _trailChannelFor;
+        unsubscribeTrail();
+        subscribeTrail(id);
       }
       // Drop the tile cache. Not because the tiles are wrong — they are
       // keyed zoom/x/y, so they never are — but because the viewport may
@@ -1389,6 +1440,7 @@
     if (error) { console.warn('loadMembers', error); return false; }
     S.members = data || [];
     renderMembers();
+    syncSosFromRow();
     return true;
   }
 
@@ -1478,12 +1530,37 @@
   }
 
   // ── REALTIME ───────────────────────────────────────────────────
+  // True while leaveKeep runs, so our own DELETE is not mistaken for a removal.
+  let _leaving = false;
+
+  // An owner removed this member while the app was open. Stop tracking for a
+  // membership that no longer exists and go back to the join screen.
+  async function onRemovedFromKeep() {
+    toast('You are no longer in this Keep', 'err');
+    await teardownNative();
+    unsubscribeTrail();
+    if (S.channel) { try { S.sb.removeChannel(S.channel); } catch (_) {} S.channel = null; }
+    setTimeout(() => location.reload(), 1500);
+  }
+
   function subscribeRT() {
     S.channel = S.sb.channel('keep:' + S.keepId)
       .on('postgres_changes', {
         event: '*', schema: 'public', table: 'keep_members',
         filter: 'keep_id=eq.' + S.keepId
       }, (p) => {
+        // A member left or was removed. p.new is empty on DELETE, and this
+        // handler used to stop there — so a removed member stayed on every
+        // open map until that phone happened to refetch.
+        if (p.eventType === 'DELETE') {
+          const gone = p.old && p.old.id;
+          if (!gone) return;
+          if (gone === S.myId) { if (!_leaving) onRemovedFromKeep(); return; }
+          S.members = S.members.filter(m => m.id !== gone);
+          renderMembers();
+          renderPins();
+          return;
+        }
         const c = p.new;
         if (!c || !c.id) return;
         const i = S.members.findIndex(m => m.id === c.id);
@@ -1497,6 +1574,8 @@
           // If MY pause state changed elsewhere (resumed on another device,
           // or the pause lapsed), bring native tracking back in line.
           if (c.id === S.myId && pausedChanged) reconcileMyPause();
+          // Likewise an SOS raised or cancelled on my other device.
+          if (c.id === S.myId && !!prev.sos !== !!c.sos) syncSosFromRow();
         } else {
           S.members.push(c);
           // Only announce an actual join. The "not in S.members" branch
@@ -1562,7 +1641,7 @@
         // exists. Without this they keep the old wording until something
         // else happens to re-render them.
         renderMembers();
-        drawMap();
+        scheduleDraw();
       })
       .on('postgres_changes', {
         event: '*', schema: 'public', table: 'keep_notify_prefs',
@@ -1581,23 +1660,6 @@
         renderPlaces();
         if (S.placeNotifyFor) renderPlaceNotifySheet();
       })
-      .on('postgres_changes', {
-        event: 'INSERT', schema: 'public', table: 'location_history',
-        filter: 'keep_id=eq.' + S.keepId
-      }, (p) => {
-        // Extend the on-screen trail live as new breadcrumbs land (the
-        // native receiver writes them, so the JS path no longer appends
-        // directly). Only the member whose trail is shown is relevant.
-        const row = p.new;
-        if (!row || row.member_id !== S.trailMemberId) return;
-        // Same shape as the fetched rows, speed included — a live-extended
-        // trail whose tail rows lack speed would classify differently from
-        // the same trail after a reload.
-        S.trail.push({ lat: row.lat, lng: row.lng, speed: row.speed,
-                       recorded_at: row.recorded_at });
-        updateTrailPill();
-        drawMap();
-      })
       .subscribe((s) => {
         const live = s === 'SUBSCRIBED';
         const dot = $('live-dot');
@@ -1607,10 +1669,75 @@
       });
   }
 
+  // ── LIVE TRAIL CHANNEL ─────────────────────────────────────────
+  //
+  // Breadcrumbs stream only for the member whose 24h trail is on screen,
+  // and only while it is. They used to arrive for EVERY member, all the
+  // time, on the main channel: the busiest table in the database (a row per
+  // fix per moving member), each event authorised per subscriber by
+  // Realtime and each one a message against the family's plan quota — and
+  // the handler then discarded every row not for the trail being shown,
+  // which was usually none.
+  let _trailChannel = null;
+  let _trailChannelFor = null;
+
+  function subscribeTrail(memberId) {
+    if (_trailChannelFor === memberId && _trailChannel) return;
+    unsubscribeTrail();
+    if (!memberId || !S.sb) return;
+    _trailChannelFor = memberId;
+    _trailChannel = S.sb.channel('trail:' + memberId)
+      .on('postgres_changes', {
+        event: 'INSERT', schema: 'public', table: 'location_history',
+        filter: 'member_id=eq.' + memberId
+      }, (p) => {
+        const row = p.new;
+        if (!row || row.member_id !== S.trailMemberId) return;
+        // Same shape as the fetched rows, speed included — a live-extended
+        // trail whose tail rows lack speed would classify differently from
+        // the same trail after a reload.
+        S.trail.push({ lat: row.lat, lng: row.lng, speed: row.speed,
+                       recorded_at: row.recorded_at });
+        updateTrailPill();
+        scheduleDraw();
+      })
+      .subscribe();
+  }
+
+  function unsubscribeTrail() {
+    if (_trailChannel && S.sb) { try { S.sb.removeChannel(_trailChannel); } catch (_) {} }
+    _trailChannel = null;
+    _trailChannelFor = null;
+  }
+
   // ── CANVAS TILE MAP ────────────────────────────────────────────
+
+  // The map's size, cached. ll2px/px2ll run for every trail point and every
+  // pin on every frame, and they used to read clientWidth/clientHeight each
+  // time — interleaved with renderPins' DOM insertions, which forced a
+  // synchronous layout per pin while panning. Kept current by the
+  // ResizeObserver in initMap; re-read lazily while still unknown (0).
+  let _mapW = 0, _mapH = 0;
+  function mapSize() {
+    if (!_mapW || !_mapH) {
+      const wrap = $('map-wrap');
+      if (wrap) { _mapW = wrap.clientWidth; _mapH = wrap.clientHeight; }
+    }
+    return [_mapW, _mapH];
+  }
+
+  // Coalesce redraws to one per animation frame. Touch moves, wheel ticks,
+  // every tile's onload and every GPS fix each called drawMap() directly,
+  // so a single frame could redraw — and rebuild every pin — many times.
+  let _drawQueued = false;
+  function scheduleDraw() {
+    if (_drawQueued) return;
+    _drawQueued = true;
+    requestAnimationFrame(() => { _drawQueued = false; drawMap(); });
+  }
+
   function ll2px(lat, lng) {
-    const wrap = $('map-wrap');
-    const W = wrap.clientWidth, H = wrap.clientHeight;
+    const [W, H] = mapSize();
     const n = Math.pow(2, S.mZoom);
     const cx = (S.mLng + 180) / 360 * n * TILE_SIZE;
     const cy = (1 - Math.log(Math.tan(S.mLat * Math.PI / 180) + 1 / Math.cos(S.mLat * Math.PI / 180)) / Math.PI) / 2 * n * TILE_SIZE;
@@ -1621,8 +1748,7 @@
 
   // Inverse Web Mercator: pixel offset within #map-wrap → {lat, lng}.
   function px2ll(px, py) {
-    const wrap = $('map-wrap');
-    const W = wrap.clientWidth, H = wrap.clientHeight;
+    const [W, H] = mapSize();
     const n = Math.pow(2, S.mZoom);
     const cx = (S.mLng + 180) / 360 * n * TILE_SIZE;
     const cy = (1 - Math.log(Math.tan(S.mLat * Math.PI / 180) + 1 / Math.cos(S.mLat * Math.PI / 180)) / Math.PI) / 2 * n * TILE_SIZE;
@@ -1637,9 +1763,16 @@
   function initMap() {
     const canvas = $('map-canvas');
     const wrap = $('map-wrap');
-    canvas.width = wrap.clientWidth;
-    canvas.height = wrap.clientHeight;
+    _mapW = wrap.clientWidth;
+    _mapH = wrap.clientHeight;
+    canvas.width = _mapW;
+    canvas.height = _mapH;
     S.mapCtx = canvas.getContext('2d');
+    // Listeners once per page. launchApp runs again after a sign-out and
+    // sign-in without a reload, and every run used to stack another set of
+    // touch, mouse and window handlers onto the same map.
+    if (S._mapBound) { drawMap(); return; }
+    S._mapBound = true;
 
     // Long-press → drop-a-pin to add a place anywhere on the map.
     // 550 ms is short enough to feel responsive, long enough not to
@@ -1730,7 +1863,7 @@
         const d = Math.max(1, touchDist(e.touches[0], e.touches[1]));
         // Distance ratio → zoom levels: each doubling is one level.
         zoomAbout(pinch.zoom + Math.log2(d / pinch.dist), pinch.ax, pinch.ay);
-        drawMap();
+        scheduleDraw();
         e.preventDefault();
         return;
       }
@@ -1741,7 +1874,7 @@
       const dpx = (156543.03392 * Math.cos(S.mLat * Math.PI / 180) / Math.pow(2, S.mZoom)) / 111320;
       S.mLat = t0.lat + dy * dpx;
       S.mLng = t0.lng - dx * dpx;
-      drawMap();
+      scheduleDraw();
       e.preventDefault();
     }, { passive: false });
 
@@ -1769,7 +1902,7 @@
       const unit = e.deltaMode === 1 ? 16 : e.deltaMode === 2 ? 100 : 1;
       const step = Math.max(-1, Math.min(1, (-e.deltaY * unit) / 300));
       zoomAbout(S.mZoom + step, e.clientX - rect.left, e.clientY - rect.top);
-      drawMap();
+      scheduleDraw();
     }, { passive: false });
 
     wrap.addEventListener('mousedown', (e) => {
@@ -1787,15 +1920,23 @@
       const dpx = (156543.03392 * Math.cos(S.mLat * Math.PI / 180) / Math.pow(2, S.mZoom)) / 111320;
       S.mLat = S.viewStart.lat + dy * dpx;
       S.mLng = S.viewStart.lng - dx * dpx;
-      drawMap();
+      scheduleDraw();
     });
     window.addEventListener('mouseup', () => { S.dragging = false; lpCancel(); });
 
-    window.addEventListener('resize', () => {
-      canvas.width = wrap.clientWidth;
-      canvas.height = wrap.clientHeight;
+    // The map box, not the window: the box also changes size without the
+    // window doing so (the desktop sidebar, the keyboard inset), and the
+    // cached size above must follow it. Drawn synchronously here — observer
+    // callbacks run before paint, so this avoids a blank frame.
+    const onMapResize = () => {
+      _mapW = wrap.clientWidth;
+      _mapH = wrap.clientHeight;
+      canvas.width = _mapW;
+      canvas.height = _mapH;
       drawMap();
-    });
+    };
+    if (window.ResizeObserver) new ResizeObserver(onMapResize).observe(wrap);
+    else window.addEventListener('resize', onMapResize);
     drawMap();
   }
 
@@ -1904,7 +2045,9 @@
           // recommends HTTP/2.
           img.src = 'https://tile.openstreetmap.org/' + tileZ + '/' + ttx + '/' + ty + '.png';
           ((key, i) => {
-            i.onload = () => { S.tiles[key] = i; drawMap(); };
+            // A screen of ~20 tiles lands in a burst: one redraw per frame,
+            // not one per tile.
+            i.onload = () => { S.tiles[key] = i; scheduleDraw(); };
             i.onerror = () => { S.tiles[key] = 'err'; };
           })(k, img);
         }
@@ -2162,12 +2305,14 @@
   function renderPins() {
     const host = $('map-pins');
     if (!host) return;
-    clear(host);
+    // Built off-document and inserted once: one DOM mutation per redraw,
+    // instead of one per pin.
+    const frag = document.createDocumentFragment();
 
     // Place icons render *under* member pins (appended first).
     for (const p of (S.places || [])) {
       const pos = ll2px(p.lat, p.lng);
-      host.appendChild(el('div', {
+      frag.appendChild(el('div', {
         class: 'map-place',
         style: 'left:' + pos.x + 'px;top:' + pos.y + 'px',
         dataset: { action: 'focus-place', id: p.id },
@@ -2182,13 +2327,15 @@
       const cls = 'map-pin' +
         (m.id === S.myId ? ' me' : '') +
         (m.sos ? ' sos' : '');
-      host.appendChild(el('div', {
+      frag.appendChild(el('div', {
         class: cls,
         style: 'left:' + pos.x + 'px;top:' + pos.y + 'px',
         dataset: { action: 'pin-click', id: m.id },
         text: m.avatar
       }));
     }
+    clear(host);
+    host.appendChild(frag);
   }
 
   function pinClick(id) {
@@ -2554,7 +2701,7 @@
     // arrivals/departures and the local map stay responsive even when
     // the network writes above are throttled.
     checkGeofenceTransitions(lat, lng, whenIso);
-    drawMap();
+    scheduleDraw();
   }
 
   // Web / PWA breadcrumb write (native owns this on the app). The trail
@@ -2605,8 +2752,21 @@
   // launch and works regardless of whether the JS or the native receiver
   // did the writing. (The v7 migration adds a pg_cron sweep for members
   // whose devices never come back online.)
+  //
+  // From schema v16, prune_keep_history() instead: breadcrumbs AND check-ins
+  // older than 7 days, for EVERY member of the keep. Pruning only your own
+  // rows meant a phone tracking headlessly for weeks, never opened, kept
+  // everything — and landing/privacy promises deletion after 7 days.
   async function pruneOwnHistory() {
     if (!S.myId) return;
+    if (S.schemaVersion >= SCHEMA_WITH_PRUNE) {
+      try {
+        const { error } = await S.sb.rpc('prune_keep_history');
+        if (!error) return;
+        console.warn('prune_keep_history', error.code || '', error.message || '');
+      } catch (e) { console.warn('prune_keep_history', e); }
+      // Fall through: at least trim our own rows.
+    }
     const cutoff = new Date(Date.now() - HISTORY_DAYS * 24 * 3600 * 1000).toISOString();
     try {
       await S.sb.from('location_history').delete()
@@ -2706,7 +2866,7 @@
       lat: fields.lat, lng: fields.lng,
       created_by: S.user.id
     });
-    if (error) { toast('Could not add place: ' + error.message, 'err'); return false; }
+    if (error) { toast('Could not add place: ' + mapRpcError(error), 'err'); return false; }
     toast(icon + ' ' + name + ' saved', 'ok');
     return true;
   }
@@ -3516,14 +3676,20 @@
   // goes through the owner-gated rename_keep RPC. The whole Settings block
   // is hidden for non-owners (like the Invite button), and the pencil
   // swaps the resting row for an inline field in place.
+  // True while the owner has the rename field open. renderMembers runs this
+  // on every member update — every family member's pin, every few seconds —
+  // and it used to close the field each time, so a new name could vanish
+  // mid-typing within seconds of starting.
+  let _familyNameEditing = false;
+
   function renderFamilyNameSetting() {
     const block = $('family-name-block');
     if (!block) return;
-    if (!amOwner()) { block.style.display = 'none'; return; }
+    if (!amOwner()) { block.style.display = 'none'; _familyNameEditing = false; return; }
     block.style.display = '';
     const val = $('family-name-val');
     if (val) val.textContent = S.keepName || '—';
-    showFamilyNameEdit(false);
+    if (!_familyNameEditing) showFamilyNameEdit(false);
   }
 
   function showFamilyNameEdit(editing) {
@@ -3536,11 +3702,12 @@
   function editFamilyName() {
     const input = $('family-name-input');
     if (input) input.value = S.keepName || '';
+    _familyNameEditing = true;
     showFamilyNameEdit(true);
     if (input) setTimeout(() => input.focus(), 50);
   }
 
-  function cancelFamilyName() { showFamilyNameEdit(false); }
+  function cancelFamilyName() { _familyNameEditing = false; showFamilyNameEdit(false); }
 
   async function saveFamilyName() {
     const input = $('family-name-input');
@@ -3555,6 +3722,7 @@
       S.keepName = (row && row.keep_name) || name;
       const sub = $('hdr-sub'); if (sub) sub.textContent = S.keepName;
       const val = $('family-name-val'); if (val) val.textContent = S.keepName;
+      _familyNameEditing = false;
       showFamilyNameEdit(false);
       toast('✅ Family name updated', 'ok');
     } catch (e) {
@@ -4177,6 +4345,9 @@
   function showTripOnMap(idx) {
     const trip = S.tlTrips[idx];
     if (!trip || !trip.pts || !trip.pts.length) return;
+    // A past trip is finished: nothing live may append to it (the old
+    // keep-wide stream used to tack today's fixes onto yesterday's drive).
+    unsubscribeTrail();
     S.trail = trip.pts;
     S.trailMemberId = S.tlMemberId;
     S.trailLabel = tlDayLabel(S.tlDayOffset);
@@ -4224,6 +4395,8 @@
       S.trail = data;
       S.trailMemberId = memberId;
       S.trailLabel = '24h';
+      // The rolling 24h trail is the only one that grows live.
+      subscribeTrail(memberId);
       updateTrailPill();
       drawMap();
     } catch (e) { console.warn('loadTrail', e); }
@@ -4232,6 +4405,7 @@
   function clearTrail() {
     S.trail = [];
     S.trailMemberId = null;
+    unsubscribeTrail();
     updateTrailPill();
     drawMap();
   }
@@ -4260,61 +4434,162 @@
     pill.style.display = 'flex';
   }
 
-  async function triggerSOS() {
-    if (S.sosActive) { cancelSOS(); return; }
-    S.sosActive = true;
-    const me = S.members.find(m => m.id === S.myId);
-    try {
-      await S.sb.from('keep_members').update({ sos: true, status: '🆘 SOS ACTIVE' }).eq('id', S.myId);
-      if (me) {
-        // Stamp WHERE, not just who and when. This row is what the rest
-        // of the family navigates to, and it has to keep meaning the
-        // same thing a week later — so it records the position at the
-        // moment the alert was raised rather than wherever the member
-        // happens to be when someone opens the log.
-        //
-        // Best effort: a member with no fix yet still gets the alert out.
-        // An SOS that failed to send because we were waiting on GPS would
-        // be the worst possible trade.
-        const sosAt = (typeof me.lat === 'number' && typeof me.lng === 'number')
-          ? { lat: me.lat, lng: me.lng } : {};
-        await S.sb.from('checkins').insert(Object.assign({
-          keep_id: S.keepId,
-          member_id: S.myId,
-          member_name: me.name,
-          member_avatar: me.avatar,
-          place: '🆘 Emergency SOS Alert',
-          type: 'sos'
-        }, sosAt));
-      }
-    } catch (_) {}
-    $('sos-hdr')?.classList.add('ring');
-    $('sos-big')?.classList.add('ring');
+  // ── SOS ──────────────────────────────────────────────────────────
+  //
+  // The screen may only say an alert was sent once the server has the
+  // check-in row — that row is what wakes the family. Until 4.9.0 this
+  // wrapped both writes in try/catch and then announced "ALERT SENT —
+  // Family has been notified!" unconditionally; but supabase-js RESOLVES
+  // with { error } on every failure (offline included) instead of throwing,
+  // so the catch never ran. With no signal — the likeliest place to need
+  // one — a person was told help was on its way when nobody knew.
+  //
+  // Now: the row carries a client id, so a retry that lands twice is one
+  // alert (a 23505 duplicate means an earlier attempt got through). Until it
+  // lands the screen says NOT SENT, loudly, and keeps trying.
+  let _sosPending = null;       // { row, rowSent, inFlight, cancelled, attempt }
+  let _sosRetryTimer = null;
+  const SOS_RETRY_MS = [2000, 5000, 10000, 30000];
+
+  function newUuid() {
+    if (window.crypto && typeof crypto.randomUUID === 'function') return crypto.randomUUID();
+    const b = crypto.getRandomValues(new Uint8Array(16));
+    b[6] = (b[6] & 0x0f) | 0x40;
+    b[8] = (b[8] & 0x3f) | 0x80;
+    const h = Array.from(b, (x) => x.toString(16).padStart(2, '0')).join('');
+    return h.slice(0, 8) + '-' + h.slice(8, 12) + '-' + h.slice(12, 16) + '-' + h.slice(16, 20) + '-' + h.slice(20);
+  }
+
+  // One place paints the SOS controls, from one of four states.
+  function renderSosUi(state) {
+    const active = state !== 'idle';
+    $('sos-hdr')?.classList.toggle('ring', active);
+    $('sos-big')?.classList.toggle('ring', active);
     const msg = $('sos-msg');
     if (msg) {
-      msg.textContent = '🆘 ALERT SENT — Family has been notified!';
-      msg.className = 'sos-msg on';
+      msg.textContent =
+          state === 'sent'    ? '🆘 ALERT SENT — Family has been notified!'
+        : state === 'sending' ? '🆘 Sending alert…'
+        : state === 'failed'  ? '⚠️ ALERT NOT SENT YET — can’t reach your family’s server. '
+                                + 'Retrying automatically. In an emergency call 000.'
+        : 'Tap to send an emergency alert to all family members';
+      msg.className = 'sos-msg' + (state === 'failed' ? ' fail' : active ? ' on' : '');
     }
     const can = $('cancel-sos');
-    if (can) can.style.display = 'inline-block';
-    toast('🆘 SOS alert sent!', 'bad');
+    if (can) can.style.display = active ? 'inline-block' : 'none';
+  }
+
+  async function triggerSOS() {
+    if (S.sosActive) { cancelSOS(); return; }
+    const me = myMember();
+    if (!me || !S.myId || !S.keepId) {
+      toast('Still loading your Keep — try again in a moment', 'err');
+      return;
+    }
+    S.sosActive = true;
+    // Stamp WHERE, not just who and when. This row is what the rest of the
+    // family navigates to, and it has to keep meaning the same thing a week
+    // later — so it records the position at the moment the alert was raised.
+    // Best effort: a member with no fix yet still gets the alert out.
+    const sosAt = (typeof me.lat === 'number' && typeof me.lng === 'number')
+      ? { lat: me.lat, lng: me.lng } : {};
+    _sosPending = {
+      rowSent: false, inFlight: false, cancelled: false, attempt: 0,
+      row: Object.assign({
+        id: newUuid(),
+        keep_id: S.keepId,
+        member_id: S.myId,
+        member_name: me.name,
+        member_avatar: me.avatar,
+        place: '🆘 Emergency SOS Alert',
+        type: 'sos'
+      }, sosAt)
+    };
+    renderSosUi('sending');
+    await sendPendingSos();
+  }
+
+  async function sendPendingSos() {
+    const p = _sosPending;
+    if (!p || p.inFlight) return;
+    if (_sosRetryTimer) { clearTimeout(_sosRetryTimer); _sosRetryTimer = null; }
+
+    if (!p.rowSent) {
+      p.inFlight = true;
+      let error;
+      try { ({ error } = await S.sb.from('checkins').insert(p.row)); } catch (e) { error = e || {}; }
+      p.inFlight = false;
+      const landed = !error || error.code === '23505';
+      if (p.cancelled) {
+        // Cancelled while the request was out. If it landed anyway the family
+        // HAS been alerted, and the person has to know that.
+        if (landed) toast('The SOS reached your family before it could be cancelled — let them know you are OK', 'err');
+        return;
+      }
+      if (!landed) {
+        console.warn('sos insert', error && (error.code || error.message));
+        renderSosUi('failed');
+        p.attempt++;
+        _sosRetryTimer = setTimeout(sendPendingSos, SOS_RETRY_MS[Math.min(p.attempt - 1, SOS_RETRY_MS.length - 1)]);
+        return;
+      }
+      p.rowSent = true;
+      renderSosUi('sent');
+      toast('🆘 SOS alert sent!', 'bad');
+    }
+
+    // The member flag colours the map and the member list. The family has
+    // already been woken by the row, so this retries quietly on failure.
+    let error;
+    try {
+      ({ error } = await S.sb.from('keep_members')
+        .update({ sos: true, status: '🆘 SOS ACTIVE' }).eq('id', S.myId));
+    } catch (e) { error = e || {}; }
+    if (_sosPending !== p) return;
+    if (!error) { _sosPending = null; return; }
+    p.attempt++;
+    _sosRetryTimer = setTimeout(sendPendingSos, SOS_RETRY_MS[Math.min(p.attempt - 1, SOS_RETRY_MS.length - 1)]);
   }
 
   async function cancelSOS() {
-    S.sosActive = false;
-    try {
-      await S.sb.from('keep_members').update({ sos: false, status: STATUS_DEFAULT }).eq('id', S.myId);
-    } catch (_) {}
-    $('sos-hdr')?.classList.remove('ring');
-    $('sos-big')?.classList.remove('ring');
-    const msg = $('sos-msg');
-    if (msg) {
-      msg.textContent = 'Tap to send an emergency alert to all family members';
-      msg.className = 'sos-msg';
+    const pending = _sosPending;
+    if (_sosRetryTimer) { clearTimeout(_sosRetryTimer); _sosRetryTimer = null; }
+    _sosPending = null;
+    if (pending && !pending.rowSent) {
+      // Nothing reached the server, so nothing to take back — unless a
+      // request is out right now, which sendPendingSos reports if it lands.
+      pending.cancelled = true;
+      S.sosActive = false;
+      renderSosUi('idle');
+      toast('SOS cancelled before it was sent', 'ok');
+      return;
     }
-    const can = $('cancel-sos');
-    if (can) can.style.display = 'none';
+    let error;
+    try {
+      ({ error } = await S.sb.from('keep_members')
+        .update({ sos: false, status: STATUS_DEFAULT }).eq('id', S.myId));
+    } catch (e) { error = e || {}; }
+    if (error) {
+      // The family still sees the SOS, so this screen must keep saying so.
+      toast('Couldn’t reach your family’s server to cancel the SOS — check your connection and tap Cancel again', 'err');
+      return;
+    }
+    S.sosActive = false;
+    renderSosUi('idle');
     toast('✅ SOS cancelled', 'ok');
+  }
+
+  // After a relaunch the button must reflect the DATABASE: S.sosActive used
+  // to start false whatever the member row said, so with an SOS still active
+  // the next tap raised a second one — past every mute — instead of
+  // cancelling. Also runs when this member's row changes elsewhere.
+  function syncSosFromRow() {
+    if (_sosPending) return;                 // our own send is in charge
+    const me = myMember();
+    const active = !!(me && me.sos);
+    if (active === S.sosActive) return;
+    S.sosActive = active;
+    renderSosUi(active ? 'sent' : 'idle');
   }
 
   // ── INVITE (owner only) ────────────────────────────────────────
@@ -4324,13 +4599,22 @@
 
   async function openInvite() {
     if (!amOwner()) { toast('Only an owner can manage invites', 'err'); return; }
-    // Pull the freshest code + expiry straight from the keep row (members
-    // can read their own keep). Avoids threading expiry through every load.
+    // The freshest code + expiry. From schema v16 through get_invite(), which
+    // is owner-only on the server; the launch query no longer reads the code
+    // at all, so "only owners see it" stops being a UI rule. An older
+    // database has no get_invite, so it falls back to the keep row.
     let code = S.keepCode, expires = null;
     try {
-      const { data } = await S.sb.from('keeps')
-        .select('code, code_expires_at').eq('id', S.keepId).single();
-      if (data) { code = data.code; expires = data.code_expires_at; S.keepCode = code; }
+      if (S.schemaVersion >= SCHEMA_WITH_GET_INVITE) {
+        const { data, error } = await S.sb.rpc('get_invite', { p_keep_id: S.keepId });
+        const row = Array.isArray(data) ? data[0] : data;
+        if (error) toast(mapRpcError(error), 'err');
+        else if (row) { code = row.keep_code; expires = row.code_expires_at; S.keepCode = code; }
+      } else {
+        const { data } = await S.sb.from('keeps')
+          .select('code, code_expires_at').eq('id', S.keepId).single();
+        if (data) { code = data.code; expires = data.code_expires_at; S.keepCode = code; }
+      }
     } catch (_) {}
     renderInvite(code, expires);
     const sheet = $('invite-sheet');
@@ -4950,7 +5234,7 @@
       S.placeRadius = v;
       const lbl = $('pe-radius-lbl');
       if (lbl) lbl.textContent = String(v);
-      drawMap();
+      scheduleDraw();
     });
 
     window.addEventListener('beforeinstallprompt', (e) => {
@@ -4962,6 +5246,10 @@
       $('install-banner')?.classList.remove('on');
       S.deferredPrompt = null;
     });
+
+    // The connection is back: retry an unsent SOS immediately rather than
+    // waiting out the backoff.
+    window.addEventListener('online', () => { if (_sosPending) sendPendingSos(); });
 
     window.addEventListener('beforeunload', () => {
       if (S.myId) {
@@ -5519,12 +5807,15 @@
     const btn = $('leave-keep-btn');
     if (btn) { btn.disabled = true; btn.textContent = '⏳ Leaving…'; }
 
+    _leaving = true;
     const { error } = await S.sb.rpc('leave_keep', { p_member_id: me.id });
     if (error) {
+      _leaving = false;
       if (btn) { btn.disabled = false; btn.textContent = 'Leave this Keep'; }
       toast(mapRpcError(error), 'err');
       return;
     }
+    unsubscribeTrail();
 
     // Stop the OS firing transitions into a keep this device is no longer
     // part of. clearAll wipes the stored auth, places and pending queue —
@@ -5741,7 +6032,10 @@
     }
     S._nativeGeoReady = false;
     S._nativeLocReady = false;
-    try { if (S.sb) await S.sb.auth.signOut(); } catch (_) {}
+    unsubscribeTrail();
+    // 'local' — this device only. See signOut(): the global default would
+    // also sign out the phone this one is usually being replaced BY.
+    try { if (S.sb) await S.sb.auth.signOut({ scope: 'local' }); } catch (_) {}
     if (S.channel) { try { S.sb.removeChannel(S.channel); } catch (_) {} S.channel = null; }
     await clearBackendConfig();
     // Full reload is the honest way to reset every module-level cache
@@ -5834,14 +6128,20 @@
         S.authHandled = true;
         S.user = session.user;
         setMsg('Loading your Keep…');
-        S.sb.from('keep_members').select('*,keeps(id,code,name)')
-          .eq('user_id', S.user.id).limit(1)
+        // keeps(id,name) — NOT the invite code. Every member used to fetch it
+        // here, which made "only owners see the code" a UI rule and nothing
+        // more; owners now read it through get_invite() when they open
+        // Invite. Ordered, because an account created before schema v16 may
+        // hold two memberships, and an unordered limit(1) could open a
+        // different family on different launches.
+        S.sb.from('keep_members').select('*,keeps(id,name)')
+          .eq('user_id', S.user.id).order('created_at').limit(1)
           .then(({ data, error }) => {
             if (error) { fatal('Error loading Keep: ' + error.message); return; }
             if (data && data.length > 0) {
               const m = data[0];
               S.keepId = m.keep_id;
-              S.keepCode = m.keeps.code;
+              S.keepCode = '';
               S.keepName = m.keeps.name;
               S.myId = m.id;
               // Fire-and-forget: no-ops unless this user is the owner and
@@ -5849,6 +6149,12 @@
               ensureProjectUrl();
               launchApp();
             } else {
+              // Signed in, but in no Keep: never joined, left, or REMOVED by
+              // an owner. In the last case the native pipeline was still
+              // running for the old membership — foreground service, GPS,
+              // geofences — posting rows the server refused, on a phone now
+              // showing the join screen. Tear it down; joining re-arms it.
+              teardownNative();
               initAvPickers();
               show('s-keep'); applyPendingJoinCode();
             }

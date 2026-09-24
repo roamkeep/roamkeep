@@ -150,7 +150,12 @@ body {
 #s-auth, #s-keep, #s-connect, #s-outdated, #s-terms {
   background: var(--bark);
   align-items: center;
-  justify-content: center;
+  /* flex-start, NOT center. justify-content: center splits an overflowing
+     card's excess equally above and below, and the half above the start
+     edge can never be scrolled to — on a phone that hid the whole top of
+     the terms card, "Before you start" included, while the rest scrolled
+     normally. The card centres itself with auto margins below instead. */
+  justify-content: flex-start;
   padding: 20px;
   /* When the on-screen keyboard is up (--kb > 0) give the scrollable card
      extra room below and tell scrollIntoView to clear the keyboard, so the
@@ -159,6 +164,17 @@ body {
   scroll-padding-bottom: var(--kb, 0px);
   overflow-y: auto;
   -webkit-overflow-scrolling: touch;
+}
+/* Safe centring. Auto margins take up the free space when the card fits,
+   so it sits in the middle exactly as before, and collapse to zero when it
+   does not, so a tall card starts at the top of the scroll area rather than
+   above it. Deliberately not `justify-content: safe center`: WebView only
+   supports that from Chromium 115, and older Android WebViews still ship. */
+#s-auth > .card, #s-keep > .card, #s-connect > .card,
+#s-outdated > .card, #s-terms > .card {
+  margin-top: auto;
+  margin-bottom: auto;
+  flex-shrink: 0;
 }
 .card {
   background: var(--warm);
@@ -732,6 +748,11 @@ input[type=range]::-moz-range-thumb {
 }
 .sos-msg { font-size: 12px; color: var(--stone); line-height: 1.5; }
 .sos-msg.on { color: var(--sos); font-weight: 600; font-size: 13px; }
+/* Not sent. Louder than "sent": this is the state someone must act on. */
+.sos-msg.fail {
+  color: #fff; background: var(--sos); font-weight: 700; font-size: 13px;
+  padding: 8px 10px; border-radius: 10px;
+}
 .cancel-sos {
   margin-top: 12px; padding: 9px 20px;
   background: white; border: 2px solid var(--sos);

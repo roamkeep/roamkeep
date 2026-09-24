@@ -307,6 +307,77 @@ public class PrefsStore {
     public String getLastPushSeen()            { return sp.getString(K_LAST_PUSH_SEEN, null); }
     public void setLastPushSeen(String isoTs)  { sp.edit().putString(K_LAST_PUSH_SEEN, isoTs).apply(); }
 
+    // The same watermark on the SERVER's clock (schema v16, checkins.inserted_at).
+    // A separate key because the two are different clocks and must never be
+    // compared: the one above holds a device-reported created_at. Seeded from
+    // it on first use — see RoamkeepMessagingService.
+    private static final String K_LAST_PUSH_SEEN_INS = "last_push_seen_ins";
+    public String getLastPushSeenInserted()           { return sp.getString(K_LAST_PUSH_SEEN_INS, null); }
+    public void setLastPushSeenInserted(String isoTs) { sp.edit().putString(K_LAST_PUSH_SEEN_INS, isoTs).apply(); }
+
+    // IDs of check-ins already raised as notifications, oldest first, capped.
+    // The notification query deliberately OVERLAPS its window, because a row
+    // can land after a newer one (a crossing queued through a network
+    // handoff); this set is what stops the overlap raising a row twice.
+    private static final String K_PUSH_SEEN_IDS = "push_seen_ids";
+    private static final int PUSH_SEEN_CAP = 200;
+
+    public Set<String> getPushSeenIds() { synchronized (LOCK) {
+        Set<String> out = new HashSet<>();
+        try {
+            JSONArray arr = new JSONArray(sp.getString(K_PUSH_SEEN_IDS, "[]"));
+            for (int i = 0; i < arr.length(); i++) {
+                String id = arr.optString(i, null);
+                if (id != null) out.add(id);
+            }
+        } catch (JSONException ignored) {}
+        return out;
+    } }
+
+    public void addPushSeenIds(Collection<String> ids) { synchronized (LOCK) {
+        if (ids == null || ids.isEmpty()) return;
+        List<String> list = new ArrayList<>();
+        try {
+            JSONArray arr = new JSONArray(sp.getString(K_PUSH_SEEN_IDS, "[]"));
+            for (int i = 0; i < arr.length(); i++) {
+                String id = arr.optString(i, null);
+                if (id != null) list.add(id);
+            }
+        } catch (JSONException ignored) {}
+        for (String id : ids) if (id != null && !list.contains(id)) list.add(id);
+        while (list.size() > PUSH_SEEN_CAP) list.remove(0);
+        JSONArray out = new JSONArray();
+        for (String id : list) out.put(id);
+        sp.edit().putString(K_PUSH_SEEN_IDS, out.toString()).apply();
+    } }
+
+    // When the live pin (keep_members lat/lng) was last written, epoch-ms.
+    // PERSISTED, because the breadcrumb pipeline runs in short-lived
+    // processes; see LocationUpdateReceiver's pin throttle.
+    private static final String K_LAST_PIN_WRITE = "last_pin_write";
+    public long getLastPinWriteMs()        { return sp.getLong(K_LAST_PIN_WRITE, 0); }
+    public void setLastPinWriteMs(long ms) { sp.edit().putLong(K_LAST_PIN_WRITE, ms).apply(); }
+
+    // Consecutive writes the server refused on row-level security (42501) —
+    // what a device sees once its member has been removed from the Keep —
+    // and the flag set when the streak says so. While the flag is set the
+    // headless pipeline stays dark; initialize() (the app opening with a
+    // valid membership) clears it. See LocationUpdateReceiver.
+    private static final String K_REJECT_STREAK   = "rls_reject_streak";
+    private static final String K_SERVER_REJECTED = "server_rejected";
+
+    public int bumpRejectStreak() { synchronized (LOCK) {
+        int n = sp.getInt(K_REJECT_STREAK, 0) + 1;
+        sp.edit().putInt(K_REJECT_STREAK, n).apply();
+        return n;
+    } }
+    public int getRejectStreak() { return sp.getInt(K_REJECT_STREAK, 0); }
+    public void resetRejectStreak() { synchronized (LOCK) {
+        if (sp.getInt(K_REJECT_STREAK, 0) != 0) sp.edit().putInt(K_REJECT_STREAK, 0).apply();
+    } }
+    public boolean isServerRejected()           { return sp.getBoolean(K_SERVER_REJECTED, false); }
+    public void setServerRejected(boolean on)   { sp.edit().putBoolean(K_SERVER_REJECTED, on).apply(); }
+
     /** null = never armed. Distinct from "" (armed an empty list), which
      *  is a real state meaning every place was deleted. */
     public String getPlacesSignature()          { return sp.getString(K_PLACES_SIG, null); }
@@ -318,9 +389,9 @@ public class PrefsStore {
      *  The four should account for every fix, so
      *  {@code written + suppressed + rejected} summing to the fixes seen is
      *  a real check rather than an accident of nothing ever being dropped. */
-    public synchronized void recordLocationFire(long whenMs, int crumbsWritten,
+    public void recordLocationFire(long whenMs, int crumbsWritten,
                                                 int suppressed, int rejStill,
-                                                int rejDrift, int rejUnusable) {
+                                                int rejDrift, int rejUnusable) { synchronized (LOCK) {
         final int rejected = rejStill + rejDrift + rejUnusable;
         sp.edit()
                 .putLong(K_LAST_LOC_FIRE, whenMs)
@@ -332,7 +403,7 @@ public class PrefsStore {
                 .putInt(K_REJ_DRIFT, sp.getInt(K_REJ_DRIFT, 0) + rejDrift)
                 .putInt(K_REJ_UNUSABLE, sp.getInt(K_REJ_UNUSABLE, 0) + rejUnusable)
                 .apply();
-    }
+    } }
     public long getLastLocationFire() { return sp.getLong(K_LAST_LOC_FIRE, 0); }
     public int getLocationFireCount() { return sp.getInt(K_LOC_FIRE_COUNT, 0); }
     public int getBreadcrumbCount()   { return sp.getInt(K_CRUMB_COUNT, 0); }
@@ -378,7 +449,7 @@ public class PrefsStore {
         public long sinceMs;
     }
 
-    public synchronized RejectWindow getRejectWindow() {
+    public RejectWindow getRejectWindow() { synchronized (LOCK) {
         RejectWindow w = new RejectWindow();
         w.still     = sp.getInt(K_PEND_STILL, 0);
         w.drift     = sp.getInt(K_PEND_DRIFT, 0);
@@ -387,9 +458,9 @@ public class PrefsStore {
         w.worstDist = sp.getFloat(K_PEND_WORST_DST, 0f);
         w.sinceMs   = sp.getLong(K_PEND_SINCE, 0);
         return w;
-    }
+    } }
 
-    public synchronized void setRejectWindow(RejectWindow w) {
+    public void setRejectWindow(RejectWindow w) { synchronized (LOCK) {
         sp.edit()
                 .putInt(K_PEND_STILL, w.still)
                 .putInt(K_PEND_DRIFT, w.drift)
@@ -398,29 +469,29 @@ public class PrefsStore {
                 .putFloat(K_PEND_WORST_DST, w.worstDist)
                 .putLong(K_PEND_SINCE, w.sinceMs)
                 .apply();
-    }
+    } }
 
     /** The last position accepted as real. Null until one has been recorded
      *  (fresh install, or after a sign-out clears everything). */
-    public synchronized Anchor getBreadcrumbAnchor() {
+    public Anchor getBreadcrumbAnchor() { synchronized (LOCK) {
         long t = sp.getLong(K_ANCHOR_T, 0);
         if (t == 0) return null;
         return new Anchor(Double.longBitsToDouble(sp.getLong(K_ANCHOR_LAT, 0)),
                           Double.longBitsToDouble(sp.getLong(K_ANCHOR_LNG, 0)), t);
-    }
+    } }
 
     /** ONE editor, so the three values commit together. A torn anchor — the
      *  latitude of one fix with the longitude of another — would be a
      *  position that never existed, and the gate would measure drift against
      *  it forever. If this is ever split into separate writes, that bug
      *  comes back. */
-    public synchronized void setBreadcrumbAnchor(double lat, double lng, long tMs) {
+    public void setBreadcrumbAnchor(double lat, double lng, long tMs) { synchronized (LOCK) {
         sp.edit()
                 .putLong(K_ANCHOR_LAT, Double.doubleToRawLongBits(lat))
                 .putLong(K_ANCHOR_LNG, Double.doubleToRawLongBits(lng))
                 .putLong(K_ANCHOR_T, tMs)
                 .apply();
-    }
+    } }
 
     /** SharedPreferences has no double; raw long bits keep it exact. */
     public static final class Anchor {
@@ -445,7 +516,7 @@ public class PrefsStore {
         }
     }
 
-    public synchronized Motion getMotion() {
+    public Motion getMotion() { synchronized (LOCK) {
         long t = sp.getLong(K_EMA_T, 0);
         if (t == 0) return new Motion(false, 0, 0, 0, 0, 0, 0);
         return new Motion(true,
@@ -454,12 +525,12 @@ public class PrefsStore {
                 Double.longBitsToDouble(sp.getLong(K_STILL_LAT, 0)),
                 Double.longBitsToDouble(sp.getLong(K_STILL_LNG, 0)),
                 sp.getLong(K_MOVING_UNTIL, 0));
-    }
+    } }
 
     /** One editor, for the same reason the anchor uses one: a half-written
      *  motion state would describe a device that was never anywhere. */
-    public synchronized void setMotion(double emaLat, double emaLng, long emaMs,
-                                       double stillLat, double stillLng, long movingUntilMs) {
+    public void setMotion(double emaLat, double emaLng, long emaMs,
+                                       double stillLat, double stillLng, long movingUntilMs) { synchronized (LOCK) {
         sp.edit()
                 .putLong(K_EMA_LAT, Double.doubleToRawLongBits(emaLat))
                 .putLong(K_EMA_LNG, Double.doubleToRawLongBits(emaLng))
@@ -468,7 +539,7 @@ public class PrefsStore {
                 .putLong(K_STILL_LNG, Double.doubleToRawLongBits(stillLng))
                 .putLong(K_MOVING_UNTIL, movingUntilMs)
                 .apply();
-    }
+    } }
 
     /**
      * Shared monitor for read-modify-write state.
@@ -480,13 +551,14 @@ public class PrefsStore {
      * SharedPreferences itself is process-wide, so the data being guarded is
      * shared even though the wrappers are not.
      *
-     * The remaining `synchronized` methods in this class have the same latent
-     * flaw. They are left alone for now because the pipeline that touches
-     * them is serialised at its source (LocationUpdateReceiver.submit); this
-     * lock covers the journal, which genuinely is written from several
-     * threads at once — the foreground service's main looper, the geofence
-     * worker and the location worker — and is the only witness we have for
-     * headless behaviour, so losing lines to a race is expensive.
+     * So EVERY read-modify-write in this class takes this one lock (4.9.0).
+     * They used to be `synchronized` instance methods — decorative — on the
+     * grounds that the pipeline touching them is serialised at its source.
+     * It is not: the pending-checkin queue and the inside-place set are
+     * written by the geofence worker, the location worker and the plugin's
+     * flush thread, so a drain writing back its list could silently drop a
+     * check-in appended a moment earlier. One lock, reentrant, and no second
+     * monitor anywhere — so no lock-ordering question can arise.
      */
     private static final Object LOCK = new Object();
 
@@ -566,7 +638,7 @@ public class PrefsStore {
         }
     }
 
-    public synchronized List<Place> getPlaces() {
+    public List<Place> getPlaces() { synchronized (LOCK) {
         String raw = sp.getString(K_PLACES, "[]");
         List<Place> out = new ArrayList<>();
         try {
@@ -576,14 +648,14 @@ public class PrefsStore {
             }
         } catch (JSONException ignored) { /* corrupt → treat as empty */ }
         return out;
-    }
+    } }
 
-    public synchronized Place findPlace(String id) {
+    public Place findPlace(String id) { synchronized (LOCK) {
         for (Place p : getPlaces()) if (p.id.equals(id)) return p;
         return null;
-    }
+    } }
 
-    public synchronized void putPlace(Place p) {
+    public void putPlace(Place p) { synchronized (LOCK) {
         List<Place> places = getPlaces();
         // Replace any existing entry with same id.
         for (int i = 0; i < places.size(); i++) {
@@ -591,9 +663,9 @@ public class PrefsStore {
         }
         places.add(p);
         writePlaces(places);
-    }
+    } }
 
-    public synchronized void removePlace(String id) {
+    public void removePlace(String id) { synchronized (LOCK) {
         List<Place> places = getPlaces();
         for (int i = 0; i < places.size(); i++) {
             if (places.get(i).id.equals(id)) { places.remove(i); break; }
@@ -603,11 +675,11 @@ public class PrefsStore {
         // it — the geofence no longer exists, so we should not
         // expect a matching EXIT to clear the state later.
         removeInsidePlace(id);
-    }
+    } }
 
-    public synchronized void clearPlaces() {
+    public void clearPlaces() { synchronized (LOCK) {
         writePlaces(new ArrayList<>());
-    }
+    } }
 
     private void writePlaces(List<Place> places) {
         JSONArray arr = new JSONArray();
@@ -626,7 +698,7 @@ public class PrefsStore {
     // synthetic (OS re-evaluation noise) and dropped. An ENTER for a
     // place *already* in the set is treated as a duplicate.
 
-    public synchronized Set<String> getInsidePlaceIds() {
+    public Set<String> getInsidePlaceIds() { synchronized (LOCK) {
         String raw = sp.getString(K_INSIDE_PLACE_IDS, "[]");
         Set<String> out = new HashSet<>();
         try {
@@ -637,41 +709,41 @@ public class PrefsStore {
             }
         } catch (JSONException ignored) {}
         return out;
-    }
+    } }
 
-    public synchronized boolean isInsidePlace(String id) {
+    public boolean isInsidePlace(String id) { synchronized (LOCK) {
         return getInsidePlaceIds().contains(id);
-    }
+    } }
 
-    public synchronized void setInsidePlaceIds(Collection<String> ids) {
+    public void setInsidePlaceIds(Collection<String> ids) { synchronized (LOCK) {
         JSONArray arr = new JSONArray();
         if (ids != null) for (String id : ids) arr.put(id);
         sp.edit().putString(K_INSIDE_PLACE_IDS, arr.toString()).apply();
-    }
+    } }
 
     /** Union-merge — adds jsState on top of existing native state rather
      *  than overwriting. Preserves any ENTERs the receiver captured
      *  while the app was closed (and that JS doesn't know about yet
      *  because last_place_id only tracks one place). */
-    public synchronized void mergeInsidePlaceIds(Collection<String> ids) {
+    public void mergeInsidePlaceIds(Collection<String> ids) { synchronized (LOCK) {
         if (ids == null || ids.isEmpty()) return;
         Set<String> existing = getInsidePlaceIds();
         if (existing.addAll(ids)) setInsidePlaceIds(existing);
-    }
+    } }
 
     /** The repair watch map, {placeId: epoch-ms}. Never null; an empty
      *  object when nothing is being watched. See K_REPAIR_WATCH. */
-    public synchronized JSONObject getRepairWatch() {
+    public JSONObject getRepairWatch() { synchronized (LOCK) {
         try {
             return new JSONObject(sp.getString(K_REPAIR_WATCH, "{}"));
         } catch (JSONException e) {
             return new JSONObject();
         }
-    }
+    } }
 
-    public synchronized void setRepairWatch(JSONObject watch) {
+    public void setRepairWatch(JSONObject watch) { synchronized (LOCK) {
         sp.edit().putString(K_REPAIR_WATCH, watch == null ? "{}" : watch.toString()).apply();
-    }
+    } }
 
     /**
      * Record that we are inside a place, and report whether THIS caller is
@@ -691,10 +763,8 @@ public class PrefsStore {
      * set into a single guarded step — so the loser is told it lost and stays
      * quiet, rather than both deciding they won.
      *
-     * Lock order note: LOCK is only ever taken on its own here (the body
-     * touches `sp` directly rather than calling the synchronized accessors),
-     * and nothing anywhere holds LOCK while reaching for an instance monitor.
-     * Keep it that way.
+     * Every other accessor in this class takes the same LOCK (it is
+     * reentrant), so this compare-and-set is atomic against all of them.
      *
      * @return true if this call added the place; false if it was already set.
      */
@@ -717,17 +787,17 @@ public class PrefsStore {
         }
     }
 
-    public synchronized void addInsidePlace(String id) {
+    public void addInsidePlace(String id) { synchronized (LOCK) {
         if (id == null) return;
         Set<String> set = getInsidePlaceIds();
         if (set.add(id)) setInsidePlaceIds(set);
-    }
+    } }
 
-    public synchronized void removeInsidePlace(String id) {
+    public void removeInsidePlace(String id) { synchronized (LOCK) {
         if (id == null) return;
         Set<String> set = getInsidePlaceIds();
         if (set.remove(id)) setInsidePlaceIds(set);
-    }
+    } }
 
     // ── Pending check-in queue ─────────────────────────────────────
     //
@@ -736,7 +806,7 @@ public class PrefsStore {
     // primary-key constraint, which the receiver treats as success
     // (the row already made it; we just didn't see the response).
 
-    public synchronized List<JSONObject> getPendingCheckins() {
+    public List<JSONObject> getPendingCheckins() { synchronized (LOCK) {
         String raw = sp.getString(K_PENDING_CHECKINS, "[]");
         List<JSONObject> out = new ArrayList<>();
         try {
@@ -746,9 +816,9 @@ public class PrefsStore {
             }
         } catch (JSONException ignored) { /* corrupt → empty */ }
         return out;
-    }
+    } }
 
-    public synchronized void appendPendingCheckin(JSONObject payload) {
+    public void appendPendingCheckin(JSONObject payload) { synchronized (LOCK) {
         if (payload == null) return;
         List<JSONObject> list = getPendingCheckins();
         list.add(payload);
@@ -758,9 +828,9 @@ public class PrefsStore {
         // unbounded SharedPreferences growth.
         while (list.size() > PENDING_CAP) list.remove(0);
         writePending(list);
-    }
+    } }
 
-    public synchronized void removePendingCheckin(String id) {
+    public void removePendingCheckin(String id) { synchronized (LOCK) {
         if (id == null) return;
         List<JSONObject> list = getPendingCheckins();
         boolean changed = false;
@@ -772,11 +842,11 @@ public class PrefsStore {
             }
         }
         if (changed) writePending(list);
-    }
+    } }
 
-    public synchronized int pendingCount() {
+    public int pendingCount() { synchronized (LOCK) {
         return getPendingCheckins().size();
-    }
+    } }
 
     private void writePending(List<JSONObject> list) {
         JSONArray arr = new JSONArray();

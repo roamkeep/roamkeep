@@ -55,6 +55,12 @@ public class BootReceiver extends BroadcastReceiver {
             Log.w(TAG, why + ": no Supabase context, skipping");
             return;
         }
+        // The server stopped accepting this member's writes (removed from the
+        // Keep). Re-arming would only restart GPS for rows nobody will take.
+        if (prefs.isServerRejected()) {
+            prefs.journal(why + ": server rejected this member — skipping re-arm");
+            return;
+        }
         // An active self-pause must survive a reboot / app update: don't
         // re-arm the service, the poll, or the geofences until it elapses.
         if (prefs.isPaused()) {

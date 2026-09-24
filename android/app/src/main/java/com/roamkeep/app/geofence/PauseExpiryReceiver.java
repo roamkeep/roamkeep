@@ -60,7 +60,7 @@ public class PauseExpiryReceiver extends BroadcastReceiver {
     public void onReceive(Context context, Intent intent) {
         Context app = context.getApplicationContext();
         PrefsStore prefs = new PrefsStore(app);
-        if (!prefs.hasContext()) return;
+        if (!prefs.hasContext() || prefs.isServerRejected()) return;
         // The pause may have been extended after this alarm was set; the
         // reschedule replaces the PendingIntent, but a stale fire is still
         // possible. Re-check rather than trusting the alarm.

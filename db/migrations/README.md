@@ -23,6 +23,8 @@ that's already on an older version.
 | `familynest-schema-v12-meta.sql` | `roamkeep_meta` (schema version, `min_app_build`, `project_url`) + `roamkeep_schema_version()` + `set_project_url()`. Sets **schema_version 12**. Purely additive — every installed app keeps working after it is applied. |
 | `familynest-schema-v13-notify-prefs.sql` | `checkins.place_id`, `keep_notify_prefs` (per-person, per-place mutes), `checkin_recipients()`, the `my_checkin_feed` view, and the `keep_places` → `notify-places` webhook trigger. Sets **schema_version 13**. Requires v12. Additive. |
 | `familynest-schema-v14-column-pinning-and-push-auth.sql` | Pins `keep_members.keep_id`/`user_id` and `keep_places.created_by`/`keep_id` via BEFORE UPDATE triggers (RLS `WITH CHECK` only sees the new row, so it cannot); binds `checkins.member_id` to the caller; adds `roamkeep_secrets` + an `x-roamkeep-webhook` header so the Edge Functions can tell a real webhook from a forged one; moves push tokens to `keep_member_push` and **drops `keep_members.fcm_token`**. Sets **schema_version 14**. Requires v13. **Not purely additive** — see the file header before running it against clients you do not control. |
+| `familynest-schema-v15-location-accuracy.sql` | `location_history.accuracy` (nullable, diagnostic). Sets **schema_version 15**. Requires v14. Purely additive. |
+| `familynest-schema-v16-server-truth-and-retention.sql` | The server decides what clients were trusted with. `set_project_url` accepts only the project's own URL (from the JWT issuer). `checkins.inserted_at` (server receipt time, what devices page push by) + a BEFORE INSERT trigger that clamps future `created_at`, takes `member_name`/`avatar` from the member row and drops a foreign `place_id`; stored future-dated rows repaired. Pair-bound `(member_id, keep_id)` INSERT policies; one Keep per account. Owner-only `get_invite()`. 90-place cap. Keep row lock on ownership changes. `prune_keep_history()` + a check-in pg_cron sweep (7-day retention). Replaces a check-in webhook trigger that sends no secret (the setup wizard wrote one; it made notify-checkin answer 403). Sets **schema_version 16**. Requires v15. Additive for every installed app. Verify with `../tests/v16-verify.sql`. |
 
 ## Schema versions and app compatibility
 
@@ -34,6 +36,9 @@ number rather than claiming a state it did not reach.
 |---|---|---|
 | 12 | `familynest-schema-v12-meta.sql` | 4.7.0 (the gate ships inert — 4.7.0 runs fine against a pre-v12 database too) |
 | 13 | `familynest-schema-v13-notify-prefs.sql` | **4.8.0** — the first release to actually require a version. Run this before 4.8.0 reaches phones, or they show the "server needs updating" screen until you do. |
+| 14 | `familynest-schema-v14-column-pinning-and-push-auth.sql` | 4.8.3 (older apps can no longer register a push token — see the file) |
+| 15 | `familynest-schema-v15-location-accuracy.sql` | none — optional; apps record accuracy only when present |
+| 16 | `familynest-schema-v16-server-truth-and-retention.sql` | none — optional; 4.9.0 uses each v16 feature when present and falls back without it. Apply it anyway: the security fixes are server-side and protect every app version. |
 
 `roamkeep_schema_version()` returns a **number, not a verdict**. That is
 deliberate and should stay that way: a database that answered
