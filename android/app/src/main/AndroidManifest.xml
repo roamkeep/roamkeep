@@ -65,12 +65,26 @@
                  NOTE: Play App Signing re-signs with Google's key, so the
                  Play build's fingerprint differs from the sideload one.
                  Both must be listed in assetlinks.json — see
-                 landing/README.md. -->
+                 landing/README.md.
+
+                 ONLY the setup-link path. This filter used to claim the
+                 whole host, which did no harm while verification was
+                 failing. Once it succeeded (4.9.0 on Play), every
+                 get.roamkeep.app URL came back to this app — including
+                 /privacy and /terms, which the consent screen and
+                 Settings open with an ordinary ACTION_VIEW — and the app,
+                 which only understands setup links, dropped them, so the
+                 policy links did nothing at all. A path the app does not
+                 handle must not be claimed; the landing site's own
+                 hand-off to the app uses the custom scheme below, not this.
+                 "/s/" is listed only so a slash added in transit still
+                 lands here. -->
             <intent-filter android:autoVerify="true">
                 <action android:name="android.intent.action.VIEW" />
                 <category android:name="android.intent.category.DEFAULT" />
                 <category android:name="android.intent.category.BROWSABLE" />
-                <data android:scheme="https" android:host="get.roamkeep.app" />
+                <data android:scheme="https" android:host="get.roamkeep.app" android:path="/s" />
+                <data android:scheme="https" android:host="get.roamkeep.app" android:path="/s/" />
             </intent-filter>
 
             <!-- Custom scheme: the fallback path, and what a QR carries if

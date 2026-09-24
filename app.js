@@ -1736,28 +1736,50 @@
     requestAnimationFrame(() => { _drawQueued = false; drawMap(); });
   }
 
+  // Web Mercator, both ways, in world pixels at the current zoom. Written
+  // once: ll2px, px2ll and the pan handlers all go through these, and the
+  // pan handlers kept their own degrees-per-pixel shortcut before.
+  function toWorld(lat, lng) {
+    const size = Math.pow(2, S.mZoom) * TILE_SIZE;
+    const r = lat * Math.PI / 180;
+    return {
+      x: (lng + 180) / 360 * size,
+      y: (1 - Math.log(Math.tan(r) + 1 / Math.cos(r)) / Math.PI) / 2 * size
+    };
+  }
+
+  function fromWorld(wx, wy) {
+    const size = Math.pow(2, S.mZoom) * TILE_SIZE;
+    const t = Math.PI - 2 * Math.PI * wy / size;
+    return {
+      lat: (180 / Math.PI) * Math.atan(0.5 * (Math.exp(t) - Math.exp(-t))),
+      lng: wx / size * 360 - 180
+    };
+  }
+
   function ll2px(lat, lng) {
     const [W, H] = mapSize();
-    const n = Math.pow(2, S.mZoom);
-    const cx = (S.mLng + 180) / 360 * n * TILE_SIZE;
-    const cy = (1 - Math.log(Math.tan(S.mLat * Math.PI / 180) + 1 / Math.cos(S.mLat * Math.PI / 180)) / Math.PI) / 2 * n * TILE_SIZE;
-    const px = (lng + 180) / 360 * n * TILE_SIZE;
-    const py = (1 - Math.log(Math.tan(lat * Math.PI / 180) + 1 / Math.cos(lat * Math.PI / 180)) / Math.PI) / 2 * n * TILE_SIZE;
-    return { x: W / 2 + (px - cx), y: H / 2 + (py - cy) };
+    const c = toWorld(S.mLat, S.mLng);
+    const p = toWorld(lat, lng);
+    return { x: W / 2 + (p.x - c.x), y: H / 2 + (p.y - c.y) };
   }
 
   // Inverse Web Mercator: pixel offset within #map-wrap → {lat, lng}.
   function px2ll(px, py) {
     const [W, H] = mapSize();
-    const n = Math.pow(2, S.mZoom);
-    const cx = (S.mLng + 180) / 360 * n * TILE_SIZE;
-    const cy = (1 - Math.log(Math.tan(S.mLat * Math.PI / 180) + 1 / Math.cos(S.mLat * Math.PI / 180)) / Math.PI) / 2 * n * TILE_SIZE;
-    const wx = cx + (px - W / 2);
-    const wy = cy + (py - H / 2);
-    const lng = wx / (n * TILE_SIZE) * 360 - 180;
-    const t = Math.PI - 2 * Math.PI * wy / (n * TILE_SIZE);
-    const lat = (180 / Math.PI) * Math.atan(0.5 * (Math.exp(t) - Math.exp(-t)));
-    return { lat, lng };
+    const c = toWorld(S.mLat, S.mLng);
+    return fromWorld(c.x + (px - W / 2), c.y + (py - H / 2));
+  }
+
+  // The centre after dragging (dx, dy) screen pixels from a gesture that
+  // began centred on (lat0, lng0), so the map moves exactly with the finger.
+  // In world pixels, not degrees: the old shortcut scaled BOTH axes by
+  // cos(latitude), which is right for latitude and wrong for longitude —
+  // a sideways drag moved the map cos(lat) of the way (83% in Sydney, 64%
+  // at 50°), so the map slid out from under the finger.
+  function panFrom(lat0, lng0, dx, dy) {
+    const c = toWorld(lat0, lng0);
+    return fromWorld(c.x - dx, c.y - dy);
   }
 
   function initMap() {
@@ -1869,11 +1891,9 @@
       }
       if (!t0 || e.touches.length !== 1) { lpCancel(); return; }
       lpMaybeCancel(e.touches[0].clientX, e.touches[0].clientY);
-      const dx = e.touches[0].clientX - t0.x;
-      const dy = e.touches[0].clientY - t0.y;
-      const dpx = (156543.03392 * Math.cos(S.mLat * Math.PI / 180) / Math.pow(2, S.mZoom)) / 111320;
-      S.mLat = t0.lat + dy * dpx;
-      S.mLng = t0.lng - dx * dpx;
+      const c = panFrom(t0.lat, t0.lng, e.touches[0].clientX - t0.x, e.touches[0].clientY - t0.y);
+      S.mLat = c.lat;
+      S.mLng = c.lng;
       scheduleDraw();
       e.preventDefault();
     }, { passive: false });
@@ -1915,11 +1935,9 @@
     window.addEventListener('mousemove', (e) => {
       lpMaybeCancel(e.clientX, e.clientY);
       if (!S.dragging) return;
-      const dx = e.clientX - S.dragStart.x;
-      const dy = e.clientY - S.dragStart.y;
-      const dpx = (156543.03392 * Math.cos(S.mLat * Math.PI / 180) / Math.pow(2, S.mZoom)) / 111320;
-      S.mLat = S.viewStart.lat + dy * dpx;
-      S.mLng = S.viewStart.lng - dx * dpx;
+      const c = panFrom(S.viewStart.lat, S.viewStart.lng, e.clientX - S.dragStart.x, e.clientY - S.dragStart.y);
+      S.mLat = c.lat;
+      S.mLng = c.lng;
       scheduleDraw();
     });
     window.addEventListener('mouseup', () => { S.dragging = false; lpCancel(); });

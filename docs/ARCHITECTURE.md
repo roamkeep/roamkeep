@@ -540,6 +540,17 @@ Google's key, so the Play build's fingerprint differs from the sideload
 one and **both must be listed in assetlinks.json** — see
 `landing/README.md`.
 
+**The filter claims `/s` and nothing else** (4.9.1). It used to claim the
+whole host, which was harmless only because verification kept failing.
+Once PR #96 made it succeed, every `get.roamkeep.app` URL came back to the
+app — including `/privacy` and `/terms`, which the consent screen and
+Settings open in the browser. Capacitor turns any off-origin navigation into
+a plain `ACTION_VIEW` intent (`Bridge.launchIntent`), and Android gives a
+verified App Link to its owner ahead of any browser, so the policy links
+quietly bounced back into an app that only understands setup links. **Never
+claim a path the app doesn't handle.** Any new page on the landing site is
+automatically a browser page, which is what it should be.
+
 QR scanning uses `@capacitor-mlkit/barcode-scanning`'s `scan()`, which
 hands off to Google's on-demand code-scanner activity (it owns the camera
 permission — don't gate on our own check). `android/build.gradle`

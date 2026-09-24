@@ -15,6 +15,12 @@ handles it directly — this page never loads. This page exists only for the
 case where it isn't installed: someone tapping a link on a phone with no
 app, or on a desktop.
 
+The app claims **only `/s`** (and `/s/`). Every other page here — `/`,
+`/privacy`, `/terms` — always opens in the browser, even on a phone with
+the app installed. That is deliberate: when the app claimed the whole host,
+the in-app links to the privacy policy and terms came straight back to the
+app and did nothing.
+
 ## The fragment never reaches this server
 
 Everything after `#` is a URL fragment, and browsers **do not send
