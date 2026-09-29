@@ -19,8 +19,10 @@ import java.util.Date;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Set;
 import java.util.TimeZone;
 import java.util.UUID;
+import java.util.concurrent.ConcurrentHashMap;
 
 /**
  * Broadcast receiver the OS invokes when a registered geofence
@@ -91,6 +93,39 @@ public class GeofenceReceiver extends BroadcastReceiver {
     // driving past, and costs a real arrival only a few minutes' delay. The
     // arrival is announced with its ORIGINAL time, not the confirmation's.
     static final long CONFIRM_DWELL_MS = 3 * 60_000;
+
+    // ── One POST per check-in at a time ────────────────────────────
+    //
+    // Ids of check-ins whose POST is under way in this process right now.
+    //
+    // The queue is WRITE-AHEAD (4.9.0): a check-in is appended before its
+    // POST and removed once it lands, so a process killed mid-request loses
+    // nothing. The price is that an entry sits in the queue WHILE its own
+    // POST is in flight — and three threads drain that queue: the geofence
+    // worker, the location worker on every breadcrumb batch, and the app's
+    // flush on resume. On the move a batch lands every few seconds, so at
+    // nearly every crossing one of them re-sent a row that was already on
+    // its way. The primary key made that harmless to the data (the loser
+    // got 23505 and was treated as "already there"), but every crossing
+    // left a duplicate-key ERROR in the family's Postgres log, cost a second
+    // request, and journalled "drain: 1 queued checkin(s) delivered" for a
+    // check-in whose first POST had never failed.
+    //
+    // A POST now claims its id here first, and anyone finding it claimed
+    // leaves it alone. In memory on purpose: every sender is in this one
+    // process, and if the process dies mid-request the claim dies with it,
+    // leaving the queued entry for the next drain — the write-ahead
+    // guarantee is untouched.
+    private static final Set<String> IN_FLIGHT = ConcurrentHashMap.newKeySet();
+
+    /** Claim a check-in id for sending. False if another thread has it. */
+    static boolean claimInFlight(String id) {
+        return id != null && IN_FLIGHT.add(id);
+    }
+
+    static void releaseInFlight(String id) {
+        if (id != null) IN_FLIGHT.remove(id);
+    }
 
     // judgeHeld verdicts.
     static final int HOLD_WAIT = 0;
@@ -467,7 +502,8 @@ public class GeofenceReceiver extends BroadcastReceiver {
             // INSERTs hit the primary-key constraint as 409, which the retry
             // path treats as "already there".
             JSONObject ci = new JSONObject();
-            ci.put("id", UUID.randomUUID().toString());
+            final String id = UUID.randomUUID().toString();
+            ci.put("id", id);
             ci.put("keep_id", prefs.getKeepId());
             ci.put("member_id", prefs.getMemberId());
             ci.put("member_name", prefs.getMemberName());
@@ -486,24 +522,33 @@ public class GeofenceReceiver extends BroadcastReceiver {
             // broadcast deadline passing on a slow link — the check-in used
             // to be lost with nothing to re-send it: never queued, and state
             // already saying the crossing was handled.
-            prefs.appendPendingCheckin(ci);
-            SupabaseRest.Result r = rest.insertCheckin(ci);
-            if (r == SupabaseRest.Result.SUCCESS || r == SupabaseRest.Result.DUPLICATE) {
-                prefs.removePendingCheckin(ci.optString("id", null));
-            } else if (r == SupabaseRest.Result.REJECTED) {
-                // The server will never take this payload; keeping it would
-                // only wedge the queue behind it.
-                prefs.removePendingCheckin(ci.optString("id", null));
-                prefs.journal("geo: " + type + " " + p.name + " refused by server ("
-                        + rest.lastSqlState() + ") — dropped");
-            } else {
-                // Network blip — most commonly a WiFi → cellular handoff at
-                // the boundary. It is already queued; the next breadcrumb
-                // fire (seconds away on the move), geofence fire, or app
-                // launch will retry it.
-                prefs.journal("geo: " + type + " " + p.name + " POST failed — queued");
-                Log.w(TAG, "checkin insert failed for " + p.name
-                        + " — queued for retry (pending=" + prefs.pendingCount() + ")");
+            //
+            // Claimed BEFORE it becomes visible in the queue, so no drain on
+            // another thread can see it there and send it a second time
+            // while this POST is still in flight (see IN_FLIGHT).
+            claimInFlight(id);
+            try {
+                prefs.appendPendingCheckin(ci);
+                SupabaseRest.Result r = rest.insertCheckin(ci);
+                if (r == SupabaseRest.Result.SUCCESS || r == SupabaseRest.Result.DUPLICATE) {
+                    prefs.removePendingCheckin(id);
+                } else if (r == SupabaseRest.Result.REJECTED) {
+                    // The server will never take this payload; keeping it
+                    // would only wedge the queue behind it.
+                    prefs.removePendingCheckin(id);
+                    prefs.journal("geo: " + type + " " + p.name + " refused by server ("
+                            + rest.lastSqlState() + ") — dropped");
+                } else {
+                    // Network blip — most commonly a WiFi → cellular handoff
+                    // at the boundary. It is already queued; the next
+                    // breadcrumb fire (seconds away on the move), geofence
+                    // fire, or app launch will retry it.
+                    prefs.journal("geo: " + type + " " + p.name + " POST failed — queued");
+                    Log.w(TAG, "checkin insert failed for " + p.name
+                            + " — queued for retry (pending=" + prefs.pendingCount() + ")");
+                }
+            } finally {
+                releaseInFlight(id);
             }
         } catch (JSONException e) {
             Log.w(TAG, "checkin payload build failed", e);
@@ -511,13 +556,17 @@ public class GeofenceReceiver extends BroadcastReceiver {
     }
 
     /** Iterate the pending-checkin queue, retry each entry, drop on
-     *  success, duplicate (already there) or a permanent rejection. Static
-     *  so the NativeGeofencePlugin's flushPending() entrypoint can reuse it
-     *  without instantiating a receiver. */
+     *  success, duplicate (already there) or a permanent rejection, and skip
+     *  any another thread is sending right now. Static so the
+     *  NativeGeofencePlugin's flushPending() entrypoint can reuse it without
+     *  instantiating a receiver.
+     *
+     *  @return how many were DELIVERED by this drain — not ones found
+     *          already on the server, which are journalled separately. */
     static int drainPendingCheckins(PrefsStore prefs, SupabaseRest rest) {
         List<JSONObject> pending = prefs.getPendingCheckins();
         if (pending.isEmpty()) return 0;
-        int drained = 0, dropped = 0;
+        int drained = 0, alreadyThere = 0, dropped = 0, busy = 0;
         String droppedWhy = null;
         for (JSONObject entry : pending) {
             String id = entry.optString("id", null);
@@ -526,10 +575,27 @@ public class GeofenceReceiver extends BroadcastReceiver {
                 // safely retry without idempotency.
                 continue;
             }
-            SupabaseRest.Result r = rest.insertCheckin(entry);
-            if (r == SupabaseRest.Result.SUCCESS || r == SupabaseRest.Result.DUPLICATE) {
+            // Another thread is sending this one right now — usually the
+            // crossing's own first POST, which is why it is in the queue at
+            // all. Leave it; if that POST fails, it stays queued for the
+            // next drain.
+            if (!claimInFlight(id)) { busy++; continue; }
+            SupabaseRest.Result r;
+            try {
+                r = rest.insertCheckin(entry);
+            } finally {
+                releaseInFlight(id);
+            }
+            if (r == SupabaseRest.Result.SUCCESS) {
                 prefs.removePendingCheckin(id);
                 drained++;
+            } else if (r == SupabaseRest.Result.DUPLICATE) {
+                // Already there: an earlier POST landed but its response
+                // never came back. Cleared, but NOT counted as delivered —
+                // that count used to include these, which is how a
+                // double-send passed for a successful retry in the journal.
+                prefs.removePendingCheckin(id);
+                alreadyThere++;
             } else if (r == SupabaseRest.Result.REJECTED) {
                 // The server refused this payload and always will. It used
                 // to stop the drain like a network failure, so one such
@@ -542,12 +608,22 @@ public class GeofenceReceiver extends BroadcastReceiver {
                 // Stop on first transient failure — the network is still
                 // down (or our token can't refresh). Try again next
                 // fire. Avoids burning 50 POSTs against a dead link.
-                Log.w(TAG, "drain stalled at " + id + "; " + (pending.size() - drained - dropped) + " still pending");
+                Log.w(TAG, "drain stalled at " + id + "; "
+                        + (pending.size() - drained - alreadyThere - dropped) + " still pending");
                 break;
             }
         }
         if (drained > 0) {
             Log.i(TAG, "drained " + drained + " pending checkin(s)");
+        }
+        if (busy > 0) {
+            Log.i(TAG, "drain skipped " + busy + " check-in(s) already being sent");
+        }
+        if (alreadyThere > 0) {
+            // Rare now, and worth seeing: each one is a POST whose row landed
+            // while its response was lost.
+            prefs.journal("drain: " + alreadyThere + " check-in(s) were already on the server"
+                    + " (a response had been lost) — cleared");
         }
         if (dropped > 0) {
             // Say how many: a drop is otherwise invisible, and the journal

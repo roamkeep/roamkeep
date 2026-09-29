@@ -940,7 +940,30 @@ Details that bite:
   after the classic WiFi→cellular handoff failure at a boundary). Since
   4.9.0 that queue is **write-ahead**: the payload is appended before the
   POST and removed on success, so a process killed mid-request loses
-  nothing. A permanent rejection (`SupabaseRest.Result.REJECTED` — a 4xx
+  nothing.
+
+  **The catch, fixed in 4.9.3.** Write-ahead means an entry sits in the
+  queue *while its own POST is in flight*. Three threads drain that queue:
+
+  - the geofence worker;
+  - the location worker, on every breadcrumb batch;
+  - the flush when the app resumes.
+
+  On the move a batch lands every few seconds, so at nearly every crossing
+  a drain re-sent a row already on its way. The primary key kept the data
+  right, but the family's Postgres log got a `23505 duplicate key … checkins_pkey`
+  **ERROR per crossing**. The journal also read `drain: 1 queued checkin(s)
+  delivered` for a check-in whose first POST had never failed. Owners see
+  that log, so harmless-but-alarming is not harmless.
+
+  Now every sender claims the id in `GeofenceReceiver.IN_FLIGHT` before
+  sending, and a drain skips anything already claimed. The claim is in
+  memory and all senders share one process, so a process death releases
+  it and leaves the entry queued. A drain's count now excludes rows it finds
+  already on the server; those get their own journal line, since after the
+  fix each one means a lost response.
+
+  A permanent rejection (`SupabaseRest.Result.REJECTED` — a 4xx
   that retrying cannot fix, or a 409 that isn't 23505) is dropped and
   journalled, not left at the head where it used to block every later
   entry.
