@@ -323,6 +323,55 @@ step under the class-level `LOCK`; the loser stays quiet. **If two paths can
 decide the same thing, they need a shared lock and a compare-and-set, not a
 check followed by an act.**
 
+### A held announcement needs a way out too (4.9.2)
+
+4.8.7 separated the state from the announcement and stopped there. A gated
+ENTER then recorded "inside" and said nothing, **for ever**. Nothing came back
+for it: `repairMissedArrival` only looks at places whose state says *outside*.
+The departure, with a good fix, was then announced as normal.
+
+The journal caught it on a drive to the shops. The car went into a multi-storey
+car park, and the log read:
+
+- `arrived Grove Square fuzzy fix ±88m within 85m of edge — drift, not
+  announced (state: inside)`;
+- 23 minutes later, `left Grove Square`, announced.
+
+The family was told someone left a place they were never told they had reached.
+The gate's judgement was right: that fix cannot say which side of the boundary
+it is on. What was wrong is that "not yet" had become "never". It is the same
+lesson one level up: **before you suppress an announcement, ask what will
+announce it once the doubt is resolved.**
+
+A gated ENTER is now **held** (`PrefsStore` held arrivals, claimed with a
+compare-and-set like the inside set). It leaves the hold exactly one way:
+
+- **Confirmed** by any of:
+  - a precise fix inside it by its whole error radius (checked on every
+    breadcrumb batch);
+  - an ENTER that the gate lets through;
+  - arriving from travel and then going `CONFIRM_DWELL_MS` without an EXIT.
+
+  Once confirmed, it is announced with its **original** time.
+- **Discarded** at its EXIT. Neither side is announced, so there is never a
+  "left" without an "arrived".
+
+**"From travel"** means the persisted motion model said moving, or an
+*announced* departure happened, within `TRAVEL_WINDOW_MS` before the ENTER.
+That condition is what keeps the gate doing its job. A phone sitting near a
+boundary all night can have Play Services believing "inside" for hours on
+drift, so dwell alone would bring the flapping back.
+
+Only announced departures count as travel. A discarded one at night is a drift
+EXIT, and letting it vouch for the next drift ENTER would confirm that ENTER.
+The rules are pure functions (`judgeHeld`, `isTravel`, `confirmsAtExit`),
+pinned by `HeldArrivalTest`.
+
+Every path that files a check-in now goes through one
+`GeofenceReceiver.fileCheckin`: the transition, the repair and the held-arrival
+confirmations. Three writers of the same row is the 4.8.5 shape waiting to
+happen.
+
 ## Build & release pipeline
 
 ```powershell

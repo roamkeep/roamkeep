@@ -1,9 +1,13 @@
 package com.roamkeep.app.geofence;
 
 import android.content.Context;
+import android.content.Intent;
+import android.content.IntentFilter;
 import android.content.SharedPreferences;
 import android.os.BatteryManager;
 import android.util.Log;
+
+import androidx.core.content.ContextCompat;
 
 import org.json.JSONException;
 import org.json.JSONObject;
@@ -184,6 +188,38 @@ public class SupabaseRest {
             }
         } catch (Exception ignored) {}
         return -1;
+    }
+
+    /**
+     * What the phone is running on right now — "on battery", "plugged in
+     * (USB)" and so on — or null if it can't be read. For journal lines only.
+     *
+     * Reads the PLUGGED state from the sticky battery broadcast rather than
+     * BatteryManager.isCharging(): a phone held at a charge limit (Samsung's
+     * battery protection stops at 80–85%) is plugged in but not charging,
+     * and it is the plug, not the charge, that is a suspected trigger of
+     * Play Services' synthetic geofence EXITs.
+     */
+    static String powerSource(Context ctx) {
+        try {
+            // Null receiver: just returns the sticky intent, registers
+            // nothing. The flag is required from API 34 and harmless below.
+            Intent i = ContextCompat.registerReceiver(ctx, null,
+                    new IntentFilter(Intent.ACTION_BATTERY_CHANGED),
+                    ContextCompat.RECEIVER_NOT_EXPORTED);
+            if (i == null) return null;
+            int plugged = i.getIntExtra(BatteryManager.EXTRA_PLUGGED, -1);
+            switch (plugged) {
+                case -1: return null;
+                case 0:  return "on battery";
+                case BatteryManager.BATTERY_PLUGGED_AC:       return "plugged in (AC)";
+                case BatteryManager.BATTERY_PLUGGED_USB:      return "plugged in (USB)";
+                case BatteryManager.BATTERY_PLUGGED_WIRELESS: return "plugged in (wireless)";
+                default: return "plugged in";
+            }
+        } catch (Exception ignored) {
+            return null;
+        }
     }
 
     // ── internals ───────────────────────────────────────────────────

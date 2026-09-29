@@ -582,6 +582,24 @@ public class LocationUpdateReceiver extends BroadcastReceiver {
                     lats[best], lngs[best], accs[best], times[best]);
         }
 
+        // The other half of the same reconcile: arrivals the drift gate
+        // HELD rather than announced. Those have state saying inside, so the
+        // repair above never looks at them — which is how one sat unannounced
+        // for a whole visit while its departure went out. Judged on the most
+        // precise fix, like the repair, and on the newest time, since the
+        // dwell rule is about how long it has been.
+        long newest = times[0];
+        for (long t : times) if (t > newest) newest = t;
+        if (best >= 0) {
+            GeofenceReceiver.confirmHeldArrivals(prefs, rest,
+                    lats[best], lngs[best], accs[best], newest);
+        } else {
+            // No fix with a known accuracy: the position rules cannot apply,
+            // but the dwell rule still can.
+            GeofenceReceiver.confirmHeldArrivals(prefs, rest,
+                    lats[last], lngs[last], -1f, newest);
+        }
+
         // Retry any check-ins parked by GeofenceReceiver. A queued entry
         // means the POST failed at the boundary crossing (classically the
         // WiFi → cellular handoff while leaving home), and until now the

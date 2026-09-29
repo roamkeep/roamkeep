@@ -9,8 +9,11 @@ import org.json.JSONObject;
 
 import java.util.ArrayList;
 import java.util.Collection;
+import java.util.HashMap;
 import java.util.HashSet;
+import java.util.Iterator;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 
 /**
@@ -181,6 +184,16 @@ public class PrefsStore {
     // doze-cycling device, and the repair would never fire at all — the
     // opposite failure to the one it is being given.
     private static final String K_REPAIR_WATCH = "repair_inside_since";
+
+    // {placeId: {t: epoch-ms, tr: bool}} — arrivals the drift gate recorded
+    // as state but did not announce, waiting for evidence either way. See
+    // GeofenceReceiver.confirmHeldArrivals. Device-local bookkeeping about
+    // what WE have said, not a mirror of any database row.
+    private static final String K_HELD_ARRIVALS = "held_arrivals";
+
+    // Epoch-ms of the last EXIT that was accepted and announced. One of the
+    // two "arriving from travel" signals a held arrival is judged by.
+    private static final String K_LAST_EXIT_MS = "last_exit_ms";
 
     // Black-box event journal: JSON array of { t: epochMs, e: text },
     // capped at JOURNAL_CAP (oldest dropped). Written by the service,
@@ -675,6 +688,9 @@ public class PrefsStore {
         // it — the geofence no longer exists, so we should not
         // expect a matching EXIT to clear the state later.
         removeInsidePlace(id);
+        // Likewise an arrival still held for it: a deleted place must
+        // never be announced later from stale metadata.
+        claimHeldArrival(id);
     } }
 
     public void clearPlaces() { synchronized (LOCK) {
@@ -797,6 +813,114 @@ public class PrefsStore {
         if (id == null) return;
         Set<String> set = getInsidePlaceIds();
         if (set.remove(id)) setInsidePlaceIds(set);
+    } }
+
+    // ── Held arrivals ──────────────────────────────────────────────
+    //
+    // An arrival the drift gate would not announce on the fix it came with.
+    // The inside-set above still records it — that set tracks what Play
+    // Services believes — but the family has not been told. A held arrival
+    // leaves this map exactly once: confirmed and announced, or discarded
+    // at the EXIT with neither side announced. Never silently.
+
+    public static final class Held {
+        public final long enterMs;     // when the gated ENTER happened
+        public final boolean travel;   // arriving from travel at the time
+        Held(long enterMs, boolean travel) {
+            this.enterMs = enterMs;
+            this.travel = travel;
+        }
+    }
+
+    private JSONObject readHeld() {
+        try {
+            return new JSONObject(sp.getString(K_HELD_ARRIVALS, "{}"));
+        } catch (JSONException e) {
+            return new JSONObject();
+        }
+    }
+
+    private static Held parseHeld(JSONObject o) {
+        if (o == null) return null;
+        long t = o.optLong("t", 0L);
+        return t > 0L ? new Held(t, o.optBoolean("tr", false)) : null;
+    }
+
+    /**
+     * Hold an arrival. If one is already held for this place, keep its
+     * EARLIER time — the dwell is measured from the first crossing — and
+     * treat it as travel if either reading was.
+     */
+    public void holdArrival(String id, long enterMs, boolean travel) {
+        if (id == null) return;
+        synchronized (LOCK) {
+            JSONObject all = readHeld();
+            Held prev = parseHeld(all.optJSONObject(id));
+            long t = prev != null ? Math.min(prev.enterMs, enterMs) : enterMs;
+            boolean tr = travel || (prev != null && prev.travel);
+            try {
+                JSONObject o = new JSONObject();
+                o.put("t", t);
+                o.put("tr", tr);
+                all.put(id, o);
+            } catch (JSONException e) {
+                return;
+            }
+            sp.edit().putString(K_HELD_ARRIVALS, all.toString()).commit();
+        }
+    }
+
+    /** Clear the travel flag on a held arrival — see GeofenceReceiver.judgeHeld. */
+    public void demoteHeldArrival(String id) {
+        if (id == null) return;
+        synchronized (LOCK) {
+            JSONObject all = readHeld();
+            JSONObject o = all.optJSONObject(id);
+            if (o == null) return;
+            try { o.put("tr", false); } catch (JSONException e) { return; }
+            sp.edit().putString(K_HELD_ARRIVALS, all.toString()).commit();
+        }
+    }
+
+    /**
+     * Take a held arrival out of the map and hand it to THIS caller, or
+     * return null if there is none — including because another thread just
+     * took it. Compare-and-set under the class-level LOCK, for the same
+     * reason as claimInsidePlace: the geofence worker (at an EXIT or a
+     * precise ENTER) and the location worker (on a breadcrumb batch) can both
+     * decide what happens to one hold, and only one of them may act on it.
+     */
+    public Held claimHeldArrival(String id) {
+        if (id == null) return null;
+        synchronized (LOCK) {
+            JSONObject all = readHeld();
+            if (!all.has(id)) return null;
+            Held h = parseHeld(all.optJSONObject(id));   // null if malformed: removed all the same
+            all.remove(id);
+            sp.edit().putString(K_HELD_ARRIVALS, all.toString()).commit();
+            return h;
+        }
+    }
+
+    /** Snapshot of every held arrival. Never null. */
+    public Map<String, Held> getHeldArrivals() { synchronized (LOCK) {
+        Map<String, Held> out = new HashMap<>();
+        JSONObject all = readHeld();
+        Iterator<String> it = all.keys();
+        while (it.hasNext()) {
+            String id = it.next();
+            Held h = parseHeld(all.optJSONObject(id));
+            if (h != null) out.put(id, h);
+        }
+        return out;
+    } }
+
+    public long getLastExitMs() { synchronized (LOCK) {
+        return sp.getLong(K_LAST_EXIT_MS, 0L);
+    } }
+
+    public void setLastExitMs(long ms) { synchronized (LOCK) {
+        sp.edit().putLong(K_LAST_EXIT_MS, ms).apply();
     } }
 
     // ── Pending check-in queue ─────────────────────────────────────
