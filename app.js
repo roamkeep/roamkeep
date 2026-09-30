@@ -429,6 +429,7 @@
   const LUCIDE = {
     users: '<path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M22 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/>',
     'map-pin': '<path d="M20 10c0 7-8 13-8 13s-8-6-8-13a8 8 0 0 1 16 0z"/><circle cx="12" cy="10" r="3"/>',
+    'map-pin-plus': '<path d="M19.914 11.105A7.298 7.298 0 0 0 20 10a8 8 0 0 0-16 0c0 4.993 5.539 10.193 7.399 11.799a1 1 0 0 0 1.202 0 32 32 0 0 0 .824-.738"/><circle cx="12" cy="10" r="3"/><path d="M16 18h6"/><path d="M19 15v6"/>',
     plus: '<path d="M5 12h14"/><path d="M12 5v14"/>',
     activity: '<path d="M22 12h-4l-3 9L9 3l-3 9H2"/>',
     'alert-triangle': '<path d="m21.73 18-8-14a2 2 0 0 0-3.48 0l-8 14A2 2 0 0 0 4 21h16a2 2 0 0 0 1.73-3z"/><path d="M12 9v4"/><path d="M12 17h.01"/>',
@@ -1865,7 +1866,10 @@
       // Don't hijack taps on interactive children (zoom buttons, pins).
       // Calling preventDefault on touchstart would cancel the synthesized
       // click event, so we leave those alone entirely.
-      if (e.target.closest('[data-action]')) { t0 = null; lpCancel(); return; }
+      // The member balloon is a control too: a touch on it must neither pan
+      // the map nor dismiss it. Any other touch on the map closes it.
+      if (e.target.closest('[data-action], #map-pop')) { t0 = null; lpCancel(); return; }
+      hidePop();
       if (e.touches.length === 1) {
         rebasePan(e.touches[0]);
         lpArm(e.touches[0].clientX, e.touches[0].clientY);
@@ -1926,7 +1930,8 @@
     }, { passive: false });
 
     wrap.addEventListener('mousedown', (e) => {
-      if (e.target.closest('[data-action]')) return;
+      if (e.target.closest('[data-action], #map-pop')) return;
+      hidePop();
       S.dragging = true;
       S.dragStart = { x: e.clientX, y: e.clientY };
       S.viewStart = { lat: S.mLat, lng: S.mLng };
@@ -2354,6 +2359,38 @@
     }
     clear(host);
     host.appendChild(frag);
+    placePop();
+  }
+
+  // The member balloon. It was built to be glanced at — pointer-events:none,
+  // placed once at tap time, hidden after 3 s by a timer nobody cleared — and
+  // that was fine while it held nothing to tap. It now carries "Add place
+  // here", so it has to behave like a control:
+  //  - ONE timer, cleared on every open. The old one was never cleared, so
+  //    tapping a second member within 3 s let the first timer hide the second
+  //    balloon early.
+  //  - re-anchored on every renderPins, so a realtime move or a zoom-button
+  //    press doesn't leave it pointing at empty map;
+  //  - dismissed by any touch on the map itself (initMap's handlers).
+  const POP_MS = 6000;
+  let _popTimer = null;
+
+  function hidePop() {
+    if (_popTimer) { clearTimeout(_popTimer); _popTimer = null; }
+    S.popMemberId = null;
+    const pop = $('map-pop');
+    if (pop) pop.style.display = 'none';
+  }
+
+  function placePop() {
+    if (!S.popMemberId) return;
+    const pop = $('map-pop');
+    const m = S.members.find(x => x.id === S.popMemberId);
+    // Gone, paused or position-less means the pin itself is no longer drawn.
+    if (!pop || !m || m.lat == null || m.lng == null || isPausedRow(m)) { hidePop(); return; }
+    const pos = ll2px(m.lat, m.lng);
+    pop.style.left = pos.x + 'px';
+    pop.style.top = pos.y + 'px';
   }
 
   function pinClick(id) {
@@ -2361,17 +2398,33 @@
     if (!m) return;
     const pop = $('map-pop');
     if (!pop) return;
-    const pos = ll2px(m.lat, m.lng);
     clear(pop);
-    const label = m.avatar + ' ' + m.name + (m.id === S.myId ? ' (You)' : '');
+    const me = m.id === S.myId;
+    const label = m.avatar + ' ' + m.name + (me ? ' (You)' : '');
     const paused = isPausedRow(m);
     pop.appendChild(el('strong', { text: label }));
     pop.appendChild(el('div', { class: 'pp-s', text: m.sos ? '🆘 SOS ACTIVE'
       : paused ? ('⏸ Location paused' + (m.paused_until ? ' · resumes ' + pauseClock(m.paused_until) : ''))
       : (m.status || '') }));
-    if (!paused) pop.appendChild(el('div', { class: 'pp-s', text: '🔋 ' + m.battery + '%' }));
-    pop.style.cssText = 'display:block;left:' + pos.x + 'px;top:' + pos.y + 'px';
-    setTimeout(() => { if (pop) pop.style.display = 'none'; }, 3000);
+    if (!paused) {
+      pop.appendChild(el('div', { class: 'pp-s',
+        text: '🔋 ' + m.battery + '%' + (m.last_seen ? ' · ' + timeAgo(m.last_seen) : '') }));
+    }
+    // Not during an SOS: that balloon stays about the emergency.
+    if (!paused && !m.sos) {
+      pop.appendChild(el('button', {
+        class: 'pp-act',
+        type: 'button',
+        'aria-label': 'Add a place at ' + (me ? 'your' : m.name + '’s') + ' location',
+        dataset: { action: 'add-place-for-member', id: m.id },
+        html: iconSvg('map-pin-plus', 16) + '<span>Add place here</span>'
+      }));
+    }
+    S.popMemberId = m.id;
+    pop.style.display = 'block';
+    placePop();
+    if (_popTimer) clearTimeout(_popTimer);
+    _popTimer = setTimeout(hidePop, POP_MS);
     loadTrail(id);
   }
 
@@ -3116,7 +3169,14 @@
     S.placeIcon = icon;
   }
 
-  function openPlaceEditor(lat, lng, existingId) {
+  // A live pin older than this may no longer be where the person is: a still
+  // phone refreshes its pin only every PIN_EVERY_* and a doze-bound or
+  // switched-off one not at all. Warned about, never blocked.
+  const PIN_STALE_MS = 30 * 60 * 1000;
+
+  // opts.member: the sheet was opened from that member's balloon, so say whose
+  // position this is and how old it is — the coordinates alone don't.
+  function openPlaceEditor(lat, lng, existingId, opts) {
     if (typeof lat !== 'number' || typeof lng !== 'number') {
       toast('No location yet — grant location permission first', 'err');
       return;
@@ -3146,6 +3206,20 @@
     if (rLbl) rLbl.textContent = String(S.placeRadius);
     const coord = $('pe-coord');
     if (coord) coord.textContent = '📍 ' + lat.toFixed(5) + ', ' + lng.toFixed(5);
+    // Directly under the title, not in pe-coord: that sits below the fold of
+    // the half-height sheet, and this is the line that says what just happened.
+    const who = $('pe-who');
+    if (who) {
+      const m = !editing && opts && opts.member;
+      const seenMs = m && m.last_seen ? new Date(m.last_seen).getTime() : NaN;
+      const stale = !!m && Date.now() - seenMs > PIN_STALE_MS;
+      who.hidden = !m;
+      who.classList.toggle('stale', stale);
+      who.textContent = !m ? '' : m.avatar + ' At ' +
+        (m.id === S.myId ? 'your' : m.name + '’s') + ' location' +
+        (m.last_seen ? ' · ' + timeAgo(m.last_seen) : '') +
+        (stale ? ' — may be out of date' : '');
+    }
 
     initPlaceIconPicker();
 
@@ -3336,6 +3410,20 @@
       lat = S.mLat; lng = S.mLng;
     }
     openPlaceEditor(lat, lng);
+  }
+
+  // "Add place here" in a member's map balloon. The member is read at TAP
+  // time, so the place goes where they are now rather than where they were
+  // when the balloon opened. It is their live pin (keep_members.lat/lng) — the
+  // position the family already sees, so nothing new is fetched or stored.
+  function addPlaceAtMember(id) {
+    hidePop();
+    const m = S.members.find(x => x.id === id);
+    if (!m || m.lat == null || m.lng == null) { toast('No location for them yet', 'err'); return; }
+    // Paused means their position is hidden from the family; the frozen last
+    // fix must not come back out through the place editor's coordinates.
+    if (isPausedRow(m)) { toast('Their location is paused', 'err'); return; }
+    openPlaceEditor(m.lat, m.lng, null, { member: m });
   }
 
   function focusPlace(id) {
@@ -5208,6 +5296,7 @@
     'tl-trip': (t) => showTripOnMap(Number(t.dataset.idx)),
     'tl-stay': (t) => focusStayPlace(t.dataset.place),
     'add-place-here': addPlaceAtMyLocation,
+    'add-place-for-member': (t) => addPlaceAtMember(t.dataset.id),
     'save-place': savePlaceFromForm,
     'cancel-place': cancelPlaceEdit,
     'edit-place': (t) => editPlace(t.dataset.id),

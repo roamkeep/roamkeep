@@ -371,7 +371,7 @@ body {
   box-shadow: 0 4px 16px rgba(0, 0, 0, .2);
   min-width: 150px; font-size: 13px;
   transform: translate(-50%, -110%) translateY(-8px);
-  pointer-events: none; display: none;
+  display: none;
 }
 .map-pop::after {
   content: ''; position: absolute;
@@ -382,6 +382,21 @@ body {
 }
 .map-pop strong { display: block; font-size: 14px; margin-bottom: 3px; }
 .map-pop .pp-s { color: var(--stone); font-size: 12px; }
+/* "Add place here" — a full-width row across the balloon's foot, so the
+   target is the balloon's whole width rather than a corner icon. The negative
+   margins cancel .map-pop's padding. */
+.map-pop .pp-act {
+  display: flex; align-items: center; justify-content: center; gap: 6px;
+  width: calc(100% + 28px); min-height: 38px;
+  margin: 8px -14px -10px; padding: 0 14px;
+  border: none; border-top: 1px solid var(--surface-3);
+  border-radius: 0 0 12px 12px;
+  background: none; color: var(--primary);
+  font: inherit; font-size: 13px; font-weight: 600;
+  cursor: pointer; -webkit-appearance: none;
+}
+.map-pop .pp-act:active { background: var(--primary-soft); }
+.map-pop .pp-act svg { width: 16px; height: 16px; flex-shrink: 0; }
 
 /* SIDEBAR */
 .sidebar {
@@ -700,6 +715,15 @@ body {
   background: var(--cream); border-radius: 8px;
   font-family: ui-monospace, Menlo, monospace;
 }
+/* Whose position this is, when the sheet was opened from a member's balloon. */
+.pe-who {
+  font-size: 13px; color: var(--ink-2);
+  margin: -2px 0 12px; padding: 7px 10px;
+  background: var(--cream); border-radius: 8px;
+}
+.pe-who[hidden] { display: none; }
+/* That position is old enough that they may have moved (PIN_STALE_MS). */
+.pe-who.stale { background: rgba(255, 184, 77, .22); color: #6b4500; }
 
 input[type=range] {
   width: 100%; -webkit-appearance: none; appearance: none;
