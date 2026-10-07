@@ -1,0 +1,781 @@
+package com.roamkeep.app.geofence;
+
+import android.content.BroadcastReceiver;
+import android.content.Context;
+import android.content.Intent;
+import android.location.Location;
+import android.util.Log;
+
+import com.google.android.gms.location.LocationResult;
+import com.google.android.gms.location.LocationServices;
+
+import org.json.JSONArray;
+import org.json.JSONException;
+import org.json.JSONObject;
+
+import java.text.SimpleDateFormat;
+import java.util.Date;
+import java.util.List;
+import java.util.Locale;
+import java.util.TimeZone;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.atomic.AtomicInteger;
+
+/**
+ * Target of the PendingIntent we hand to
+ * FusedLocationProviderClient.requestLocationUpdates(). The OS delivers
+ * location batches here even when the Roamkeep process is dead — the
+ * whole point of moving breadcrumb logging off the JS path, which Android
+ * suspends whenever the WebView is backgrounded.
+ *
+ * Each batch's breadcrumbs go up as ONE location_history POST, and the live
+ * pin (keep_members.lat/lng) is refreshed at the tracking mode's cadence.
+ *
+ * WHY THERE ARE GATES HERE AT ALL. This used to persist whatever the OS
+ * handed it, leaning entirely on the request's setMinUpdateDistanceMeters.
+ * That gate turned out to be full of holes: every applyProfile() re-arm
+ * re-registers the request and so resets its reference point, and the
+ * doze-exit one-shot in LocationForegroundService calls getCurrentLocation()
+ * and pushes the result straight in here, past the OS filter entirely. On a
+ * device that doze-cycles every few minutes — a Pixel in closed testing did
+ * exactly this — a stationary phone therefore wrote a cold, fuzzy fix every
+ * few minutes, and the History timeline added them up into "Drive · 4.6 km ·
+ * top 139 km/h" for an afternoon spent sitting at home.
+ *
+ * The deeper problem was an ASYMMETRY. GeofenceReceiver already refused to
+ * act on an imprecise fix near a boundary (DRIFT_MIN_ACC_M), and
+ * LocationForegroundService.detectMoving already refused to believe a fuzzy
+ * fix's reported speed (SPEED_TRUST_ACC_M) or a displacement inside its own
+ * error (MOVING_DISP_M / MOVING_ACC_MULT). The journal caught the two paths
+ * reaching OPPOSITE verdicts about one fix: "arrived Home fuzzy fix ±66m
+ * within 46m of edge — drift, dropped", while that same fix was written here
+ * without question. So the gates below are not new rules; they are the
+ * existing rules, applied to writes, from the same constants.
+ *
+ * TWO GATES, ANSWERING TWO DIFFERENT QUESTIONS. Getting these confused is
+ * what made the first attempt at this fix fall short.
+ *
+ *   "Has the device MOVED?" cannot be answered from one fix. A single sample
+ *   lands beyond any threshold a fixed fraction of the time, however good the
+ *   reference you compare it against — so a per-fix test does not stop a
+ *   still phone writing, it merely filters the writes down to the BIGGEST
+ *   jumps, which the timeline then sums into an even longer phantom. It takes
+ *   an AVERAGE, whose noise falls as sqrt(N), to answer it. That is the
+ *   stillness gate, and while it says still, nothing is written at all.
+ *
+ *   "How far apart should recorded points be?" is answered per fix, by the
+ *   anchor gate — an anchor that only advances when a fix is accepted, so
+ *   that displacement accumulates for a device that is genuinely travelling.
+ *
+ * THE RULE THEY ARE WRITTEN AGAINST (LocationForegroundService:106-111):
+ * never make a real trip harder to record. So every gate here distrusts only
+ * IMPRECISE fixes — a fix at or below DRIFT_MIN_ACC_M is written
+ * unconditionally, even while the device is judged still — a trusted speed
+ * reading alone is enough to count as moving, and an unknown state is
+ * assumed to be moving, the same call onDozeExit makes. The cost of guessing
+ * "moving" wrongly is a few surplus points; the cost of guessing "still"
+ * wrongly is the start of somebody's journey.
+ *
+ * Mirrors GeofenceReceiver's headless pattern: goAsync() + worker thread,
+ * Supabase auth + member context from PrefsStore, one 401 refresh retry
+ * handled inside SupabaseRest.
+ */
+public class LocationUpdateReceiver extends BroadcastReceiver {
+    private static final String TAG = "RoamkeepGeo";
+    public static final String ACTION = "com.roamkeep.app.LOCATION_UPDATE";
+
+    // Above this error radius a fix is not a position. It cannot tell which
+    // side of the timeline's 120 m "is this a trip" line it sits on, so it
+    // can manufacture a whole journey by itself. Well above every fix that
+    // carries real trail information (a BALANCED_POWER wifi fix is ±20-60 m;
+    // this is cell trilateration). Its other job is anchor hygiene: a ±500 m
+    // fix must not drag the anchor half a kilometre and re-open the hole.
+    private static final float BREADCRUMB_MAX_ACC_M = 150f;
+
+    // ── Stillness ──────────────────────────────────────────────────
+    //
+    // The anchor gate below sets the SPACING of written points. It cannot
+    // decide whether the device is moving at all — no single-fix test can,
+    // because one sample lands beyond any threshold a fixed fraction of the
+    // time however good the reference. Simulated against the reported fix
+    // quality, the anchor gate alone still let a still phone write ~30 points
+    // an hour, each one a bigger jump than before, which the timeline sums
+    // into kilometres. Averaging is what breaks that: the mean of N fixes has
+    // sqrt(N) less noise than one fix, so it can be asked the question.
+    //
+    // Time constant of the average. 90 s is the compromise: long enough that
+    // a still phone's average barely moves, short enough that a real
+    // departure is noticed within ~100 m of walking — and MOVING_SPEED_MS
+    // below usually notices it long before that anyway.
+    private static final long CENTROID_TAU_MS = 90_000;
+    // Ceiling on how far ONE fix may drag that average, whatever the gap
+    // before it.
+    //
+    // The time weighting is right in principle and was wrong in practice.
+    // Its comment promises "the same smoothing whether the profile is
+    // delivering every 4 s or every 30 s" — but those are not the rates that
+    // occur. auto's low-power profile carries setMinUpdateDistanceMeters(30)
+    // (saver, 50 m), so the OS withholds every delivery until the device has
+    // moved that far, and a still phone on BALANCED_POWER network fixes only
+    // produces one when drift happens to cross the bar. The journal shows
+    // 8-20 MINUTES between deliveries, and 1 - exp(-600s/90s) is 0.9987: the
+    // "average" is simply the latest fix.
+    //
+    // So the gate degenerated into the single-sample test the comment above
+    // explains cannot answer the question — in the one mode where the fixes
+    // are tens of metres wide, which is where the phantom trips came from.
+    //
+    // 0.20 keeps roughly five fixes of memory. It is a CEILING, not a
+    // replacement: while the device is genuinely moving the profile is dense,
+    // dt is seconds, the computed weight is ~0.043 and this never binds.
+    //
+    // Note what this deliberately is NOT. It does not raise any bar for
+    // concluding "moving" — MOVING_SPEED_MS, MOVING_DISP_M, MOVING_ACC_MULT
+    // and CENTROID_MOVE_M are untouched, because raising one of those is what
+    // cost trail density in 3.0.2 and again in 4.5.4. It pays on the
+    // stillness side instead, by making the reference stable, which is the
+    // "anchor position held over a window rather than the previous fix" the
+    // design already intended. An average at alpha ~ 1.0 IS the previous fix.
+    private static final double CENTROID_ALPHA_MAX = 0.20;
+    // How far the average must move before the device is credited with having
+    // gone somewhere. A FLOOR, then scaled by the fix's own error radius —
+    // because the averaged noise scales with it too, so a fixed number is
+    // either leaky at ±120 m or needlessly deaf at ±25 m. Measured, a flat
+    // 50 m still let a ±120 m phone manufacture 4.5 km of phantom in an hour.
+    // Scaling keeps the test at a constant number of standard deviations,
+    // which is the only version that behaves the same at every fix quality.
+    private static final float CENTROID_MOVE_M = 50f;
+    // Once movement is confirmed, stop asking for a while — otherwise the
+    // stillness test doubles as a second distance filter during travel,
+    // thinning trails for no reason; the anchor gate already owns spacing.
+    // Kept SHORT because this is the multiplier on a false positive: every
+    // spurious "moving" buys a whole grace window of free writing, and at two
+    // minutes that was most of the residual phantom.
+    private static final long MOVING_GRACE_MS = 60_000;
+
+    // Rate limit on the rejection summary. Same value and same reasoning as
+    // LocationForegroundService.RESTORE_JOURNAL_EVERY_MS — the journal is the
+    // only witness for a headless bug, and a line that cries wolf is worse
+    // than no line at all.
+    private static final long REJECT_JOURNAL_EVERY_MS = 30 * 60_000;
+
+    // The schema version at which location_history gained its accuracy
+    // column. Below this the column does not exist and PostgREST rejects the
+    // whole insert rather than ignoring the field, so the write path has to
+    // know before it sends. See PrefsStore.getSchemaVersion.
+    private static final int SCHEMA_WITH_ACCURACY = 15;
+
+    // ── Live-pin cadence ───────────────────────────────────────────
+    //
+    // How often keep_members.lat/lng is rewritten from here, by tracking
+    // mode — the same numbers the in-app path has always used (TRACK_PROFILES
+    // and AUTO_WRITE_* in app.js). This path used to PATCH the pin on EVERY
+    // batch: every 1–4 s while driving on the dense profile, each one a
+    // radio wake-up and a realtime event fanned out to every family member
+    // with the app open, where it rebuilt the member list and the map pins.
+    // Breadcrumbs, not the pin, carry the detail; the pin only has to be
+    // fresh. Geofence transitions and doze exits still write it at once.
+    private static final long PIN_EVERY_LIVE_MS     = 8_000;
+    private static final long PIN_EVERY_MOVING_MS   = 10_000;   // auto, moving
+    private static final long PIN_EVERY_BALANCED_MS = 30_000;
+    private static final long PIN_EVERY_STILL_MS    = 60_000;   // auto, still
+    private static final long PIN_EVERY_SAVER_MS    = 120_000;
+
+    // Consecutive INSERTs refused by row-level security before this device
+    // concludes the server no longer accepts it — in practice, that an owner
+    // removed this member. Generous, because acting on it stops tracking.
+    // Opening the app with a valid membership clears it (initialize()).
+    private static final int RLS_REJECTIONS_TO_STOP = 30;
+
+    /** Batches submitted and not yet started. A batch that sees another
+     *  waiting behind it skips its pin write — the newer one carries a
+     *  fresher position anyway, and on a slow link a backlog used to replay
+     *  every stale position in turn as the family's "live" pin. */
+    private static final AtomicInteger QUEUED = new AtomicInteger();
+
+    @Override
+    public void onReceive(Context context, Intent intent) {
+        LocationResult result = LocationResult.extractResult(intent);
+        if (result == null) return;
+        final List<Location> locations = result.getLocations();
+        if (locations == null || locations.isEmpty()) return;
+
+        final Context appCtx = context.getApplicationContext();
+        final PendingResult pr = goAsync();
+        submit(appCtx, locations, pr::finish);
+    }
+
+    /**
+     * The ONE thread every location delivery is processed on, in order.
+     *
+     * processLocations is a SEQUENTIAL pipeline: the drift anchor and the
+     * stillness average are read, updated from this fix, and written back, so
+     * each fix has to see what the one before it left behind. It used to run
+     * on a fresh Thread per delivery from three call sites, which broke that
+     * outright — two batches read the same anchor, both wrote, and one update
+     * was simply lost.
+     *
+     * The same race quietly ate the diagnostics counters, and it hid well:
+     * all four are written in a single edit(), so a lost update drops all
+     * four together and the "fires == written + suppressed + rejected"
+     * identity keeps balancing perfectly while under-reporting badly. A
+     * stationary night journalled 393 dropped fixes while the counters showed
+     * 74 — the identity was not evidence of health, it was preserved by
+     * construction.
+     *
+     * PrefsStore's `synchronized` does not help: it locks the instance, and
+     * every call site builds its own, so it guards nothing shared.
+     *
+     * Queueing is what a sequential pipeline wants anyway, and this work is
+     * never on the main thread, so a backlog can never ANR — it just delays.
+     */
+    private static final ExecutorService WORKER =
+            Executors.newSingleThreadExecutor(r -> new Thread(r, "RoamkeepLocationWorker"));
+
+    /**
+     * Hand a batch to the shared worker. Two batches never run at once,
+     * whichever of the three producers they came from.
+     *
+     * @param onDone run after the batch completes, however it completes —
+     *               the receiver uses it to release its goAsync() token.
+     */
+    static void submit(Context ctx, List<Location> locations, Runnable onDone) {
+        submit(ctx, locations, onDone, false);
+    }
+
+    /** @param forcePin write the live pin from this batch regardless of the
+     *                  cadence (the doze-exit fix: the family should see the
+     *                  phone catch up the moment it wakes). */
+    static void submit(Context ctx, List<Location> locations, Runnable onDone, boolean forcePin) {
+        QUEUED.incrementAndGet();
+        WORKER.execute(() -> {
+            QUEUED.decrementAndGet();
+            try {
+                processLocations(ctx, locations, forcePin);
+            } catch (Exception e) {
+                Log.w(TAG, "location worker failed", e);
+            } finally {
+                if (onDone != null) onDone.run();
+            }
+        });
+    }
+
+    /**
+     * Shared breadcrumb + pin write path, fed by this receiver (legacy
+     * PendingIntent deliveries), the LocationForegroundService's in-process
+     * LocationCallback (the primary path) and its doze-exit one-shot.
+     *
+     * PRIVATE on purpose. Every caller must come through submit(), because
+     * this reads sequential state (the drift anchor, the stillness average)
+     * that two concurrent calls would clobber. It used to be public and each
+     * producer span its own thread — which is precisely how that happened.
+     */
+    private static void processLocations(Context ctx, List<Location> locations, boolean forcePin) {
+        if (locations == null || locations.isEmpty()) return;
+        final int n = locations.size();
+        final double[] lats = new double[n];
+        final double[] lngs = new double[n];
+        final long[] times = new long[n];
+        final float[] speeds = new float[n];   // m/s; -1 = not reported
+        // Horizontal error radius, m; -1 = not reported. A fix with NO
+        // accuracy counts as precise for the drop gates below — we never
+        // discard a fix we cannot prove is bad, which is the same call
+        // GeofenceReceiver makes (its gate requires tAcc != null before it
+        // will drop anything). For the speed column the polarity flips, and
+        // for the same reason detectMoving flips it: an unverifiable speed
+        // is not evidence.
+        final float[] accs = new float[n];
+        for (int i = 0; i < n; i++) {
+            Location l = locations.get(i);
+            lats[i] = l.getLatitude();
+            lngs[i] = l.getLongitude();
+            times[i] = l.getTime() > 0 ? l.getTime() : System.currentTimeMillis();
+            speeds[i] = l.hasSpeed() ? l.getSpeed() : -1f;
+            accs[i] = l.hasAccuracy() ? l.getAccuracy() : -1f;
+        }
+
+        PrefsStore prefs = new PrefsStore(ctx);
+        if (!prefs.hasContext()) return;   // not signed in — nothing to write
+        if (prefs.isPaused()) return;      // self-paused — write nothing
+        if (prefs.isServerRejected()) return;  // server stopped accepting us
+        SupabaseRest rest = new SupabaseRest(ctx);
+        String keepId   = prefs.getKeepId();
+        String memberId = prefs.getMemberId();
+        List<PrefsStore.Place> places = prefs.getPlaces();
+
+        // The drift anchor: read once, carried in locals through the batch,
+        // written back once at the end — one prefs write per fire, matching
+        // the existing recordLocationFire cadence rather than one per fix.
+        PrefsStore.Anchor anchor = prefs.getBreadcrumbAnchor();
+        double aLat = anchor != null ? anchor.lat : Double.NaN;
+        double aLng = anchor != null ? anchor.lng : Double.NaN;
+        boolean anchorMoved = false;
+
+        // Stillness state, carried in locals through the batch and written
+        // back once, like the anchor.
+        PrefsStore.Motion m = prefs.getMotion();
+        boolean motionValid = m.valid;
+        double emaLat = m.emaLat, emaLng = m.emaLng;
+        long emaMs = m.emaMs;
+        double stillLat = m.stillLat, stillLng = m.stillLng;
+        long movingUntilMs = m.movingUntilMs;
+
+        // Does this family's database have location_history.accuracy?
+        // Read once per batch from the version the app last mirrored here.
+        // Unknown (0, a device that has not opened the app since upgrading)
+        // reads as NO: the cost of omitting the field is a gap in diagnostic
+        // data, and the cost of guessing wrong the other way is a rejected
+        // INSERT on every fix, headless, with no screen to report it.
+        boolean writeAcc = prefs.getSchemaVersion() >= SCHEMA_WITH_ACCURACY;
+
+        int written = 0, suppressed = 0, rejDrift = 0, rejStill = 0, rejUnusable = 0;
+        float worstAcc = 0f, worstDist = 0f;
+        // The batch's breadcrumbs, sent as ONE request after the loop.
+        final JSONArray rows = new JSONArray();
+        boolean anyAcc = false;
+        for (int i = 0; i < lats.length; i++) {
+            final float acc = accs[i];
+
+            // 1. Unusable. Not a trail point at any threshold — and this test
+            //    comes FIRST so a wild fix cannot become the anchor, or poison
+            //    the average, and drag the reference point off with it.
+            if (acc > BREADCRUMB_MAX_ACC_M) { rejUnusable++; continue; }
+
+            // 2. Fold this fix into the running average of where we are.
+            //    Every usable fix updates it, including ones rejected below —
+            //    it estimates POSITION, not what we chose to store.
+            if (!motionValid) {
+                // Nothing known yet (fresh install, sign-out, first fire).
+                // Seed it and assume MOVING, the same call onDozeExit makes:
+                // the cost of a wrong "moving" is a few extra points, and of
+                // a wrong "still" is the start of someone's journey.
+                emaLat = lats[i]; emaLng = lngs[i];
+                stillLat = lats[i]; stillLng = lngs[i];
+                movingUntilMs = times[i] + MOVING_GRACE_MS;
+                motionValid = true;
+            } else {
+                double dt = times[i] - emaMs;
+                // Weight by elapsed time, so the smoothing is the same
+                // whether the profile is delivering every 4 s or every 30 s —
+                // then clamp, because the low-power profile's distance filter
+                // stretches the real gaps to minutes and the weight to ~1.0,
+                // which leaves no average at all. See CENTROID_ALPHA_MAX.
+                // The clamp replaces an "alpha > 1.0" guard that could never
+                // fire (1 - exp(-x) < 1 for every finite x). It does change
+                // the dt <= 0 case — an out-of-order fix inside a batch — from
+                // 1.0 to the ceiling, which is the same correction: a fix with
+                // a stale timestamp has no business replacing the average.
+                double alpha = dt <= 0 ? 1.0 : 1.0 - Math.exp(-dt / (double) CENTROID_TAU_MS);
+                if (alpha > CENTROID_ALPHA_MAX) alpha = CENTROID_ALPHA_MAX;
+                emaLat += alpha * (lats[i] - emaLat);
+                emaLng += alpha * (lngs[i] - emaLng);
+            }
+            emaMs = times[i];
+
+            // 3. Has the device actually gone anywhere? Two ways to say yes,
+            //    and only one of them has to hold. A trusted speed reading is
+            //    the fastest answer and is the same test detectMoving makes;
+            //    the average having left where it sat is the slower one that
+            //    works when no speed is reported.
+            boolean movingNow = speeds[i] > LocationForegroundService.MOVING_SPEED_MS
+                    && acc >= 0 && acc < LocationForegroundService.SPEED_TRUST_ACC_M;
+            if (!movingNow) {
+                float[] cd = new float[1];
+                Location.distanceBetween(stillLat, stillLng, emaLat, emaLng, cd);
+                movingNow = cd[0] > Math.max(CENTROID_MOVE_M, acc);
+            }
+            if (movingNow) {
+                stillLat = emaLat; stillLng = emaLng;
+                movingUntilMs = times[i] + MOVING_GRACE_MS;
+            }
+
+            // 4. Still, and imprecise: write nothing. A PRECISE fix is never
+            //    suppressed here — the rule is that a real GPS fix is always
+            //    recorded, so that no journey can lose its start.
+            //
+            //    That rule used to lean on the timeline refusing to call
+            //    anything that never left a 120 m circle a trip. It no
+            //    longer can: 4.8.6 removed that test, so a cluster of fixes
+            //    claiming to be precise now reaches the timeline unopposed.
+            //    Whether that matters depends on something this build
+            //    cannot yet see — what those fixes reported for accuracy —
+            //    which is exactly what the new column is here to record.
+            if (times[i] > movingUntilMs && acc > GeofenceReceiver.DRIFT_MIN_ACC_M) {
+                rejStill++;
+                worstAcc = Math.max(worstAcc, acc);
+                continue;
+            }
+
+            // 5. Anti-drift. Only IMPRECISE fixes are distrusted, exactly as
+            //    in GeofenceReceiver: a fix at or below DRIFT_MIN_ACC_M is a
+            //    real GPS fix and is written even one metre from the anchor.
+            //    The bar is detectMoving's own bar, unchanged — it is simply
+            //    asked against a stabler reference. That is not a higher bar:
+            //    against the PREVIOUS fix a slow mover can stay below it
+            //    forever, while against an anchor that does not move,
+            //    displacement accumulates until it clears.
+            final boolean precise = acc < 0 || acc <= GeofenceReceiver.DRIFT_MIN_ACC_M;
+            if (!precise && !Double.isNaN(aLat)) {
+                float[] d = new float[1];
+                Location.distanceBetween(aLat, aLng, lats[i], lngs[i], d);
+                float need = Math.max(LocationForegroundService.MOVING_DISP_M,
+                                      acc * LocationForegroundService.MOVING_ACC_MULT);
+                if (d[0] < need) {
+                    rejDrift++;
+                    worstAcc = Math.max(worstAcc, acc);
+                    worstDist = Math.max(worstDist, d[0]);
+                    continue;   // anchor NOT advanced — that is the mechanism
+                }
+            }
+
+            // 6. Accepted as somewhere we genuinely are. The anchor advances
+            //    HERE, before the place check, because it tracks where the
+            //    device IS and not what we chose to store. If it only moved
+            //    on written rows, an evening at home would leave it at the
+            //    last outdoor point and every fix near the house would read
+            //    as travel the moment someone stepped outside the radius.
+            aLat = lats[i];
+            aLng = lngs[i];
+            anchorMoved = true;
+
+            // 7. Don't record breadcrumbs while inside a saved place —
+            // wandering around the house with the phone shouldn't show up
+            // as a trip. The live pin (below) still updates so others see
+            // you're home; only the trail is suppressed.
+            if (isInsideAnyPlace(places, lats[i], lngs[i], acc, movingNow)) { suppressed++; continue; }
+            String iso = toIso8601Utc(times[i]);
+            try {
+                JSONObject row = new JSONObject();
+                row.put("keep_id", keepId);
+                row.put("member_id", memberId);
+                row.put("lat", lats[i]);
+                row.put("lng", lngs[i]);
+                row.put("recorded_at", iso);
+                // GPS speed feeds the timeline's walk/drive classifier;
+                // omit when the fix has none so the row stays NULL — and
+                // omit it from a fuzzy fix too, which is the same call
+                // detectMoving makes for the same reason: a low-power fix
+                // invents speed while the device is still. That invention is
+                // where the timeline's "top 139 km/h" came from, and it then
+                // cleared DRIVE_MAX_MS and labelled an hour of drift a Drive.
+                // A NULL here is not a loss: tripStats falls back to the
+                // trip's own distance over time.
+                // Below 150 m/s too: that is the lh_speed_range CHECK, and now
+                // that a batch is one INSERT, one row violating it would take
+                // every other row in the batch down with it.
+                if (speeds[i] >= 0 && speeds[i] < 150f && acc >= 0
+                        && acc < LocationForegroundService.SPEED_TRUST_ACC_M) {
+                    row.put("speed", (double) speeds[i]);
+                }
+                // The fix's own error radius, recorded at ANY value — note
+                // the deliberate polarity difference from speed above.
+                // Speed is withheld from a fuzzy fix because an invented
+                // speed poisons the classifier. Accuracy is never withheld,
+                // because the fixes worth interrogating later are precisely
+                // the confident-looking ones: every gate above waves those
+                // through untested, and this column is the only way to find
+                // out afterwards whether they deserved it.
+                if (writeAcc && acc >= 0) { row.put("accuracy", (double) acc); anyAcc = true; }
+                rows.put(row);
+            } catch (JSONException e) {
+                Log.w(TAG, "breadcrumb payload build failed", e);
+            }
+        }
+
+        if (rows.length() > 0) {
+            final String cols = "keep_id,member_id,lat,lng,recorded_at,speed";
+            int status = rest.insertLocationHistoryBatchStatus(rows, anyAcc ? cols + ",accuracy" : cols);
+            // A 400 on a batch carrying accuracy means the column is not
+            // there, whatever the version number said. Verify OBJECTS, not
+            // the number — a database has already reported a version it did
+            // not fully contain once in this project's history. Drop the
+            // field, re-send the batch, and stop sending it: the alternative
+            // is every breadcrumb silently failing on a family whose owner
+            // has not run the migration.
+            if (status == 400 && anyAcc) {
+                for (int r = 0; r < rows.length(); r++) {
+                    JSONObject o = rows.optJSONObject(r);
+                    if (o != null) o.remove("accuracy");
+                }
+                status = rest.insertLocationHistoryBatchStatus(rows, cols);
+                if (status / 100 == 2) {
+                    prefs.demoteSchemaVersion(SCHEMA_WITH_ACCURACY - 1);
+                    // Once, on the transition — not per batch. A line that
+                    // repeats every fix is a line nobody reads.
+                    prefs.journal("crumbs: no accuracy column on this database "
+                            + "— v15 not applied, field dropped");
+                }
+            }
+            if (status / 100 == 2) written = rows.length();
+        }
+        if (anchorMoved) prefs.setBreadcrumbAnchor(aLat, aLng, System.currentTimeMillis());
+        if (motionValid) prefs.setMotion(emaLat, emaLng, emaMs, stillLat, stillLng, movingUntilMs);
+
+        // Diagnostics: stamp that we fired and how many points landed vs.
+        // were suppressed inside a place vs. rejected as unusable or drift,
+        // so the app (and the user) can see whether native breadcrumb logging
+        // is running — and whether a low breadcrumb count is throttling,
+        // home-suppression, or the drift gate doing its job.
+        final int rejected = rejDrift + rejStill + rejUnusable;
+        prefs.recordLocationFire(System.currentTimeMillis(), written, suppressed,
+                                 rejStill, rejDrift, rejUnusable);
+        Log.i(TAG, "location fire: " + lats.length + " fixes, " + written
+                + " written, " + suppressed + " suppressed, " + rejected + " rejected");
+        if (rejected > 0) journalRejects(prefs, rejDrift, rejStill, rejUnusable, worstAcc, worstDist);
+
+        // Refresh the live pin from the most recent fix in the batch so the
+        // map keeps moving for other members even when the BG-geolocation
+        // foreground service has been killed by an OEM battery saver.
+        //
+        // Deliberately NOT gated on the trail gates above. A drift-rejected
+        // fix is still a real location the OS handed us, and GeofenceReceiver
+        // sets the same precedent — the family's map must never go staler
+        // because we got fussier about the trail. The one exception is an
+        // unusable fix, which would teleport the avatar; prefer the last one
+        // that cleared the ceiling, and fall back to the raw last if none did.
+        //
+        // It IS paced, by tracking mode (see PIN_EVERY_*), and skipped when a
+        // newer batch is already waiting — that one carries a fresher fix.
+        int last = lats.length - 1;
+        for (int i = lats.length - 1; i >= 0; i--) {
+            if (accs[i] <= BREADCRUMB_MAX_ACC_M) { last = i; break; }
+        }
+        final long nowMs = System.currentTimeMillis();
+        final long lastPin = prefs.getLastPinWriteMs();
+        final long every = pinInterval(prefs.getTrackMode(), times[last] <= movingUntilMs);
+        final boolean due = forcePin || lastPin == 0 || nowMs < lastPin || nowMs - lastPin >= every;
+        if (due && QUEUED.get() == 0) {
+            try {
+                JSONObject upd = new JSONObject();
+                upd.put("lat", lats[last]);
+                upd.put("lng", lngs[last]);
+                upd.put("last_seen", toIso8601Utc(times[last]));
+                upd.put("online", true);
+                // Piggyback the battery level so it stays current in the
+                // background (the JS battery listener only runs foreground).
+                int batt = SupabaseRest.currentBatteryLevel(ctx);
+                if (batt >= 0) upd.put("battery", batt);
+                if (rest.updateMember(memberId, upd)) prefs.setLastPinWriteMs(nowMs);
+            } catch (JSONException e) {
+                Log.w(TAG, "pin update payload build failed", e);
+            }
+        }
+
+        // Reconcile the inside-place set against where we actually are.
+        //
+        // Geofence transitions fire only on a CROSSING, so an ENTER that is
+        // dropped or never delivered can never be re-sent while the phone
+        // sits still inside the place — the device records itself outside
+        // somewhere it is sitting, files no arrival, and discards its next
+        // real departure as spurious. This path has what the receiver lacks:
+        // a position, several times a minute, whether or not anything
+        // crossed a boundary. Use the most PRECISE fix in the batch, not the
+        // most recent — the whole judgement rests on trusting the reading.
+        int best = -1;
+        for (int i = 0; i < accs.length; i++) {
+            if (accs[i] < 0) continue;
+            if (best < 0 || accs[i] < accs[best]) best = i;
+        }
+        if (best >= 0) {
+            GeofenceReceiver.repairMissedArrival(prefs, rest,
+                    lats[best], lngs[best], accs[best], times[best]);
+        }
+
+        // The other half of the same reconcile: arrivals the drift gate
+        // HELD rather than announced. Those have state saying inside, so the
+        // repair above never looks at them — which is how one sat unannounced
+        // for a whole visit while its departure went out. Judged on the most
+        // precise fix, like the repair, and on the newest time, since the
+        // dwell rule is about how long it has been.
+        long newest = times[0];
+        for (long t : times) if (t > newest) newest = t;
+        if (best >= 0) {
+            GeofenceReceiver.confirmHeldArrivals(prefs, rest,
+                    lats[best], lngs[best], accs[best], newest);
+        } else {
+            // No fix with a known accuracy: the position rules cannot apply,
+            // but the dwell rule still can.
+            GeofenceReceiver.confirmHeldArrivals(prefs, rest,
+                    lats[last], lngs[last], -1f, newest);
+        }
+
+        // Retry any check-ins parked by GeofenceReceiver. A queued entry
+        // means the POST failed at the boundary crossing (classically the
+        // WiFi → cellular handoff while leaving home), and until now the
+        // retry waited for the NEXT geofence fire or app open — which
+        // could be hours, with the family seeing no "left" alert the
+        // whole time even though breadcrumbs were flowing happily on the
+        // recovered network. These fires run every few seconds on the
+        // move, so a fire with a non-empty queue is both the earliest
+        // and the best-evidenced moment to retry (drain stops on first
+        // hard failure, so a still-dead network costs one request).
+        if (prefs.pendingCount() > 0) {
+            int drained = GeofenceReceiver.drainPendingCheckins(prefs, rest);
+            if (drained > 0) {
+                prefs.journal("drain: " + drained + " queued checkin(s) delivered on breadcrumb fire");
+            }
+        }
+
+        if (prefs.getRejectStreak() >= RLS_REJECTIONS_TO_STOP) stopForServerRejection(ctx, prefs);
+    }
+
+    /** Pin cadence for a tracking mode. See PIN_EVERY_*. */
+    private static long pinInterval(String mode, boolean moving) {
+        if ("live".equals(mode)) return PIN_EVERY_LIVE_MS;
+        if ("balanced".equals(mode)) return PIN_EVERY_BALANCED_MS;
+        if ("saver".equals(mode)) return PIN_EVERY_SAVER_MS;
+        return moving ? PIN_EVERY_MOVING_MS : PIN_EVERY_STILL_MS;
+    }
+
+    /**
+     * The server has refused this device's writes on row-level security
+     * RLS_REJECTIONS_TO_STOP times running. In practice an owner removed
+     * this member: the app shows the join screen when opened, but nothing
+     * told the headless pipeline, which went on running the foreground
+     * service and GPS for a Keep that would never accept a row — until 4.9.0
+     * it also rotated the refresh token on every rejection.
+     *
+     * Stops the service and removes the geofences, and sets a flag every
+     * start path (BootReceiver, the service, both receivers) respects. Not
+     * clearAll(): if this is ever wrong, opening the app — which re-runs
+     * initialize() — clears the flag and resumes everything intact.
+     */
+    private static void stopForServerRejection(Context ctx, PrefsStore prefs) {
+        if (prefs.isServerRejected()) return;
+        prefs.setServerRejected(true);
+        prefs.journal("server: " + RLS_REJECTIONS_TO_STOP + " writes in a row refused by row-level "
+                + "security — member probably removed from the Keep. Tracking stopped until the app is opened.");
+        try { LocationForegroundService.stop(ctx); } catch (Exception ignored) {}
+        try {
+            LocationServices.getGeofencingClient(ctx).removeGeofences(GeofenceArmer.pendingIntent(ctx));
+        } catch (Exception ignored) {}
+    }
+
+    /**
+     * Summarise rejections into the journal, at most once every
+     * REJECT_JOURNAL_EVERY_MS. Counts accumulate in between so the line
+     * describes a window rather than one batch.
+     *
+     * The line carries "max Nm from anchor" on purpose: it is the built-in
+     * falsifier. A gate doing its job reports tens of metres — that is drift
+     * being measured. A gate eating a real journey reports hundreds. One
+     * number on one line tells the next reader which of the two is happening,
+     * without a device in hand.
+     */
+    private static void journalRejects(PrefsStore prefs, int drift, int still, int unusable,
+                                       float worstAcc, float worstDist) {
+        final long now = System.currentTimeMillis();
+
+        // PERSISTED, not static. These counters used to live in fields on
+        // this class, so every process death silently zeroed the window
+        // while the half-hourly stamp behind it survived — and the line
+        // then described only the rejections since the process was last
+        // rebuilt. On a doze-cycling device that is minutes, which made
+        // "4 fixes dropped in 27m" a floor rather than a count. It was
+        // read as a count, and that misreading sent the phantom-trip
+        // investigation after the wrong mechanism for a week.
+        PrefsStore.RejectWindow w = prefs.getRejectWindow();
+        if (w.sinceMs == 0) w.sinceMs = now;
+        w.drift += drift;
+        w.still += still;
+        w.unusable += unusable;
+        w.worstAcc = Math.max(w.worstAcc, worstAcc);
+        w.worstDist = Math.max(w.worstDist, worstDist);
+
+        long lastJournal = prefs.getLastRejectJournal();
+        // First ever window: start the clock rather than emitting at once, so
+        // a fresh install doesn't open its journal with a rejection line.
+        if (lastJournal == 0) {
+            prefs.setRejectWindow(w);
+            prefs.setLastRejectJournal(now);
+            return;
+        }
+        if (now - lastJournal < REJECT_JOURNAL_EVERY_MS) {
+            prefs.setRejectWindow(w);
+            return;
+        }
+
+        StringBuilder sb = new StringBuilder("crumbs: ")
+                .append(w.drift + w.still + w.unusable)
+                .append(" fixes dropped in ").append((now - w.sinceMs) / 60_000).append("m — ");
+        boolean first = true;
+        if (w.still > 0) {
+            sb.append(w.still).append(" still");
+            first = false;
+        }
+        if (w.drift > 0) {
+            if (!first) sb.append(", ");
+            sb.append(w.drift).append(" drift (max ")
+              .append(Math.round(w.worstDist)).append("m from anchor)");
+            first = false;
+        }
+        if (w.unusable > 0) {
+            if (!first) sb.append(", ");
+            sb.append(w.unusable).append(" unusable (>")
+              .append(Math.round(BREADCRUMB_MAX_ACC_M)).append("m)");
+            first = false;
+        }
+        sb.append(", worst ±").append(Math.round(w.worstAcc)).append("m");
+        prefs.journal(sb.toString());
+        prefs.setLastRejectJournal(now);
+        prefs.setRejectWindow(new PrefsStore.RejectWindow());
+    }
+
+    /**
+     * True if (lat,lng) falls within the radius of any saved place — or, for
+     * an IMPRECISE fix, within its own error of the edge, where it genuinely
+     * cannot tell which side it is on.
+     *
+     * The padding is the same call GeofenceReceiver makes about a crossing,
+     * for the same reason: a ±66 m fix landing 46 m outside a home radius is
+     * not a walk down the street. Without it, that fix escaped suppression
+     * and became a 501 m "Drive" on top of a stay at home.
+     *
+     * Note the deliberate asymmetry with GeofenceReceiver: there an ambiguous
+     * fix drops the transition, here it counts as inside. Both refuse to act
+     * on a fix that cannot tell which side it is on.
+     *
+     * BUT THE PADDING IS CONDITIONAL, and 4.8.6 is where that was learned.
+     * Padding unconditionally clips the START OF EVERY DEPARTURE by roughly
+     * the fix's own accuracy — on a device running ±50 m that is 50 m of
+     * missing trail every time you leave anywhere, which showed up as bike
+     * rides beginning well down the road.
+     *
+     * It is also, by then, protecting almost nothing. The stillness gate
+     * (step 4) runs BEFORE this check, so a stationary phone's fuzzy fixes
+     * never arrive here at all — they were rejected several steps earlier.
+     * The only fix that reaches this padding is one from a device the
+     * pipeline already believes is moving, which is exactly when the points
+     * are wanted.
+     *
+     * So pad only when THIS fix shows no movement of its own. A real
+     * departure carries a trusted speed or has already dragged the centroid,
+     * so movingNow is true and nothing is clipped. Drift leaking through a
+     * grace window has neither, so it is still suppressed — which is the one
+     * hole the padding was left to cover.
+     *
+     * A PRECISE fix outside the radius is always a trail point, even right at
+     * the edge — so a walk that genuinely starts at the front door is not
+     * clipped.
+     */
+    private static boolean isInsideAnyPlace(List<PrefsStore.Place> places,
+                                            double lat, double lng, float acc,
+                                            boolean movingNow) {
+        if (places == null || places.isEmpty()) return false;
+        final boolean fuzzy = !movingNow && acc > GeofenceReceiver.DRIFT_MIN_ACC_M;
+        float[] out = new float[1];
+        for (PrefsStore.Place p : places) {
+            Location.distanceBetween(lat, lng, p.lat, p.lng, out);
+            if (out[0] <= p.radius) return true;
+            if (fuzzy && Math.abs(out[0] - p.radius) < acc) return true;
+        }
+        return false;
+    }
+
+    private static String toIso8601Utc(long ms) {
+        SimpleDateFormat fmt = new SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss.SSS'Z'", Locale.US);
+        fmt.setTimeZone(TimeZone.getTimeZone("UTC"));
+        return fmt.format(new Date(ms));
+    }
+}

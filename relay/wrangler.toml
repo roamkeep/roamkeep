@@ -1,0 +1,32 @@
+name = "roamkeep-relay"
+main = "src/index.js"
+compatibility_date = "2026-01-15"
+
+# The relay answers on this hostname only.
+routes = [
+  { pattern = "relay.roamkeep.app", custom_domain = true }
+]
+workers_dev = false
+preview_urls = false
+
+# Nothing is bound for storage: the relay is stateless and keeps nothing.
+
+# Logging is off. The relay handles push tokens, and the claim that it
+# retains nothing is only true while this stays false. Do not turn it on.
+[observability]
+enabled = false
+
+# Throughput limit: one counter keyed on a constant (RATE_LIMIT_KEY in
+# src/index.js), so nothing about any caller is counted. The relay runs
+# without it, so local runs and the tests still work.
+[[unsafe.bindings]]
+name = "RATE_LIMITER"
+type = "ratelimit"
+namespace_id = "1001"
+# An example. The deployed values are not published.
+simple = { limit = 500, period = 60 }
+
+# FCM_SERVICE_ACCOUNT is a secret, never committed:
+#   npx wrangler secret put FCM_SERVICE_ACCOUNT
+# Paste the entire JSON from Firebase Console → Project settings →
+# Service accounts → Generate new private key.

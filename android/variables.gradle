@@ -1,0 +1,26 @@
+ext {
+    minSdkVersion = 23
+    // Android 16. Play requires the target to be within one year of the
+    // latest release: from 31 Aug 2026 an app targeting 35 cannot be
+    // updated at all, which surfaced as a closed-testing rejection.
+    //
+    // The SDK also ships an "android-36.1" minor platform. Do NOT point
+    // compileSdk at it — minor SDK versions need AGP 8.13+, and AGP here is
+    // 8.7.2. Base 36 satisfies Play either way.
+    compileSdkVersion = 36
+    targetSdkVersion = 36
+    androidxActivityVersion = '1.9.2'
+    androidxAppCompatVersion = '1.7.0'
+    androidxCoordinatorLayoutVersion = '1.2.0'
+    androidxCoreVersion = '1.15.0'
+    androidxFragmentVersion = '1.8.4'
+    coreSplashScreenVersion = '1.0.1'
+    androidxWebkitVersion = '1.12.1'
+    junitVersion = '4.13.2'
+    androidxJunitVersion = '1.2.1'
+    androidxEspressoCoreVersion = '3.6.1'
+    cordovaAndroidVersion = '10.1.1'
+    // Shared by @capacitor/push-notifications and by :app, which extends
+    // the plugin's MessagingService for content-free push wake-ups.
+    firebaseMessagingVersion = '24.1.0'
+}

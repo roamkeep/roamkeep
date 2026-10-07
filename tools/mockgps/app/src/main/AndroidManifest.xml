@@ -1,0 +1,73 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
+
+    <!--
+      THERE IS NO android.permission.INTERNET IN THIS FILE, AND THERE MUST
+      NOT BE. Replaying a route into the OS is entirely offline. A mock
+      location app that can reach the network can also send somewhere the
+      route it is playing, and the whole point of this app existing is that
+      it cannot. Anything that would need the network does not belong here.
+
+      Without INTERNET, Android denies every socket to this process — this
+      is enforced by the OS, not by a promise in a README.
+
+      THE REMOVAL BELOW IS LOAD-BEARING. AGP injects
+      android.permission.INTERNET into every DEBUG build by itself, for
+      Android Studio's deploy and profiling channels. So "we never asked for
+      it" is not enough: without this explicit node removal the debug APK
+      ships with full network access and the claim above is simply false.
+      Verified by build: `verifyNoInternet` fails assembleDebug if it ever
+      comes back.
+    -->
+    <uses-permission android:name="android.permission.INTERNET" tools:node="remove" />
+
+    <!-- Declaring this is what makes the app appear in Developer options ->
+         "Select mock location app". It is a development-signature permission
+         and is never actually granted; the real gate is the appop the user
+         sets there. Lint flags it, which is why it is suppressed. -->
+    <uses-permission android:name="android.permission.ACCESS_MOCK_LOCATION"
+        tools:ignore="MockLocation,ProtectedPermissions" />
+
+    <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+
+    <application
+        android:label="Roamkeep MockGPS"
+        android:icon="@android:drawable/ic_menu_mylocation"
+        android:allowBackup="false"
+        android:supportsRtl="true"
+        android:theme="@android:style/Theme.Material.Light">
+
+        <activity
+            android:name=".MainActivity"
+            android:exported="true"
+            android:label="Roamkeep MockGPS">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+        <!--
+          A foreground service, because the whole point is to keep injecting
+          while THIS app is in the background and Roamkeep is in front being
+          screen-recorded. A background service would be frozen within
+          minutes and the trail would simply stop.
+
+          specialUse is the honest type: the service does not consume
+          location, it produces it. It is also never published, so the Play
+          declaration that specialUse normally requires does not arise.
+        -->
+        <service
+            android:name=".MockService"
+            android:exported="false"
+            android:foregroundServiceType="specialUse">
+            <property
+                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="Injects a recorded route into the OS test location provider for app testing." />
+        </service>
+    </application>
+</manifest>

@@ -1,0 +1,10 @@
+buildscript {
+    repositories {
+        google()
+        mavenCentral()
+    }
+    dependencies {
+        // Same AGP as android/build.gradle, so one Gradle download serves both.
+        classpath 'com.android.tools.build:gradle:8.7.2'
+    }
+}

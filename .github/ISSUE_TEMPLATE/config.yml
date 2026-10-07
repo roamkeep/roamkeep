@@ -1,0 +1,14 @@
+# Every issue starts from a form, so the version and phone are always there
+# and nobody is invited to paste a setup link. Questions go to Discussions,
+# vulnerabilities to private reporting.
+blank_issues_enabled: false
+contact_links:
+  - name: Report a security vulnerability
+    url: https://github.com/roamkeep/roamkeep/security/advisories/new
+    about: Privately, so a fix can be ready before the problem is public.
+  - name: Ask a question
+    url: https://github.com/roamkeep/roamkeep/discussions
+    about: How something works, whether Roamkeep suits your family, or anything else that isn't a bug.
+  - name: Read the FAQ
+    url: https://roamkeep.app/faq/
+    about: Privacy, Supabase, cost, iPhone, children, battery.

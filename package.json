@@ -1,0 +1,47 @@
+{
+  "name": "roamkeep",
+  "version": "0.3.0",
+  "private": true,
+  "description": "Roamkeep — private family location sharing. PWA + Capacitor Android shell.",
+  "scripts": {
+    "build": "node build.js",
+    "build:pwa": "node build.js --bake",
+    "icons": "node tools/gen-icons.js && npx --yes @capacitor/assets@3.0.5 generate --android",
+    "sync": "npm run build && cap sync android",
+    "android:open": "cap open android",
+    "android:run": "npm run sync && cap run android",
+    "android:release": "npm run sync && cd android && .\\gradlew.bat assembleRelease",
+    "android:bundle": "npm run sync && cd android && .\\gradlew.bat bundleRelease",
+    "link": "node tools/setup-link.js",
+    "test:db": "node db/tests/pglite/run.mjs",
+    "test:db:mutate": "node db/tests/pglite/mutate.mjs",
+    "test:brand": "node tools/gen-brand.mjs --check",
+    "build:site": "node tools/build-site.mjs",
+    "build:landing": "node tools/build-landing.mjs",
+    "deploy:site": "node tools/deploy-static.mjs site",
+    "deploy:landing": "node tools/deploy-static.mjs landing",
+    "deploy:app": "node tools/deploy-static.mjs app"
+  },
+  "devDependencies": {
+    "@capacitor/cli": "^7.6.9",
+    "@electric-sql/pglite": "^0.5.8",
+    "esbuild": "^0.28.1",
+    "opentype.js": "^2.0.0",
+    "sharp": "^0.35.5",
+    "typescript": "^6.0.3"
+  },
+  "dependencies": {
+    "@capacitor-mlkit/barcode-scanning": "^7.5.0",
+    "@capacitor/android": "^7.6.9",
+    "@capacitor/app": "^7.1.2",
+    "@capacitor/clipboard": "^7.0.4",
+    "@capacitor/core": "^7.6.9",
+    "@capacitor/geolocation": "^7.0.0",
+    "@capacitor/keyboard": "^7.0.6",
+    "@capacitor/preferences": "^7.0.4",
+    "@capacitor/push-notifications": "^7.0.6",
+    "@capacitor/share": "^7.0.4",
+    "@capacitor/status-bar": "^7.0.0",
+    "qrcode": "^1.5.4"
+  }
+}

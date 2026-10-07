@@ -1,0 +1,41 @@
+name: Help with setting up
+description: Stuck setting up your family's server, or joining a family.
+labels: [setup]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        The step-by-step guide is at [roamkeep.app/get-started](https://roamkeep.app/get-started/),
+        and the long version is [docs/OWNER_SETUP.md](https://github.com/roamkeep/roamkeep/blob/main/docs/OWNER_SETUP.md).
+
+        **Never post your Supabase access token, a setup link or an invite link.** If one has been
+        posted anywhere public, delete the token in Supabase and rotate the invite code in the app.
+  - type: dropdown
+    id: where
+    attributes:
+      label: Where are you stuck?
+      options:
+        - Setting up a new family on my phone
+        - Setting up with the desktop wizard
+        - Joining a family with an invite
+        - Updating my family server
+        - Something else
+    validations:
+      required: true
+  - type: textarea
+    id: what
+    attributes:
+      label: What do you see?
+      description: The step you're on and any message on screen, word for word if you can.
+    validations:
+      required: true
+  - type: input
+    id: app
+    attributes:
+      label: Roamkeep version
+      placeholder: "4.11.0"
+  - type: input
+    id: phone
+    attributes:
+      label: Phone and Android version
+      placeholder: "Galaxy S23, Android 15"

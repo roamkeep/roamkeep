@@ -1,0 +1,991 @@
+package com.roamkeep.app.geofence;
+
+import android.content.Context;
+import android.content.SharedPreferences;
+
+import org.json.JSONArray;
+import org.json.JSONException;
+import org.json.JSONObject;
+
+import java.util.ArrayList;
+import java.util.Collection;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.Iterator;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+
+/**
+ * Typed wrapper around SharedPreferences for the native geofence
+ * plugin. Holds the Supabase auth context the broadcast receiver
+ * needs to POST check-ins without the app process being alive, plus
+ * the place metadata keyed by geofence id (so the receiver can build
+ * a human-readable check-in payload from just the triggering id).
+ *
+ * Stored as plaintext. The tokens here are the same Supabase JWT +
+ * refresh token the WebView keeps in localStorage, so we're not
+ * exposing anything that wasn't already present on the device. If
+ * we later want encryption-at-rest we can swap for EncryptedSharedPreferences
+ * without changing callers.
+ */
+public class PrefsStore {
+    private static final String PREFS = "roamkeep_geofence";
+
+    // Auth + keep context.
+    private static final String K_SUPABASE_URL   = "supabase_url";
+    private static final String K_ANON_KEY       = "anon_key";
+    private static final String K_ACCESS_TOKEN   = "access_token";
+    private static final String K_REFRESH_TOKEN  = "refresh_token";
+    private static final String K_USER_ID        = "user_id";
+    private static final String K_KEEP_ID        = "keep_id";
+    /** Pre-v9 name of K_KEEP_ID; see migrateNestIdKey(). */
+    private static final String LEGACY_K_NEST_ID = "nest_id";
+    private static final String K_MEMBER_ID      = "member_id";
+    private static final String K_MEMBER_NAME    = "member_name";
+    private static final String K_MEMBER_AVATAR  = "member_avatar";
+
+    // Places: JSON array of { id, name, icon, lat, lng, radius }.
+    private static final String K_PLACES = "places";
+
+    // Fingerprint of the place list as it was last ARMED (see
+    // GeofenceArmer.signature). A push wake-up refetches keep_places and
+    // compares against this, so the common case — a wake-up caused by
+    // something else entirely — costs one comparison instead of a
+    // pointless re-registration.
+    //
+    // Deliberately NOT K_LAST_PUSH_SEEN: that one means "newest check-in
+    // already notified" and advancing it for a place change would drop
+    // notifications.
+    private static final String K_PLACES_SIG = "places_sig";
+
+    // Active tracking mode (auto|live|balanced|saver). Persisted so the
+    // BootReceiver can re-arm native location updates headlessly after a
+    // reboot without waiting for the app to open.
+    private static final String K_TRACK_MODE = "track_mode";
+
+    // Diagnostics: the last time LocationUpdateReceiver fired and running
+    // counters of how many breadcrumbs it wrote vs. suppressed (inside a
+    // place). Surfaced via the plugin so a device can self-report whether
+    // native breadcrumb logging is actually working.
+    private static final String K_LAST_LOC_FIRE   = "last_loc_fire";
+    private static final String K_LOC_FIRE_COUNT   = "loc_fire_count";
+    private static final String K_CRUMB_COUNT      = "crumb_count";
+    private static final String K_SUPPRESSED_COUNT = "suppressed_count";
+    // Fixes the receiver refused to record: too imprecise to be a position,
+    // or indistinguishable from drift about the anchor below. Before this
+    // existed the three counters above always summed exactly to the fire
+    // count, because nothing was ever rejected — which read as healthy and
+    // was in fact the bug.
+    private static final String K_REJECTED_COUNT   = "rejected_count";
+    // The same rejections split by REASON, because the combined number
+    // above says that a gate fired without saying which one. "Still" and
+    // "drift" answer different questions and a fix for one is the wrong
+    // fix for the other, so a single total cannot tell anybody whether the
+    // gates are working — which was the complaint that produced these.
+    private static final String K_REJ_STILL        = "rej_still_count";
+    private static final String K_REJ_DRIFT        = "rej_drift_count";
+    private static final String K_REJ_UNUSABLE     = "rej_unusable_count";
+    // Rate-limit stamp for the rejection journal summary. PERSISTED, not a
+    // static: this path runs in short-lived processes, and an in-memory
+    // stamp would emit a line on the first rejection after every process
+    // death — every few minutes on a doze-cycling device, which is exactly
+    // the journal noise that makes a journal useless.
+    private static final String K_LAST_REJ_JOURNAL = "last_rej_journal";
+    // The accumulating window BEHIND that stamp, persisted for the same
+    // reason the stamp is. These were static fields, so they reset to zero
+    // on every process death while the stamp survived — which meant the
+    // half-hourly line reported only the rejections since the last time
+    // the process happened to be rebuilt. A line reading "4 fixes dropped
+    // in 27m" was therefore a floor and not a count, and reading it as a
+    // count once led this investigation down the wrong path entirely.
+    private static final String K_PEND_STILL     = "rej_pend_still";
+    private static final String K_PEND_DRIFT     = "rej_pend_drift";
+    private static final String K_PEND_UNUSABLE  = "rej_pend_unusable";
+    private static final String K_PEND_WORST_ACC = "rej_pend_worst_acc";
+    private static final String K_PEND_WORST_DST = "rej_pend_worst_dist";
+    private static final String K_PEND_SINCE     = "rej_pend_since";
+
+    // What the family's database reported for roamkeep_schema_version(),
+    // mirrored here by the plugin on every app launch so the headless
+    // write path can tell whether a column exists before writing to it.
+    //
+    // Zero means "not known yet", and every gate that reads this must
+    // treat unknown as "the column is absent" — the cost of that is
+    // missing diagnostic data, while the cost of guessing the other way
+    // is a rejected INSERT and a silently lost breadcrumb trail.
+    private static final String K_SCHEMA_VERSION = "db_schema_version";
+
+    // ── Breadcrumb drift anchor ────────────────────────────────────
+    //
+    // The last position LocationUpdateReceiver accepted as somewhere the
+    // device genuinely was. An imprecise fix is measured against THIS, not
+    // against the previous fix: drift is a random walk that stays near its
+    // origin, so an anchor that only advances on an accepted fix can never
+    // be walked away from by noise — while real travel accumulates against
+    // it and always clears the bar eventually. That asymmetry is the whole
+    // mechanism, and it is why this can thin a trail but never end one.
+    //
+    // PERSISTED because the pipeline is headless. The foreground service
+    // callback, the doze-exit one-shot and the legacy receiver can each run
+    // in a freshly created process; an in-memory anchor would reset to "no
+    // anchor" — accept everything — on every process death, which on the
+    // device that produced this bug is every few minutes.
+    //
+    // Deliberately NO expiry. A stale anchor can only ever make the gate
+    // MORE permissive (you are far from it, so fixes pass), never less.
+    // There is no age at which forgetting it would protect a real trip.
+    private static final String K_ANCHOR_LAT = "crumb_anchor_lat";
+    private static final String K_ANCHOR_LNG = "crumb_anchor_lng";
+    private static final String K_ANCHOR_T   = "crumb_anchor_t";
+
+    // ── Stillness estimate ─────────────────────────────────────────
+    //
+    // The anchor above sets the SPACING of written points. It cannot decide
+    // whether the device is moving at all, because that question cannot be
+    // answered from one fix: a single sample lands beyond any threshold a
+    // fixed fraction of the time, whatever you compare it against. Measured,
+    // that left a still phone on ±66 m fixes still writing ~30 points an hour
+    // — fewer than before, but each one a bigger jump, which the timeline
+    // sums into kilometres.
+    //
+    // So stillness is decided from an AVERAGED position, whose noise falls
+    // with the number of samples. `ema` is that average; `still` is where it
+    // sat when the device was last known to be moving. While the average has
+    // not left `still`, the device has not left either, and nothing is
+    // written.
+    //
+    // An exponential average rather than a ring buffer because this has to
+    // survive process death in SharedPreferences, and its weighting is by
+    // TIME, not sample count, so the smoothing does not change when the
+    // tracking profile does.
+    private static final String K_EMA_LAT      = "motion_ema_lat";
+    private static final String K_EMA_LNG      = "motion_ema_lng";
+    private static final String K_EMA_T        = "motion_ema_t";
+    private static final String K_STILL_LAT    = "motion_still_lat";
+    private static final String K_STILL_LNG    = "motion_still_lng";
+    private static final String K_MOVING_UNTIL = "motion_moving_until";
+
+    // IDs of places the device is *currently* considered inside. The
+    // receiver uses this to dedupe ENTERs and drop synthetic EXITs
+    // that Google Play Services sometimes fires on re-registration,
+    // doze wake-up, or charging-state transitions. Without this,
+    // users see spurious "left <place>" check-ins for places they
+    // never actually entered this session.
+    private static final String K_INSIDE_PLACE_IDS = "inside_place_ids";
+
+    // {placeId: epoch-ms} — when repairMissedArrival FIRST saw itself inside
+    // a place that the inside-set says we left. It waits for that to persist
+    // before acting, so it repairs a divergence rather than racing Play
+    // Services to every ordinary arrival, and this is the clock.
+    //
+    // PERSISTED, because the pipeline is headless: an in-memory stamp would
+    // reset on every process death, the wait would never elapse on a
+    // doze-cycling device, and the repair would never fire at all — the
+    // opposite failure to the one it is being given.
+    private static final String K_REPAIR_WATCH = "repair_inside_since";
+
+    // {placeId: {t: epoch-ms, tr: bool}} — arrivals the drift gate recorded
+    // as state but did not announce, waiting for evidence either way. See
+    // GeofenceReceiver.confirmHeldArrivals. Device-local bookkeeping about
+    // what WE have said, not a mirror of any database row.
+    private static final String K_HELD_ARRIVALS = "held_arrivals";
+
+    // Epoch-ms of the last EXIT that was accepted and announced. One of the
+    // two "arriving from travel" signals a held arrival is judged by.
+    private static final String K_LAST_EXIT_MS = "last_exit_ms";
+
+    // Black-box event journal: JSON array of { t: epochMs, e: text },
+    // capped at JOURNAL_CAP (oldest dropped). Written by the service,
+    // receivers and plugin at lifecycle-significant moments (doze
+    // transitions, service create/destroy, geofence fires, package
+    // updates) and surfaced in the Diagnostics panel — so the next
+    // tracking anomaly can be explained from the phone screen instead
+    // of a perishable adb logcat buffer.
+    private static final String K_JOURNAL = "journal";
+    private static final int JOURNAL_CAP = 120;
+
+    // Check-in payloads the receiver tried to POST but couldn't deliver
+    // (transient network failure on the boundary crossing — most often
+    // a WiFi → cellular handoff while leaving home). Stored as a JSON
+    // array; drained on every subsequent receiver fire, on every
+    // breadcrumb fire with a non-empty queue (the earliest proof the
+    // network is back), and on every app launch via the flushPending
+    // plugin method. Capped at PENDING_CAP entries; oldest dropped on
+    // overflow.
+    private static final String K_PENDING_CHECKINS = "pending_checkins";
+    private static final int PENDING_CAP = 50;
+
+    private final SharedPreferences sp;
+
+    public PrefsStore(Context ctx) {
+        this.sp = ctx.getApplicationContext()
+                .getSharedPreferences(PREFS, Context.MODE_PRIVATE);
+        migrateNestIdKey();
+    }
+
+    /** v9 renamed the stored key "nest_id" → "keep_id", and the column
+     *  it names in Supabase along with it. Without this copy, an
+     *  in-place upgrade orphans the value: hasContext() goes false and
+     *  every headless path (geofence receiver, breadcrumbs,
+     *  BootReceiver, push wake-up) silently bails until the user next
+     *  opens the app and initialize() rewrites the context.
+     *
+     *  The pending-checkin queue needs the same treatment for a
+     *  different reason: an entry queued before the upgrade carries a
+     *  "nest_id" field, which the migrated database rejects. The drain
+     *  loop stops at the first failure, so one stale entry would wedge
+     *  the queue permanently.
+     *
+     *  One-shot — the old key is removed, so this is a no-op from the
+     *  second construction onwards. */
+    private void migrateNestIdKey() {
+        if (!sp.contains(LEGACY_K_NEST_ID)) return;
+        SharedPreferences.Editor e = sp.edit();
+        String legacy = sp.getString(LEGACY_K_NEST_ID, null);
+        if (legacy != null && sp.getString(K_KEEP_ID, null) == null) {
+            e.putString(K_KEEP_ID, legacy);
+        }
+        e.remove(LEGACY_K_NEST_ID);
+
+        try {
+            JSONArray arr = new JSONArray(sp.getString(K_PENDING_CHECKINS, "[]"));
+            boolean touched = false;
+            for (int i = 0; i < arr.length(); i++) {
+                JSONObject o = arr.getJSONObject(i);
+                if (o.has("nest_id")) {
+                    o.put("keep_id", o.remove("nest_id"));
+                    touched = true;
+                }
+            }
+            if (touched) e.putString(K_PENDING_CHECKINS, arr.toString());
+        } catch (JSONException ignored) { /* corrupt → leave it */ }
+
+        e.apply();
+    }
+
+    // ── Auth / context ─────────────────────────────────────────────
+
+    public void setContext(String supabaseUrl, String anonKey,
+                           String userId, String keepId, String memberId,
+                           String memberName, String memberAvatar) {
+        sp.edit()
+                .putString(K_SUPABASE_URL, supabaseUrl)
+                .putString(K_ANON_KEY, anonKey)
+                .putString(K_USER_ID, userId)
+                .putString(K_KEEP_ID, keepId)
+                .putString(K_MEMBER_ID, memberId)
+                .putString(K_MEMBER_NAME, memberName)
+                .putString(K_MEMBER_AVATAR, memberAvatar)
+                .apply();
+    }
+
+    public void setTokens(String accessToken, String refreshToken) {
+        sp.edit()
+                .putString(K_ACCESS_TOKEN, accessToken)
+                .putString(K_REFRESH_TOKEN, refreshToken)
+                .apply();
+    }
+
+    public String getSupabaseUrl()  { return sp.getString(K_SUPABASE_URL, null); }
+    public String getAnonKey()      { return sp.getString(K_ANON_KEY, null); }
+    public String getAccessToken()  { return sp.getString(K_ACCESS_TOKEN, null); }
+    public String getRefreshToken() { return sp.getString(K_REFRESH_TOKEN, null); }
+    public String getUserId()       { return sp.getString(K_USER_ID, null); }
+    public String getKeepId()       { return sp.getString(K_KEEP_ID, null); }
+    public String getMemberId()     { return sp.getString(K_MEMBER_ID, null); }
+    public String getMemberName()   { return sp.getString(K_MEMBER_NAME, "Someone"); }
+    public String getMemberAvatar() { return sp.getString(K_MEMBER_AVATAR, "📍"); }
+
+    public void setTrackMode(String mode) {
+        sp.edit().putString(K_TRACK_MODE, mode).apply();
+    }
+    public String getTrackMode() { return sp.getString(K_TRACK_MODE, "auto"); }
+
+    // Adult self-pause: the epoch-ms instant tracking should stay off
+    // until (0 = not paused). The whole native pipeline consults isPaused()
+    // — the foreground service, boot re-arm and both receivers refuse to
+    // run while it's true — so a pause actually silences tracking rather
+    // than just hiding the pin. Auto-expires: once the instant passes,
+    // isPaused() is false again with no write needed.
+    private static final String K_PAUSED_UNTIL = "paused_until";
+    public void setPausedUntil(long ms) { sp.edit().putLong(K_PAUSED_UNTIL, ms).apply(); }
+    public long getPausedUntil()        { return sp.getLong(K_PAUSED_UNTIL, 0); }
+
+    // Newest check-in we have already raised a notification for, as the
+    // raw created_at string. Push is content-free now, so a wake-up just
+    // means "something happened" — this is how the device works out what
+    // is actually new and avoids re-notifying the same row.
+    private static final String K_LAST_PUSH_SEEN = "last_push_seen";
+    public String getLastPushSeen()            { return sp.getString(K_LAST_PUSH_SEEN, null); }
+    public void setLastPushSeen(String isoTs)  { sp.edit().putString(K_LAST_PUSH_SEEN, isoTs).apply(); }
+
+    // The same watermark on the SERVER's clock (schema v16, checkins.inserted_at).
+    // A separate key because the two are different clocks and must never be
+    // compared: the one above holds a device-reported created_at. Seeded from
+    // it on first use — see RoamkeepMessagingService.
+    private static final String K_LAST_PUSH_SEEN_INS = "last_push_seen_ins";
+    public String getLastPushSeenInserted()           { return sp.getString(K_LAST_PUSH_SEEN_INS, null); }
+    public void setLastPushSeenInserted(String isoTs) { sp.edit().putString(K_LAST_PUSH_SEEN_INS, isoTs).apply(); }
+
+    // IDs of check-ins already raised as notifications, oldest first, capped.
+    // The notification query deliberately OVERLAPS its window, because a row
+    // can land after a newer one (a crossing queued through a network
+    // handoff); this set is what stops the overlap raising a row twice.
+    private static final String K_PUSH_SEEN_IDS = "push_seen_ids";
+    private static final int PUSH_SEEN_CAP = 200;
+
+    public Set<String> getPushSeenIds() { synchronized (LOCK) {
+        Set<String> out = new HashSet<>();
+        try {
+            JSONArray arr = new JSONArray(sp.getString(K_PUSH_SEEN_IDS, "[]"));
+            for (int i = 0; i < arr.length(); i++) {
+                String id = arr.optString(i, null);
+                if (id != null) out.add(id);
+            }
+        } catch (JSONException ignored) {}
+        return out;
+    } }
+
+    public void addPushSeenIds(Collection<String> ids) { synchronized (LOCK) {
+        if (ids == null || ids.isEmpty()) return;
+        List<String> list = new ArrayList<>();
+        try {
+            JSONArray arr = new JSONArray(sp.getString(K_PUSH_SEEN_IDS, "[]"));
+            for (int i = 0; i < arr.length(); i++) {
+                String id = arr.optString(i, null);
+                if (id != null) list.add(id);
+            }
+        } catch (JSONException ignored) {}
+        for (String id : ids) if (id != null && !list.contains(id)) list.add(id);
+        while (list.size() > PUSH_SEEN_CAP) list.remove(0);
+        JSONArray out = new JSONArray();
+        for (String id : list) out.put(id);
+        sp.edit().putString(K_PUSH_SEEN_IDS, out.toString()).apply();
+    } }
+
+    // The last password-reset event this phone has told its user about,
+    // "made:<issued_at>" or "used:<redeemed_at>". The same string the app's
+    // in-app notice keeps (rk_reset_seen), and the app seeds it here at every
+    // launch (NativeGeofencePlugin.setResetSeen), because clearAll wipes it.
+    // Deliberately NOT in the capped push-seen set: the reset row is never
+    // deleted, so a key that aged out of that set, or was wiped with it,
+    // re-announced an old reset on the next wake (rc9 device test).
+    private static final String K_RESET_SEEN = "reset_seen";
+    public String getResetSeen()           { return sp.getString(K_RESET_SEEN, null); }
+    public void setResetSeen(String event) { sp.edit().putString(K_RESET_SEEN, event).apply(); }
+
+    // When the live pin (keep_members lat/lng) was last written, epoch-ms.
+    // PERSISTED, because the breadcrumb pipeline runs in short-lived
+    // processes; see LocationUpdateReceiver's pin throttle.
+    private static final String K_LAST_PIN_WRITE = "last_pin_write";
+    public long getLastPinWriteMs()        { return sp.getLong(K_LAST_PIN_WRITE, 0); }
+    public void setLastPinWriteMs(long ms) { sp.edit().putLong(K_LAST_PIN_WRITE, ms).apply(); }
+
+    // Consecutive writes the server refused on row-level security (42501) —
+    // what a device sees once its member has been removed from the Keep —
+    // and the flag set when the streak says so. While the flag is set the
+    // headless pipeline stays dark; initialize() (the app opening with a
+    // valid membership) clears it. See LocationUpdateReceiver.
+    private static final String K_REJECT_STREAK   = "rls_reject_streak";
+    private static final String K_SERVER_REJECTED = "server_rejected";
+
+    public int bumpRejectStreak() { synchronized (LOCK) {
+        int n = sp.getInt(K_REJECT_STREAK, 0) + 1;
+        sp.edit().putInt(K_REJECT_STREAK, n).apply();
+        return n;
+    } }
+    public int getRejectStreak() { return sp.getInt(K_REJECT_STREAK, 0); }
+    public void resetRejectStreak() { synchronized (LOCK) {
+        if (sp.getInt(K_REJECT_STREAK, 0) != 0) sp.edit().putInt(K_REJECT_STREAK, 0).apply();
+    } }
+    public boolean isServerRejected()           { return sp.getBoolean(K_SERVER_REJECTED, false); }
+    public void setServerRejected(boolean on)   { sp.edit().putBoolean(K_SERVER_REJECTED, on).apply(); }
+
+    /** null = never armed. Distinct from "" (armed an empty list), which
+     *  is a real state meaning every place was deleted. */
+    public String getPlacesSignature()          { return sp.getString(K_PLACES_SIG, null); }
+    public void setPlacesSignature(String sig)  { sp.edit().putString(K_PLACES_SIG, sig).apply(); }
+    public boolean isPaused()           { return getPausedUntil() > System.currentTimeMillis(); }
+
+    /** Record a LocationUpdateReceiver firing: stamp the time and bump the
+     *  fire / breadcrumb / suppressed-inside-place / rejected counters.
+     *  The four should account for every fix, so
+     *  {@code written + suppressed + rejected} summing to the fixes seen is
+     *  a real check rather than an accident of nothing ever being dropped. */
+    public void recordLocationFire(long whenMs, int crumbsWritten,
+                                                int suppressed, int rejStill,
+                                                int rejDrift, int rejUnusable) { synchronized (LOCK) {
+        final int rejected = rejStill + rejDrift + rejUnusable;
+        sp.edit()
+                .putLong(K_LAST_LOC_FIRE, whenMs)
+                .putInt(K_LOC_FIRE_COUNT, sp.getInt(K_LOC_FIRE_COUNT, 0) + 1)
+                .putInt(K_CRUMB_COUNT, sp.getInt(K_CRUMB_COUNT, 0) + crumbsWritten)
+                .putInt(K_SUPPRESSED_COUNT, sp.getInt(K_SUPPRESSED_COUNT, 0) + suppressed)
+                .putInt(K_REJECTED_COUNT, sp.getInt(K_REJECTED_COUNT, 0) + rejected)
+                .putInt(K_REJ_STILL, sp.getInt(K_REJ_STILL, 0) + rejStill)
+                .putInt(K_REJ_DRIFT, sp.getInt(K_REJ_DRIFT, 0) + rejDrift)
+                .putInt(K_REJ_UNUSABLE, sp.getInt(K_REJ_UNUSABLE, 0) + rejUnusable)
+                .apply();
+    } }
+    public long getLastLocationFire() { return sp.getLong(K_LAST_LOC_FIRE, 0); }
+    public int getLocationFireCount() { return sp.getInt(K_LOC_FIRE_COUNT, 0); }
+    public int getBreadcrumbCount()   { return sp.getInt(K_CRUMB_COUNT, 0); }
+    public int getSuppressedCount()   { return sp.getInt(K_SUPPRESSED_COUNT, 0); }
+    public int getRejectedCount()     { return sp.getInt(K_REJECTED_COUNT, 0); }
+    public int getRejStillCount()     { return sp.getInt(K_REJ_STILL, 0); }
+    public int getRejDriftCount()     { return sp.getInt(K_REJ_DRIFT, 0); }
+    public int getRejUnusableCount()  { return sp.getInt(K_REJ_UNUSABLE, 0); }
+
+    public long getLastRejectJournal()          { return sp.getLong(K_LAST_REJ_JOURNAL, 0); }
+    public void setLastRejectJournal(long ms)   { sp.edit().putLong(K_LAST_REJ_JOURNAL, ms).apply(); }
+
+    /** The schema version the database last reported, or 0 if never read.
+     *  See K_SCHEMA_VERSION: 0 must be treated as "the column is absent". */
+    public int getSchemaVersion() { return sp.getInt(K_SCHEMA_VERSION, 0); }
+
+    /** Mirror the version JS read from the database.
+     *
+     *  Ignores a non-positive value rather than storing it. The JS side
+     *  leaves its own copy null when the read FAILED — offline, project
+     *  asleep, a tunnel — and a failed read must never overwrite good
+     *  state, which is the rule the members-list bug wrote down the hard
+     *  way. Keeping the last known number costs nothing: it is only ever
+     *  used to decide whether to include one optional field. */
+    public void setSchemaVersion(int v) {
+        if (v > 0) sp.edit().putInt(K_SCHEMA_VERSION, v).apply();
+    }
+
+    /** Force the mirrored version DOWN, when the database has proven it
+     *  does not have what that version promises. Separate from the setter
+     *  above precisely because it must bypass the "never go backwards"
+     *  guard: here the evidence is a rejected write, not a stale read. */
+    public void demoteSchemaVersion(int v) {
+        sp.edit().putInt(K_SCHEMA_VERSION, v).apply();
+    }
+
+    /** The pending rejection window behind the half-hourly journal line.
+     *  Read, added to, and written back by LocationUpdateReceiver, which
+     *  runs every one of those calls on a single serial worker thread. */
+    public static final class RejectWindow {
+        public int still, drift, unusable;
+        public float worstAcc, worstDist;
+        public long sinceMs;
+    }
+
+    public RejectWindow getRejectWindow() { synchronized (LOCK) {
+        RejectWindow w = new RejectWindow();
+        w.still     = sp.getInt(K_PEND_STILL, 0);
+        w.drift     = sp.getInt(K_PEND_DRIFT, 0);
+        w.unusable  = sp.getInt(K_PEND_UNUSABLE, 0);
+        w.worstAcc  = sp.getFloat(K_PEND_WORST_ACC, 0f);
+        w.worstDist = sp.getFloat(K_PEND_WORST_DST, 0f);
+        w.sinceMs   = sp.getLong(K_PEND_SINCE, 0);
+        return w;
+    } }
+
+    public void setRejectWindow(RejectWindow w) { synchronized (LOCK) {
+        sp.edit()
+                .putInt(K_PEND_STILL, w.still)
+                .putInt(K_PEND_DRIFT, w.drift)
+                .putInt(K_PEND_UNUSABLE, w.unusable)
+                .putFloat(K_PEND_WORST_ACC, w.worstAcc)
+                .putFloat(K_PEND_WORST_DST, w.worstDist)
+                .putLong(K_PEND_SINCE, w.sinceMs)
+                .apply();
+    } }
+
+    /** The last position accepted as real. Null until one has been recorded
+     *  (fresh install, or after a sign-out clears everything). */
+    public Anchor getBreadcrumbAnchor() { synchronized (LOCK) {
+        long t = sp.getLong(K_ANCHOR_T, 0);
+        if (t == 0) return null;
+        return new Anchor(Double.longBitsToDouble(sp.getLong(K_ANCHOR_LAT, 0)),
+                          Double.longBitsToDouble(sp.getLong(K_ANCHOR_LNG, 0)), t);
+    } }
+
+    /** ONE editor, so the three values commit together. A torn anchor — the
+     *  latitude of one fix with the longitude of another — would be a
+     *  position that never existed, and the gate would measure drift against
+     *  it forever. If this is ever split into separate writes, that bug
+     *  comes back. */
+    public void setBreadcrumbAnchor(double lat, double lng, long tMs) { synchronized (LOCK) {
+        sp.edit()
+                .putLong(K_ANCHOR_LAT, Double.doubleToRawLongBits(lat))
+                .putLong(K_ANCHOR_LNG, Double.doubleToRawLongBits(lng))
+                .putLong(K_ANCHOR_T, tMs)
+                .apply();
+    } }
+
+    /** SharedPreferences has no double; raw long bits keep it exact. */
+    public static final class Anchor {
+        public final double lat, lng;
+        public final long tMs;
+        Anchor(double lat, double lng, long tMs) { this.lat = lat; this.lng = lng; this.tMs = tMs; }
+    }
+
+    /** The whole stillness estimate, read and written as one unit. */
+    public static final class Motion {
+        /** false = never seeded (fresh install, or just after a sign-out). */
+        public final boolean valid;
+        public final double emaLat, emaLng;
+        public final long emaMs;
+        public final double stillLat, stillLng;
+        public final long movingUntilMs;
+        Motion(boolean valid, double emaLat, double emaLng, long emaMs,
+               double stillLat, double stillLng, long movingUntilMs) {
+            this.valid = valid; this.emaLat = emaLat; this.emaLng = emaLng;
+            this.emaMs = emaMs; this.stillLat = stillLat; this.stillLng = stillLng;
+            this.movingUntilMs = movingUntilMs;
+        }
+    }
+
+    public Motion getMotion() { synchronized (LOCK) {
+        long t = sp.getLong(K_EMA_T, 0);
+        if (t == 0) return new Motion(false, 0, 0, 0, 0, 0, 0);
+        return new Motion(true,
+                Double.longBitsToDouble(sp.getLong(K_EMA_LAT, 0)),
+                Double.longBitsToDouble(sp.getLong(K_EMA_LNG, 0)), t,
+                Double.longBitsToDouble(sp.getLong(K_STILL_LAT, 0)),
+                Double.longBitsToDouble(sp.getLong(K_STILL_LNG, 0)),
+                sp.getLong(K_MOVING_UNTIL, 0));
+    } }
+
+    /** One editor, for the same reason the anchor uses one: a half-written
+     *  motion state would describe a device that was never anywhere. */
+    public void setMotion(double emaLat, double emaLng, long emaMs,
+                                       double stillLat, double stillLng, long movingUntilMs) { synchronized (LOCK) {
+        sp.edit()
+                .putLong(K_EMA_LAT, Double.doubleToRawLongBits(emaLat))
+                .putLong(K_EMA_LNG, Double.doubleToRawLongBits(emaLng))
+                .putLong(K_EMA_T, emaMs)
+                .putLong(K_STILL_LAT, Double.doubleToRawLongBits(stillLat))
+                .putLong(K_STILL_LNG, Double.doubleToRawLongBits(stillLng))
+                .putLong(K_MOVING_UNTIL, movingUntilMs)
+                .apply();
+    } }
+
+    /**
+     * Shared monitor for read-modify-write state.
+     *
+     * `synchronized` on an instance method locks `this`, and every call site
+     * in this codebase constructs its own PrefsStore — so instance locking
+     * guards nothing at all. Every method below that reads a value, changes
+     * it and writes it back therefore needs a lock that all instances share.
+     * SharedPreferences itself is process-wide, so the data being guarded is
+     * shared even though the wrappers are not.
+     *
+     * So EVERY read-modify-write in this class takes this one lock (4.9.0).
+     * They used to be `synchronized` instance methods — decorative — on the
+     * grounds that the pipeline touching them is serialised at its source.
+     * It is not: the pending-checkin queue and the inside-place set are
+     * written by the geofence worker, the location worker and the plugin's
+     * flush thread, so a drain writing back its list could silently drop a
+     * check-in appended a moment earlier. One lock, reentrant, and no second
+     * monitor anywhere — so no lock-ordering question can arise.
+     */
+    private static final Object LOCK = new Object();
+
+    /** Append a line to the black-box journal. Cheap and safe to call
+     *  from any thread; failures are swallowed — diagnostics must never
+     *  break the pipeline they're diagnosing. */
+    public void journal(String event) {
+        synchronized (LOCK) { journalLocked(event); }
+    }
+
+    private void journalLocked(String event) {
+        if (event == null) return;
+        try {
+            JSONArray arr = new JSONArray(sp.getString(K_JOURNAL, "[]"));
+            JSONObject e = new JSONObject();
+            e.put("t", System.currentTimeMillis());
+            e.put("e", event);
+            arr.put(e);
+            while (arr.length() > JOURNAL_CAP) arr.remove(0);
+            sp.edit().putString(K_JOURNAL, arr.toString()).apply();
+        } catch (JSONException ignored) {}
+    }
+
+    public String getJournalRaw() {
+        synchronized (LOCK) { return sp.getString(K_JOURNAL, "[]"); }
+    }
+
+    public boolean hasContext() {
+        return getSupabaseUrl() != null && getAnonKey() != null
+                && getAccessToken() != null && getKeepId() != null
+                && getMemberId() != null;
+    }
+
+    public void clearAll() {
+        sp.edit().clear().apply();
+    }
+
+    // ── Places ──────────────────────────────────────────────────────
+
+    public static class Place {
+        public final String id;
+        public final String name;
+        public final String icon;
+        public final double lat;
+        public final double lng;
+        public final float radius;
+
+        public Place(String id, String name, String icon, double lat, double lng, float radius) {
+            this.id = id;
+            this.name = name;
+            this.icon = icon;
+            this.lat = lat;
+            this.lng = lng;
+            this.radius = radius;
+        }
+
+        JSONObject toJson() throws JSONException {
+            JSONObject o = new JSONObject();
+            o.put("id", id);
+            o.put("name", name);
+            o.put("icon", icon);
+            o.put("lat", lat);
+            o.put("lng", lng);
+            o.put("radius", radius);
+            return o;
+        }
+
+        static Place fromJson(JSONObject o) throws JSONException {
+            return new Place(
+                    o.getString("id"),
+                    o.getString("name"),
+                    o.getString("icon"),
+                    o.getDouble("lat"),
+                    o.getDouble("lng"),
+                    (float) o.getDouble("radius")
+            );
+        }
+    }
+
+    public List<Place> getPlaces() { synchronized (LOCK) {
+        String raw = sp.getString(K_PLACES, "[]");
+        List<Place> out = new ArrayList<>();
+        try {
+            JSONArray arr = new JSONArray(raw);
+            for (int i = 0; i < arr.length(); i++) {
+                out.add(Place.fromJson(arr.getJSONObject(i)));
+            }
+        } catch (JSONException ignored) { /* corrupt → treat as empty */ }
+        return out;
+    } }
+
+    public Place findPlace(String id) { synchronized (LOCK) {
+        for (Place p : getPlaces()) if (p.id.equals(id)) return p;
+        return null;
+    } }
+
+    public void putPlace(Place p) { synchronized (LOCK) {
+        List<Place> places = getPlaces();
+        // Replace any existing entry with same id.
+        for (int i = 0; i < places.size(); i++) {
+            if (places.get(i).id.equals(p.id)) { places.remove(i); break; }
+        }
+        places.add(p);
+        writePlaces(places);
+    } }
+
+    public void removePlace(String id) { synchronized (LOCK) {
+        List<Place> places = getPlaces();
+        for (int i = 0; i < places.size(); i++) {
+            if (places.get(i).id.equals(id)) { places.remove(i); break; }
+        }
+        writePlaces(places);
+        // If we were tracking ourselves as inside this place, drop
+        // it — the geofence no longer exists, so we should not
+        // expect a matching EXIT to clear the state later.
+        removeInsidePlace(id);
+        // Likewise an arrival still held for it: a deleted place must
+        // never be announced later from stale metadata.
+        claimHeldArrival(id);
+    } }
+
+    public void clearPlaces() { synchronized (LOCK) {
+        writePlaces(new ArrayList<>());
+    } }
+
+    private void writePlaces(List<Place> places) {
+        JSONArray arr = new JSONArray();
+        try {
+            for (Place p : places) arr.put(p.toJson());
+        } catch (JSONException ignored) {}
+        sp.edit().putString(K_PLACES, arr.toString()).apply();
+    }
+
+    // ── Inside-place tracking ──────────────────────────────────────
+    //
+    // The receiver treats this set as the authoritative record of
+    // "places we have an unmatched ENTER for". A place is added on
+    // successful ENTER check-in insert and removed on successful EXIT.
+    // An EXIT broadcast for a place *not* in this set is treated as
+    // synthetic (OS re-evaluation noise) and dropped. An ENTER for a
+    // place *already* in the set is treated as a duplicate.
+
+    public Set<String> getInsidePlaceIds() { synchronized (LOCK) {
+        String raw = sp.getString(K_INSIDE_PLACE_IDS, "[]");
+        Set<String> out = new HashSet<>();
+        try {
+            JSONArray arr = new JSONArray(raw);
+            for (int i = 0; i < arr.length(); i++) {
+                String id = arr.optString(i, null);
+                if (id != null) out.add(id);
+            }
+        } catch (JSONException ignored) {}
+        return out;
+    } }
+
+    public boolean isInsidePlace(String id) { synchronized (LOCK) {
+        return getInsidePlaceIds().contains(id);
+    } }
+
+    public void setInsidePlaceIds(Collection<String> ids) { synchronized (LOCK) {
+        JSONArray arr = new JSONArray();
+        if (ids != null) for (String id : ids) arr.put(id);
+        sp.edit().putString(K_INSIDE_PLACE_IDS, arr.toString()).apply();
+    } }
+
+    /** Union-merge — adds jsState on top of existing native state rather
+     *  than overwriting. Preserves any ENTERs the receiver captured
+     *  while the app was closed (and that JS doesn't know about yet
+     *  because last_place_id only tracks one place). */
+    public void mergeInsidePlaceIds(Collection<String> ids) { synchronized (LOCK) {
+        if (ids == null || ids.isEmpty()) return;
+        Set<String> existing = getInsidePlaceIds();
+        if (existing.addAll(ids)) setInsidePlaceIds(existing);
+    } }
+
+    /** The repair watch map, {placeId: epoch-ms}. Never null; an empty
+     *  object when nothing is being watched. See K_REPAIR_WATCH. */
+    public JSONObject getRepairWatch() { synchronized (LOCK) {
+        try {
+            return new JSONObject(sp.getString(K_REPAIR_WATCH, "{}"));
+        } catch (JSONException e) {
+            return new JSONObject();
+        }
+    } }
+
+    public void setRepairWatch(JSONObject watch) { synchronized (LOCK) {
+        sp.edit().putString(K_REPAIR_WATCH, watch == null ? "{}" : watch.toString()).apply();
+    } }
+
+    /**
+     * Record that we are inside a place, and report whether THIS caller is
+     * the one that changed it.
+     *
+     * Two independent threads now decide someone has arrived: the geofence
+     * receiver, from a Play Services transition, and the breadcrumb pipeline,
+     * from a precise fix inside a place whose state says otherwise. Both
+     * follow "is it already set? no — then file an arrival and set it", and
+     * as separate check-then-act pairs that races into two arrivals for one
+     * homecoming.
+     *
+     * `synchronized` on the methods around it does NOT prevent that: it locks
+     * the PrefsStore INSTANCE, and every one of these call sites constructs
+     * its own. The lock has always been decorative across threads. This one
+     * takes the class-level LOCK, which is shared, and folds the test and the
+     * set into a single guarded step — so the loser is told it lost and stays
+     * quiet, rather than both deciding they won.
+     *
+     * Every other accessor in this class takes the same LOCK (it is
+     * reentrant), so this compare-and-set is atomic against all of them.
+     *
+     * @return true if this call added the place; false if it was already set.
+     */
+    public boolean claimInsidePlace(String id) {
+        if (id == null) return false;
+        synchronized (LOCK) {
+            Set<String> set = new HashSet<>();
+            try {
+                JSONArray arr = new JSONArray(sp.getString(K_INSIDE_PLACE_IDS, "[]"));
+                for (int i = 0; i < arr.length(); i++) {
+                    String v = arr.optString(i, null);
+                    if (v != null) set.add(v);
+                }
+            } catch (JSONException ignored) {}
+            if (!set.add(id)) return false;
+            JSONArray out = new JSONArray();
+            for (String v : set) out.put(v);
+            sp.edit().putString(K_INSIDE_PLACE_IDS, out.toString()).commit();
+            return true;
+        }
+    }
+
+    public void addInsidePlace(String id) { synchronized (LOCK) {
+        if (id == null) return;
+        Set<String> set = getInsidePlaceIds();
+        if (set.add(id)) setInsidePlaceIds(set);
+    } }
+
+    public void removeInsidePlace(String id) { synchronized (LOCK) {
+        if (id == null) return;
+        Set<String> set = getInsidePlaceIds();
+        if (set.remove(id)) setInsidePlaceIds(set);
+    } }
+
+    // ── Held arrivals ──────────────────────────────────────────────
+    //
+    // An arrival the drift gate would not announce on the fix it came with.
+    // The inside-set above still records it — that set tracks what Play
+    // Services believes — but the family has not been told. A held arrival
+    // leaves this map exactly once: confirmed and announced, or discarded
+    // at the EXIT with neither side announced. Never silently.
+
+    public static final class Held {
+        public final long enterMs;     // when the gated ENTER happened
+        public final boolean travel;   // arriving from travel at the time
+        Held(long enterMs, boolean travel) {
+            this.enterMs = enterMs;
+            this.travel = travel;
+        }
+    }
+
+    private JSONObject readHeld() {
+        try {
+            return new JSONObject(sp.getString(K_HELD_ARRIVALS, "{}"));
+        } catch (JSONException e) {
+            return new JSONObject();
+        }
+    }
+
+    private static Held parseHeld(JSONObject o) {
+        if (o == null) return null;
+        long t = o.optLong("t", 0L);
+        return t > 0L ? new Held(t, o.optBoolean("tr", false)) : null;
+    }
+
+    /**
+     * Hold an arrival. If one is already held for this place, keep its
+     * EARLIER time — the dwell is measured from the first crossing — and
+     * treat it as travel if either reading was.
+     */
+    public void holdArrival(String id, long enterMs, boolean travel) {
+        if (id == null) return;
+        synchronized (LOCK) {
+            JSONObject all = readHeld();
+            Held prev = parseHeld(all.optJSONObject(id));
+            long t = prev != null ? Math.min(prev.enterMs, enterMs) : enterMs;
+            boolean tr = travel || (prev != null && prev.travel);
+            try {
+                JSONObject o = new JSONObject();
+                o.put("t", t);
+                o.put("tr", tr);
+                all.put(id, o);
+            } catch (JSONException e) {
+                return;
+            }
+            sp.edit().putString(K_HELD_ARRIVALS, all.toString()).commit();
+        }
+    }
+
+    /** Clear the travel flag on a held arrival — see GeofenceReceiver.judgeHeld. */
+    public void demoteHeldArrival(String id) {
+        if (id == null) return;
+        synchronized (LOCK) {
+            JSONObject all = readHeld();
+            JSONObject o = all.optJSONObject(id);
+            if (o == null) return;
+            try { o.put("tr", false); } catch (JSONException e) { return; }
+            sp.edit().putString(K_HELD_ARRIVALS, all.toString()).commit();
+        }
+    }
+
+    /**
+     * Take a held arrival out of the map and hand it to THIS caller, or
+     * return null if there is none — including because another thread just
+     * took it. Compare-and-set under the class-level LOCK, for the same
+     * reason as claimInsidePlace: the geofence worker (at an EXIT or a
+     * precise ENTER) and the location worker (on a breadcrumb batch) can both
+     * decide what happens to one hold, and only one of them may act on it.
+     */
+    public Held claimHeldArrival(String id) {
+        if (id == null) return null;
+        synchronized (LOCK) {
+            JSONObject all = readHeld();
+            if (!all.has(id)) return null;
+            Held h = parseHeld(all.optJSONObject(id));   // null if malformed: removed all the same
+            all.remove(id);
+            sp.edit().putString(K_HELD_ARRIVALS, all.toString()).commit();
+            return h;
+        }
+    }
+
+    /** Snapshot of every held arrival. Never null. */
+    public Map<String, Held> getHeldArrivals() { synchronized (LOCK) {
+        Map<String, Held> out = new HashMap<>();
+        JSONObject all = readHeld();
+        Iterator<String> it = all.keys();
+        while (it.hasNext()) {
+            String id = it.next();
+            Held h = parseHeld(all.optJSONObject(id));
+            if (h != null) out.put(id, h);
+        }
+        return out;
+    } }
+
+    public long getLastExitMs() { synchronized (LOCK) {
+        return sp.getLong(K_LAST_EXIT_MS, 0L);
+    } }
+
+    public void setLastExitMs(long ms) { synchronized (LOCK) {
+        sp.edit().putLong(K_LAST_EXIT_MS, ms).apply();
+    } }
+
+    // ── Pending check-in queue ─────────────────────────────────────
+    //
+    // Idempotency depends on each entry carrying a client-generated
+    // UUID under "id" — duplicate INSERTs land as 409 Conflict on the
+    // primary-key constraint, which the receiver treats as success
+    // (the row already made it; we just didn't see the response).
+
+    public List<JSONObject> getPendingCheckins() { synchronized (LOCK) {
+        String raw = sp.getString(K_PENDING_CHECKINS, "[]");
+        List<JSONObject> out = new ArrayList<>();
+        try {
+            JSONArray arr = new JSONArray(raw);
+            for (int i = 0; i < arr.length(); i++) {
+                out.add(arr.getJSONObject(i));
+            }
+        } catch (JSONException ignored) { /* corrupt → empty */ }
+        return out;
+    } }
+
+    public void appendPendingCheckin(JSONObject payload) { synchronized (LOCK) {
+        if (payload == null) return;
+        List<JSONObject> list = getPendingCheckins();
+        list.add(payload);
+        // Trim from the front if we've blown through the cap. Older
+        // entries are most likely already stale (e.g. user has been
+        // offline for days) and dropping them is preferable to
+        // unbounded SharedPreferences growth.
+        while (list.size() > PENDING_CAP) list.remove(0);
+        writePending(list);
+    } }
+
+    public void removePendingCheckin(String id) { synchronized (LOCK) {
+        if (id == null) return;
+        List<JSONObject> list = getPendingCheckins();
+        boolean changed = false;
+        for (int i = list.size() - 1; i >= 0; i--) {
+            String entryId = list.get(i).optString("id", null);
+            if (id.equals(entryId)) {
+                list.remove(i);
+                changed = true;
+            }
+        }
+        if (changed) writePending(list);
+    } }
+
+    public int pendingCount() { synchronized (LOCK) {
+        return getPendingCheckins().size();
+    } }
+
+    private void writePending(List<JSONObject> list) {
+        JSONArray arr = new JSONArray();
+        for (JSONObject p : list) arr.put(p);
+        sp.edit().putString(K_PENDING_CHECKINS, arr.toString()).apply();
+    }
+}

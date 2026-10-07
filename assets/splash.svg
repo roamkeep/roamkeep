@@ -1,0 +1,16 @@
+<!--
+  Native splash (pre-Android-12 full-screen splash, and the background
+  of the Android 12+ SplashScreen). Same teal as the web #s-load screen
+  so the system splash -> WebView handoff is visually seamless.
+
+  The mark is small (~22% of the shorter side) because this canvas is
+  square and heavily cropped on tall/short devices.
+-->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 2732 2732" width="2732" height="2732">
+  <rect width="2732" height="2732" fill="#0E7C7B"/>
+  <g transform="translate(937,911.3) scale(8.58)">
+    <path fill="#FFFFFF"
+          d="M26,18 L35,18 L35,26 L44,26 L44,18 L56,18 L56,26 L65,26 L65,18 L74,18 L74,60 L50,88 L26,60 Z"/>
+    <path fill="#FF6B5B" d="M40,58 L40,44 A10,10 0 0 1 60,44 L60,58 Z"/>
+  </g>
+</svg>

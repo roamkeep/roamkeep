@@ -1,0 +1,445 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: |
+  Secure static website with CloudFront, ACM, and S3.
+  Based on: https://github.com/aws-samples/amazon-cloudfront-secure-static-site
+  Modified: Route53 removed. ACM uses DNS validation (CNAME records). Point your
+  site's DNS CNAME to the CloudFrontDomain output after deployment.
+
+# REQUIREMENTS:
+#   - Must be deployed in us-east-1 (ACM certificates for CloudFront must be in us-east-1)
+#   - Access to add DNS records at your DNS provider
+
+# AFTER STARTING DEPLOYMENT (stack will pause waiting for certificate validation):
+#   1. Go to AWS Console > Certificate Manager > your pending certificate
+#   2. Copy the CNAME name and value shown under "DNS validation records"
+#      (these are ACM validation records — one per domain if CreateApex=yes)
+#   3. Add that CNAME record in your DNS provider
+#   4. ACM validates (usually within a few minutes once DNS propagates)
+#   5. Stack completes automatically
+
+# AFTER DEPLOYMENT COMPLETES:
+#   1. Copy the CloudFrontDomain output value
+#   2. In your DNS provider, add:
+#        www  CNAME  <CloudFrontDomain>
+#      (for apex domain, use ALIAS or ANAME record if your provider supports it)
+#   3. Upload your site content to the S3BucketRoot output bucket
+
+# ---------------------------------------------------------------------------
+# Parameters
+# ---------------------------------------------------------------------------
+
+Parameters:
+
+  SubDomain:
+    Description: Subdomain prefix, e.g. "www" for www.example.com
+    Type: String
+    Default: www
+    AllowedPattern: ^[^.]*$
+    ConstraintDescription: Must not contain dots
+
+  DomainName:
+    Description: Root domain, e.g. "example.com"
+    Type: String
+    AllowedPattern: ^[a-z0-9][a-z0-9\-\.]*[a-z0-9]$
+    ConstraintDescription: Must be a valid domain name
+
+  CreateApex:
+    Description: |
+      Include the apex/root domain (e.g. example.com) as a Subject Alternative Name
+      on the certificate and as a CloudFront alias. Set to "yes" if you want both
+      www.example.com and example.com to serve the same site.
+    Type: String
+    Default: 'no'
+    AllowedValues:
+      - 'yes'
+      - 'no'
+
+  ContentSecurityPolicy:
+    Description: |
+      The Content-Security-Policy header for this site. The default is the
+      web app's (app.roamkeep.app) and is also right for the invite pages
+      (get.roamkeep.app). The website (roamkeep.app) runs no script at all
+      and passes its own, stricter policy.
+    Type: String
+    Default: "default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com; img-src 'self' data: https://tile.openstreetmap.org; connect-src 'self' https://*.supabase.co wss://*.supabase.co; worker-src 'self'; manifest-src 'self'; object-src 'none'; frame-ancestors 'none'"
+
+# ---------------------------------------------------------------------------
+# Rules
+# ---------------------------------------------------------------------------
+
+Rules:
+  OnlyUsEast1:
+    Assertions:
+      - Assert:
+          Fn::Equals:
+            - !Ref AWS::Region
+            - us-east-1
+        AssertDescription: |
+          This template must be deployed in us-east-1. ACM certificates used
+          by CloudFront must be created in the us-east-1 region.
+
+# ---------------------------------------------------------------------------
+# Conditions
+# ---------------------------------------------------------------------------
+
+Conditions:
+  CreateApexConfig: !Equals [!Ref CreateApex, 'yes']
+
+# ---------------------------------------------------------------------------
+# Resources
+# ---------------------------------------------------------------------------
+
+Resources:
+
+  # -------------------------------------------------------------------------
+  # S3 — Logs bucket
+  # -------------------------------------------------------------------------
+
+  S3BucketLogs:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketName: !Sub '${AWS::StackName}-logs-${AWS::AccountId}'
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerPreferred
+      AccessControl: LogDeliveryWrite
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: ExpireLogs
+            Status: Enabled
+            ExpirationInDays: 90
+
+  # -------------------------------------------------------------------------
+  # S3 — Website content bucket
+  # -------------------------------------------------------------------------
+
+  S3BucketRoot:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketName: !Sub '${AWS::StackName}-root-${AWS::AccountId}'
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LoggingConfiguration:
+        DestinationBucketName: !Ref S3BucketLogs
+        LogFilePrefix: 's3-access/'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      VersioningConfiguration:
+        Status: Enabled
+
+  # -------------------------------------------------------------------------
+  # S3 Bucket Policy — allow CloudFront OAC only
+  # -------------------------------------------------------------------------
+
+  S3BucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref S3BucketRoot
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowCloudFrontServicePrincipal
+            Effect: Allow
+            Principal:
+              Service: cloudfront.amazonaws.com
+            Action: s3:GetObject
+            Resource: !Sub '${S3BucketRoot.Arn}/*'
+            Condition:
+              StringEquals:
+                AWS:SourceArn: !Sub 'arn:aws:cloudfront::${AWS::AccountId}:distribution/${CloudFrontDistribution}'
+          - Sid: DenyNonTLS
+            Effect: Deny
+            Principal: '*'
+            Action: s3:*
+            Resource:
+              - !GetAtt S3BucketRoot.Arn
+              - !Sub '${S3BucketRoot.Arn}/*'
+            Condition:
+              Bool:
+                aws:SecureTransport: false
+
+  # -------------------------------------------------------------------------
+  # ACM Certificate — email validation (no Route53 required)
+  # -------------------------------------------------------------------------
+
+  Certificate:
+    Type: AWS::CertificateManager::Certificate
+    Properties:
+      DomainName: !Sub '${SubDomain}.${DomainName}'
+      SubjectAlternativeNames:
+        - !If
+          - CreateApexConfig
+          - !Ref DomainName
+          - !Ref AWS::NoValue
+      ValidationMethod: DNS
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-cert'
+
+  # -------------------------------------------------------------------------
+  # CloudFront — Origin Access Control (SigV4, prevents direct S3 access)
+  # -------------------------------------------------------------------------
+
+  OriginAccessControl:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig:
+        Name: !Sub '${AWS::StackName}-oac'
+        OriginAccessControlOriginType: s3
+        SigningBehavior: always
+        SigningProtocol: sigv4
+
+  # -------------------------------------------------------------------------
+  # CloudFront — Response Headers Policy (security headers)
+  # -------------------------------------------------------------------------
+
+  ResponseHeadersPolicy:
+    Type: AWS::CloudFront::ResponseHeadersPolicy
+    Properties:
+      ResponseHeadersPolicyConfig:
+        Name: !Sub '${AWS::StackName}-security-headers'
+        Comment: Security headers for static site
+        SecurityHeadersConfig:
+          StrictTransportSecurity:
+            AccessControlMaxAgeSec: 63072000
+            IncludeSubdomains: true
+            Preload: true
+            Override: true
+          ContentSecurityPolicy:
+            # img-src names tile.openstreetmap.org exactly. It used to say
+            # *.tile.openstreetmap.org, which in CSP requires at least one
+            # leading label and therefore never matched the bare host — and
+            # 4.5.16 moved the map to exactly that bare host, because the OSM
+            # tile usage policy asks for the canonical name with no a/b/c
+            # rotation. Between the two the PWA was blocking its own tiles.
+            # Mirrored as a meta tag in index.html, which is the only policy
+            # the Android WebView sees; keep the two in step. The value is the
+            # ContentSecurityPolicy parameter, whose default is the web app's.
+            ContentSecurityPolicy: !Ref ContentSecurityPolicy
+            Override: true
+          ContentTypeOptions:
+            Override: true
+          FrameOptions:
+            FrameOption: DENY
+            Override: true
+          ReferrerPolicy:
+            # strict-origin-when-cross-origin: sends full URL same-origin, origin-only
+            # cross-origin, and nothing on HTTPS→HTTP downgrades. Matters here because
+            # OpenStreetMap's tile usage policy requires a Referer header; 'same-origin'
+            # stripped it and got tile requests blocked.
+            ReferrerPolicy: strict-origin-when-cross-origin
+            Override: true
+          XSSProtection:
+            ModeBlock: true
+            Protection: true
+            Override: true
+        CustomHeadersConfig:
+          Items:
+            - Header: Permissions-Policy
+              Value: accelerometer=(), camera=(), gyroscope=(), magnetometer=(), microphone=(), payment=(), usb=()
+              Override: true
+
+  # -------------------------------------------------------------------------
+  # CloudFront Function — directory index rewrite
+  # -------------------------------------------------------------------------
+  #
+  # S3 behind Origin Access Control is an object store, not a web server: it
+  # has no notion of a directory index. A request for /privacy is a request
+  # for an object with the key "privacy", which does not exist, so the origin
+  # refuses it and the CustomErrorResponses below turn that into the site's
+  # own index.html. DefaultRootObject does not help — it applies to "/" only.
+  #
+  # The result was that https://get.roamkeep.app/privacy served the invite
+  # landing page with a 200. That URL is registered in the Play Console and
+  # Google re-checks it, and the in-app consent sheet links to it and to
+  # /terms — so members were being asked to accept documents that, if they
+  # tapped through, they could not read.
+  #
+  # This lived outside the template before, attached by hand, and a stack
+  # update reset the cache behaviour and removed it. Hence: in the template,
+  # where an update restores it rather than dropping it.
+  IndexRewriteFunction:
+    Type: AWS::CloudFront::Function
+    Properties:
+      Name: !Sub '${AWS::StackName}-index-rewrite'
+      AutoPublish: true
+      FunctionConfig:
+        Comment: Map extensionless paths to their directory index
+        Runtime: cloudfront-js-2.0
+      FunctionCode: |
+        function handler(event) {
+            var request = event.request;
+            var uri = request.uri;
+
+            // "/privacy/" and "/" -> append index.html
+            if (uri.charAt(uri.length - 1) === '/') {
+                request.uri = uri + 'index.html';
+                return request;
+            }
+
+            // "/privacy" -> "/privacy/index.html", but leave anything with a
+            // file extension alone. That last test is what keeps
+            // /.well-known/assetlinks.json, /app.js and /styles.css intact —
+            // assetlinks in particular must be served as-is with no redirect
+            // or Android App Link verification fails silently.
+            var lastSegment = uri.substring(uri.lastIndexOf('/') + 1);
+            if (lastSegment.indexOf('.') === -1) {
+                request.uri = uri + '/index.html';
+            }
+
+            return request;
+        }
+
+  # -------------------------------------------------------------------------
+  # CloudFront Distribution
+  # -------------------------------------------------------------------------
+
+  CloudFrontDistribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        Comment: !Sub '${SubDomain}.${DomainName} static site'
+        DefaultRootObject: index.html
+
+        # Custom domain aliases — point DNS CNAME here after deploy
+        Aliases:
+          - !Sub '${SubDomain}.${DomainName}'
+          - !If
+            - CreateApexConfig
+            - !Ref DomainName
+            - !Ref AWS::NoValue
+
+        # HTTPS certificate
+        ViewerCertificate:
+          AcmCertificateArn: !Ref Certificate
+          SslSupportMethod: sni-only
+          MinimumProtocolVersion: TLSv1.2_2021
+
+        # S3 origin
+        Origins:
+          - Id: S3Origin
+            DomainName: !GetAtt S3BucketRoot.RegionalDomainName
+            OriginAccessControlId: !Ref OriginAccessControl
+            S3OriginConfig: {}
+
+        # Default cache behavior
+        DefaultCacheBehavior:
+          TargetOriginId: S3Origin
+          ViewerProtocolPolicy: redirect-to-https
+          CachePolicyId: 658327ea-f89d-4fab-a63d-7e88639e58f6  # CachingOptimized (AWS managed)
+          OriginRequestPolicyId: 88a5eaf4-2fd4-4709-b370-b4c650ea3fcf  # CORS-S3Origin (AWS managed)
+          ResponseHeadersPolicyId: !Ref ResponseHeadersPolicy
+          Compress: true
+          AllowedMethods:
+            - GET
+            - HEAD
+            - OPTIONS
+          CachedMethods:
+            - GET
+            - HEAD
+          FunctionAssociations:
+            - EventType: viewer-request
+              FunctionARN: !GetAtt IndexRewriteFunction.FunctionMetadata.FunctionARN
+
+        # Custom error pages
+        #
+        # A missing object still lands here — the rewrite above resolves
+        # /privacy to /privacy/index.html, but nothing can resolve a path that
+        # genuinely has no page behind it. What changed is the status: this
+        # used to answer 200, so every missing route was served as the landing
+        # page and looked like a success. That is precisely what hid the
+        # /privacy fault, and it would have hidden the next one too.
+        #
+        # 403 rather than 404 is what S3 returns for a missing key behind
+        # Origin Access Control, because the caller has GetObject and not
+        # ListBucket — so both are mapped, and both now tell the truth.
+        CustomErrorResponses:
+          - ErrorCode: 403
+            ResponseCode: 404
+            ResponsePagePath: /index.html
+            ErrorCachingMinTTL: 0
+          - ErrorCode: 404
+            ResponseCode: 404
+            ResponsePagePath: /index.html
+            ErrorCachingMinTTL: 0
+
+        # Logging
+        Logging:
+          Bucket: !GetAtt S3BucketLogs.DomainName
+          IncludeCookies: false
+          Prefix: 'cloudfront-access/'
+
+        # Use North America + Europe edge locations by default (PriceClass_100)
+        # Change to PriceClass_All for global coverage
+        PriceClass: PriceClass_100
+
+        HttpVersion: http2and3
+        IPV6Enabled: true
+
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-distribution'
+
+# ---------------------------------------------------------------------------
+# Outputs
+# ---------------------------------------------------------------------------
+
+Outputs:
+
+  CloudFrontDomain:
+    Description: |
+      CloudFront distribution domain name. Create a CNAME record in your DNS
+      provider pointing your subdomain to this value.
+      Example: www  CNAME  d1234abcdef.cloudfront.net
+    Value: !GetAtt CloudFrontDistribution.DomainName
+    Export:
+      Name: !Sub '${AWS::StackName}-CloudFrontDomain'
+
+  CloudFrontDistributionId:
+    Description: CloudFront distribution ID (useful for cache invalidations)
+    Value: !Ref CloudFrontDistribution
+    Export:
+      Name: !Sub '${AWS::StackName}-DistributionId'
+
+  WebsiteURL:
+    Description: Website URL (after DNS is configured)
+    Value: !Sub 'https://${SubDomain}.${DomainName}'
+
+  S3BucketRoot:
+    Description: S3 bucket name — upload your website files here
+    Value: !Ref S3BucketRoot
+    Export:
+      Name: !Sub '${AWS::StackName}-S3BucketRoot'
+
+  S3BucketRootArn:
+    Description: S3 bucket ARN
+    Value: !GetAtt S3BucketRoot.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-S3BucketRootArn'
+
+  S3BucketLogs:
+    Description: S3 logs bucket name
+    Value: !Ref S3BucketLogs
+    Export:
+      Name: !Sub '${AWS::StackName}-S3BucketLogs'
+
+  CertificateArn:
+    Description: ACM certificate ARN
+    Value: !Ref Certificate
+    Export:
+      Name: !Sub '${AWS::StackName}-CertificateArn'

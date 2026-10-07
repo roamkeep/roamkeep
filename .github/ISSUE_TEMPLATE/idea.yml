@@ -1,0 +1,26 @@
+name: An idea
+description: Something Roamkeep could do, or do better.
+labels: [idea]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Ideas are welcome. Two things Roamkeep won't do, so you know before writing: add
+        analytics, tracking or advertising of any kind, or need the developer to run a server
+        that holds a family's data. Both are published promises.
+  - type: textarea
+    id: problem
+    attributes:
+      label: What would it help your family with?
+      description: The situation, before any solution. "We never know if Gran got home" says more than a feature name.
+    validations:
+      required: true
+  - type: textarea
+    id: idea
+    attributes:
+      label: What do you have in mind?
+  - type: textarea
+    id: privacy
+    attributes:
+      label: Would it change what's collected or who can see it?
+      description: If so, say how. These are product decisions and are made before any code is written.

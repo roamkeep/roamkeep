@@ -1,0 +1,272 @@
+// notify-places
+//
+// Supabase Edge Function fired by a Database Webhook on INSERT, UPDATE or
+// DELETE of public.keep_places. It asks the Roamkeep relay to wake every
+// device in the keep so each one re-reads the place list and re-arms its
+// geofences.
+//
+// ── Why this exists ─────────────────────────────────────────────
+//
+// Three stores hold a copy of what keep_places says, and none of them is
+// the database: the Play Services fence registry, PrefsStore's place
+// metadata, and PrefsStore's inside-place set. They exist so the geofence
+// receivers work with the app dead — that is the whole point — but it
+// means every change to a place has to reach three places, on every
+// device, or they drift.
+//
+// The realtime subscription looks like it handles this. It does not:
+// Android suspends the WebView's realtime socket while the app is
+// backgrounded, and Supabase does not replay missed events. So a
+// keep_places change only lands on a device that happens to be in the
+// foreground at that moment. Every other device learns about it, if at
+// all, at the next app open.
+//
+// That gap has produced two shipped bugs already: a place added on
+// another device was never armed (fixed in 4.5.2), and a place deleted on another
+// device was never pruned, so a phone went on filing check-ins for a place
+// that no longer existed (fixed in 4.5.5). Both were invisible — the database was
+// consistent, the UI rendered the database, and the wrong behaviour
+// happened in a receiver with no screen.
+//
+// This closes it: a place change wakes every device within seconds, app
+// closed, and the woken device reconciles against the authoritative list.
+//
+// ── How it differs from notify-checkin ──────────────────────────
+//
+// Deliberately a separate function, not a branch inside that one. The
+// recipient rules share nothing, and a bug in place sync must not be able
+// to stop an SOS being delivered.
+//
+//   * It does NOT respect notify_on_checkin. This is a data sync, not a
+//     notification — muting alerts must not leave a phone holding stale
+//     geofences. Nothing user-visible results from this wake-up unless
+//     the device also finds a check-in worth raising.
+//   * It INCLUDES the actor. Their own other devices need it, and their
+//     originating device gets an idempotent no-op (the reconcile compares
+//     a signature before touching anything). Cheaper than working out who
+//     to exclude — a DELETE does not even carry who deleted it.
+//
+// The relay is unchanged and learns nothing new: same endpoint, same
+// tokens-only body, same fixed {"t":"sync"} on the wire. If anything it
+// sees less, because a wake-up no longer implies that a family member
+// arrived somewhere.
+//
+// ── Join requests (v17) ─────────────────────────────────────────
+//
+// A keep that requires approval admits a joiner as PENDING, and the
+// on_join_request trigger posts here with table 'keep_members'. That wakes
+// the keep's OWNERS only (keep_owner_push_recipients): a join request is
+// theirs to settle, and nobody else should learn that someone asked. The
+// woken device reads the pending row itself and composes "<name> wants to
+// join"; the body carries only the row's id and keep_id. A child asking for
+// their account to be deleted arrives the same way (on_deletion_request),
+// for the same people.
+//
+// It rides this function rather than a third one so that an owner who
+// upgrades the database by pasting schema.sql, and never redeploys
+// functions, still gets something sensible: an older copy of this function
+// ignores the table and wakes the whole keep for a harmless empty sync,
+// where a missing function would 404.
+//
+// Webhook config — created by db/schema.sql (triggers on_place_notify and
+// on_join_request), or by hand:
+//   Table:    keep_places
+//   Events:   Insert, Update, Delete
+//   Type:     Supabase Edge Functions → notify-places
+//
+// Optional secret:
+//   RELAY_URL   – override the default relay endpoint.
+// Auto-injected by Supabase:
+//   SUPABASE_URL
+//   SUPABASE_SERVICE_ROLE_KEY  (bypasses RLS — needed to read tokens)
+//
+// Deploy:
+//   supabase functions deploy notify-places --no-verify-jwt
+
+import { createClient } from 'https://esm.sh/@supabase/supabase-js@2.45.4';
+
+const DEFAULT_RELAY = 'https://relay.roamkeep.app/v1/push';
+const RELAY_BATCH = 20;   // relay's per-call token cap
+
+/**
+ * Cached expected webhook secret, per isolate. See notify-checkin for the
+ * full reasoning: the database issues its own secret, the trigger sends it,
+ * and this function reads the same row with the service-role key — so there
+ * is nothing for an owner to configure and no way for the two to drift.
+ *
+ * `null` = no secret there, which leaves the check open so a function
+ * deployed ahead of the v14 migration keeps working.
+ *
+ * Fails CLOSED on any other lookup error (503, not cached), and expires after
+ * SECRET_TTL_MS so a rotated secret is picked up — see notify-checkin, where
+ * the reasoning is written out.
+ */
+const SECRET_TTL_MS = 10 * 60 * 1000;
+let cachedSecret: { value: string | null; at: number } | undefined;
+
+async function webhookSecret(sb: ReturnType<typeof createClient>): Promise<string | null> {
+  if (cachedSecret && Date.now() - cachedSecret.at < SECRET_TTL_MS) return cachedSecret.value;
+  const { data, error } = await sb.from('roamkeep_secrets').select('webhook_secret').maybeSingle();
+  if (error) {
+    if (error.code === '42P01' || error.code === 'PGRST205') {
+      cachedSecret = { value: null, at: Date.now() };
+      return null;
+    }
+    throw new Error(`webhook secret lookup failed: ${error.code || error.message}`);
+  }
+  const value = (data as { webhook_secret?: string } | null)?.webhook_secret ?? null;
+  cachedSecret = { value, at: Date.now() };
+  return value;
+}
+
+/** Constant-time comparison: hash both sides, then compare every byte. */
+async function secretMatches(got: string | null, want: string): Promise<boolean> {
+  if (got === null) return false;
+  const enc = new TextEncoder();
+  const [a, b] = await Promise.all([
+    crypto.subtle.digest('SHA-256', enc.encode(got)),
+    crypto.subtle.digest('SHA-256', enc.encode(want)),
+  ]);
+  const x = new Uint8Array(a), y = new Uint8Array(b);
+  let diff = 0;
+  for (let i = 0; i < x.length; i++) diff |= x[i] ^ y[i];
+  return diff === 0;
+}
+
+/** Accept RELAY_URL with or without the endpoint path — see notify-checkin. */
+function relayEndpoint(): string {
+  const raw = (Deno.env.get('RELAY_URL') || DEFAULT_RELAY).trim().replace(/\/+$/, '');
+  return raw.endsWith('/v1/push') ? raw : raw + '/v1/push';
+}
+
+/** A keep_places row, the {id, keep_id} that on_join_request sends, or the
+ *  {id, keep_id, user_id} that on_reset_notice sends. */
+interface KeepRow {
+  id: string;
+  keep_id: string;
+  user_id?: string;
+}
+
+/** One row of keep_push_recipients() / keep_owner_push_recipients(). */
+interface Recipient {
+  member_id: string;
+  fcm_token: string;
+}
+
+interface WebhookPayload {
+  type: 'INSERT' | 'UPDATE' | 'DELETE';
+  table: string;
+  record: KeepRow | null;
+  schema: string;
+  old_record: KeepRow | null;
+}
+
+Deno.serve(async (req) => {
+  if (req.method !== 'POST') return new Response('method not allowed', { status: 405 });
+
+  const sb = createClient(
+    Deno.env.get('SUPABASE_URL')!,
+    Deno.env.get('SUPABASE_SERVICE_ROLE_KEY')!,
+    { auth: { persistSession: false } },
+  );
+
+  // Deployed --no-verify-jwt, so without this anyone who knew the project
+  // ref could invoke it and wake every device in a keep, repeatedly. See
+  // notify-checkin. Checked before the body is read.
+  let want: string | null;
+  try {
+    want = await webhookSecret(sb);
+  } catch (e) {
+    console.error(String(e));
+    return new Response('secret unavailable', { status: 503 });
+  }
+  if (want !== null && !(await secretMatches(req.headers.get('x-roamkeep-webhook'), want))) {
+    return new Response('forbidden', { status: 403 });
+  }
+
+  let payload: WebhookPayload;
+  try {
+    payload = await req.json();
+  } catch {
+    return new Response('bad json', { status: 400 });
+  }
+
+  // A DELETE has no `record`; old_record carries keep_id only because
+  // keep_places is REPLICA IDENTITY FULL. Without that the id would
+  // arrive and the keep would not, and this would silently wake nobody.
+  const keepId = payload?.record?.keep_id ?? payload?.old_record?.keep_id;
+  if (!keepId) return new Response('no keep_id', { status: 200 });
+
+  // A place change: EVERY member with a token, including whoever made the
+  // change. See the header for why notify_on_checkin is not consulted here.
+  // A join request or a child's deletion request (v17): the keep's
+  // approved owners only.
+  //
+  // Since v14 this goes through an RPC rather than selecting
+  // keep_members.fcm_token directly: that column moved to keep_member_push,
+  // whose RLS is own-row only, so a member can no longer read a relative's
+  // push token. Only service_role may execute either RPC.
+  //
+  // A reset code made for an account, or used on it (v17): that account's
+  // own phones only, so the member hears about it at once.
+  const joinRequest = payload.table === 'keep_members';
+  const resetNotice = payload.table === 'password_reset_codes' && !!payload.record?.user_id;
+  const { data, error } = resetNotice
+    ? await sb.rpc('reset_notice_recipients', { p_user: payload.record!.user_id })
+    : await sb.rpc(
+      joinRequest ? 'keep_owner_push_recipients' : 'keep_push_recipients',
+      { p_keep: keepId },
+    );
+
+  if (error) {
+    console.error('recipients query failed', error);
+    return new Response('db error', { status: 500 });
+  }
+  const recipients = (data ?? []) as Recipient[];
+  if (!recipients.length) return new Response('no recipients', { status: 200 });
+
+  const relayUrl = relayEndpoint();
+  const dead: Recipient[] = [];
+  let sent = 0;
+
+  // Best-effort, exactly like notify-checkin: the keep_places row is
+  // already committed, so a relay outage must never fail this webhook.
+  // A device that misses the wake-up still reconciles at its next app
+  // open, which is today's behaviour — this only makes it faster.
+  for (let i = 0; i < recipients.length; i += RELAY_BATCH) {
+    const batch = recipients.slice(i, i + RELAY_BATCH);
+    try {
+      const res = await fetch(relayUrl, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        // Tokens only. Nothing about which place, or what happened to it.
+        body: JSON.stringify({ tokens: batch.map((r) => r.fcm_token) }),
+      });
+      if (!res.ok) {
+        console.warn(`relay ${res.status}`);
+        continue;
+      }
+      const out = await res.json();
+      sent += out?.sent ?? 0;
+      // `stale` is a list of INDICES into the batch we sent.
+      for (const idx of (out?.stale ?? [])) {
+        const r = batch[idx];
+        if (r) dead.push(r);
+      }
+    } catch (e) {
+      console.warn('relay call failed', e);
+    }
+  }
+
+  // Matched on the token as well as the member, so a token re-registered
+  // since the recipient read is not wiped — see notify-checkin.
+  for (const r of dead) {
+    await sb.from('keep_member_push').update({ fcm_token: null })
+      .eq('member_id', r.member_id).eq('fcm_token', r.fcm_token);
+  }
+
+  return new Response(
+    `ok op=${payload.type} table=${payload.table} recipients=${recipients.length} sent=${sent} dead=${dead.length}`,
+    { status: 200 },
+  );
+});

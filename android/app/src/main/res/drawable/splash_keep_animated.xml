@@ -1,0 +1,28 @@
+<!--
+  Android 12+ splash icon animation: the keep settles into place with a
+  short scale-up. Kept to 500ms — the platform caps splash icon
+  animations at ~1000ms and cuts them off once the app is ready, so a
+  brief, complete gesture beats a long one that never finishes.
+-->
+<animated-vector xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:aapt="http://schemas.android.com/aapt"
+    android:drawable="@drawable/splash_keep">
+    <target android:name="mark">
+        <aapt:attr name="android:animation">
+            <set>
+                <objectAnimator
+                    android:propertyName="scaleX"
+                    android:valueFrom="0.82"
+                    android:valueTo="1.0"
+                    android:duration="500"
+                    android:interpolator="@android:interpolator/fast_out_slow_in" />
+                <objectAnimator
+                    android:propertyName="scaleY"
+                    android:valueFrom="0.82"
+                    android:valueTo="1.0"
+                    android:duration="500"
+                    android:interpolator="@android:interpolator/fast_out_slow_in" />
+            </set>
+        </aapt:attr>
+    </target>
+</animated-vector>

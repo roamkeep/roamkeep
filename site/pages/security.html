@@ -1,0 +1,72 @@
+<!-- {"title": "Security · Roamkeep", "description": "How Roamkeep keeps a family's locations to that family, how to report a vulnerability, and how to check the app you installed.", "path": "/security/"} -->
+
+<section class="page-head">
+  <div class="wrap narrow">
+    <span class="kicker">Security</span>
+    <h1>Your family's data, reachable only by your family</h1>
+    <p class="lead">That is Roamkeep's whole premise. This is how it holds, how to tell us if it
+      doesn't, and how to check the app you installed.</p>
+  </div>
+</section>
+
+<section class="article">
+  <div class="wrap narrow">
+
+    <h2>How it's protected</h2>
+    <ul>
+      <li><strong>A database per family.</strong> Each family's locations live in its own Supabase
+        project. Nothing is shared between families, and nothing passes through us.</li>
+      <li><strong>Row-level security.</strong> The database itself decides who can read and write
+        each row, so a modified app gets no further than the real one. The key inside a setup link
+        is public by design; the security rules are the boundary.</li>
+      <li><strong>Rules the server enforces.</strong> Owner approval of new members, what children
+        can and can't do, and who may change sign-ups are checked by the database, not by the app.</li>
+      <li><strong>Notifications without content.</strong> The relay that wakes phones sends an empty
+        message and keeps no record of it.</li>
+      <li><strong>Encrypted in transit.</strong> Every connection between the app and your database
+        uses HTTPS.</li>
+      <li><strong>Open to inspection.</strong> The source is public. The app is minified to make it
+        smaller, not to hide anything.</li>
+    </ul>
+
+    <h2>Report a vulnerability</h2>
+    <p><strong>Please don't open a public issue.</strong> Use GitHub's
+      <a href="https://github.com/roamkeep/roamkeep/security/advisories/new">private vulnerability
+      reporting</a>, or email <a href="mailto:security@roamkeep.app">security@roamkeep.app</a>.
+      Tell us what an attacker could do, how to reproduce it, and which version you tested. Never
+      include another person's real location data.</p>
+    <table>
+      <tr><th scope="row">Acknowledgement</th><td>within 3 working days</td></tr>
+      <tr><th scope="row">First assessment</th><td>within 10 working days</td></tr>
+      <tr><th scope="row">Disclosure</th><td>coordinated with you, by default within 90 days</td></tr>
+    </table>
+    <p>Roamkeep is made by one person, so these are honest targets rather than a commercial
+      promise. If one slips, you will hear from us before it does. The full policy is in
+      <a href="https://github.com/roamkeep/roamkeep/blob/main/SECURITY.md">SECURITY.md</a>.</p>
+
+    <!-- Approved by the owner (plan C5/C6, 2026-10-06). Revise when an independent review is
+         booked or published. The app.js hash promise (C3) is agreed: every release lists it. -->
+    <h2 id="reviewed">What has been reviewed</h2>
+    <p>The code and database were reviewed in September 2026, and its main findings were fixed in
+      Roamkeep 4.9.0. That review was carried out by the developer with an AI coding assistant, so
+      it is not independent. An independent review of the database's security rules is planned,
+      and its report will be published here in full. No full independent audit of the app has
+      been done yet.</p>
+
+    <h2>Check the app you installed</h2>
+    <p>The app on Google Play is built from the public source. From Roamkeep 4.11.0, each
+      <a href="https://github.com/roamkeep/roamkeep/releases">release on GitHub</a> lists the SHA-256
+      of the app's main script, <code>app.js</code>, which is identical in every copy. To compare
+      yours, with a computer and <code>adb</code>:</p>
+    <ol>
+      <li>Find the app: <code>adb shell pm path com.roamkeep.app</code></li>
+      <li>Copy it off the phone: <code>adb pull &lt;the path it printed&gt; roamkeep.apk</code></li>
+      <li>Take the script out of it: it is <code>assets/public/app.js</code> inside the APK, which is
+        a zip file.</li>
+      <li>Hash it (<code>sha256sum app.js</code>, or <code>Get-FileHash app.js</code> on Windows) and
+        compare with the release.</li>
+    </ol>
+    <p class="quiet small">Google re-signs apps it distributes, so the APK's own signature differs
+      from a build you make yourself. The script inside it does not.</p>
+  </div>
+</section>

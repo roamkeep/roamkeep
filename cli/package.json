@@ -1,0 +1,24 @@
+{
+  "name": "create-roamkeep-server",
+  "version": "1.0.0",
+  "type": "module",
+  "description": "Stand up a family's own private Roamkeep backend on Supabase.",
+  "bin": {
+    "create-roamkeep-server": "src/index.js"
+  },
+  "files": ["src", "assets"],
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "start": "node src/index.js",
+    "test": "node test.mjs",
+    "prepack": "node pack-assets.mjs",
+    "postpack": "node pack-assets.mjs --clean"
+  },
+  "dependencies": {
+    "@clack/prompts": "^0.7.0",
+    "picocolors": "^1.1.1",
+    "qrcode": "^1.5.4"
+  }
+}

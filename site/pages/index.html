@@ -1,0 +1,171 @@
+<!-- {"title": "Roamkeep: private family location sharing", "description": "Family location sharing on a database your family owns: a live map, arrive and leave alerts, a week of history and SOS. Nothing about you is sent to us.", "path": "/"} -->
+
+<section class="hero">
+  <div class="wrap hero-in">
+    <div>
+      <h1>Family location sharing, without the company in the middle.</h1>
+      <p class="lead">Roamkeep keeps your family's locations in a private database that your
+        family owns. We can't see where you are. Not as a promise, but because nothing we
+        run ever receives it.</p>
+      <div class="btns">
+        <a class="btn" href="https://play.google.com/store/apps/details?id=com.roamkeep.app">Install from Google Play</a>
+        <a class="btn btn-ghost" href="#how">How it stays private</a>
+      </div>
+      <ul class="facts">
+        <li>Free, with no ads</li>
+        <li>For Android</li>
+        <li>Source-available</li>
+      </ul>
+    </div>
+    <div class="hero-art">
+      <div class="phone"><img src="/assets/map.jpg" width="540" height="1043"
+        alt="The Roamkeep family map, with family members' pins and the trail of a trip"></div>
+      <img class="hero-tile" src="/assets/brand-tile.png" width="92" height="92" alt="">
+    </div>
+  </div>
+</section>
+
+<section class="sec sec-alt" aria-labelledby="what">
+  <div class="wrap">
+    <div class="sec-head">
+      <span class="kicker">What it does</span>
+      <h2 id="what">Everything a family needs, and nothing it doesn't</h2>
+      <p>Know everyone arrived, without having to ask.</p>
+    </div>
+    <div class="cards cards-3">
+      <div class="card"><h3><span class="ico" aria-hidden="true">🗺️</span>Live family map</h3>
+        <p>See where everyone is, updated as they move.</p></div>
+      <div class="card"><h3><span class="ico" aria-hidden="true">📍</span>Saved places</h3>
+        <p>Home, school, work, Grandma's. Whatever matters to your family.</p></div>
+      <div class="card"><h3><span class="ico" aria-hidden="true">🔔</span>Arrive and leave alerts</h3>
+        <p>Know when your child gets to school. Choose whose alerts you get, and for which places.</p></div>
+      <div class="card"><h3><span class="ico" aria-hidden="true">🗓️</span>A week of history</h3>
+        <p>Trips and stays, day by day. After seven days it's gone.</p></div>
+      <div class="card"><h3><span class="ico" aria-hidden="true">🆘</span>SOS</h3>
+        <p>One button tells everyone in your family, urgently, where you are.</p></div>
+      <div class="card"><h3><span class="ico" aria-hidden="true">🔋</span>Battery modes</h3>
+        <p>From dense tracking to power saver. You choose the trade-off.</p></div>
+    </div>
+  </div>
+</section>
+
+<section class="sec" aria-labelledby="look">
+  <div class="wrap">
+    <div class="sec-head">
+      <span class="kicker">The app</span>
+      <h2 id="look">Simple enough for the whole family</h2>
+    </div>
+    <div class="shots">
+      <figure class="shot">
+        <div class="phone"><img src="/assets/map.jpg" width="540" height="1043" loading="lazy"
+          alt="The family map with live pins"></div>
+        <figcaption>One private map<span>Everyone in your family, live.</span></figcaption>
+      </figure>
+      <figure class="shot">
+        <div class="phone"><img src="/assets/places.jpg" width="540" height="1043" loading="lazy"
+          alt="The list of saved places"></div>
+        <figcaption>Places that matter<span>Alerts when people arrive and leave.</span></figcaption>
+      </figure>
+      <figure class="shot">
+        <div class="phone"><img src="/assets/history.jpg" width="540" height="1043" loading="lazy"
+          alt="A day's history of trips and stays"></div>
+        <figcaption>A week of history<span>Then it's gone, automatically.</span></figcaption>
+      </figure>
+    </div>
+  </div>
+</section>
+
+<section class="sec band" id="how" aria-labelledby="how-h">
+  <div class="wrap">
+    <div class="sec-head">
+      <span class="kicker">How it stays private</span>
+      <h2 id="how-h">Your family's locations go to your family's database, and nowhere else</h2>
+      <p>Most family trackers keep your household's movements on the company's servers.
+        Roamkeep keeps them on yours. The only service we run for the app is a small relay
+        that wakes phones with an empty message.</p>
+    </div>
+
+    <div class="flow" role="img" aria-label="Your family's phones send everything to your family's own database. To wake a phone, the Roamkeep relay sends it an empty message, and the phone reads what happened from your database.">
+      <div class="node node-yours">
+        <h3>Your family's database</h3>
+        <p>A free Supabase project on your own account, in the region you choose. You hold
+          the keys, and you can delete all of it.</p>
+      </div>
+      <div class="arrow"><b>⇄</b>everything</div>
+      <div class="node">
+        <h3>Your family's phones</h3>
+        <p>Share locations, places, alerts and SOS, only with your database.</p>
+      </div>
+      <div class="arrow"><b>⇠</b>an empty wake-up</div>
+      <div class="node node-ours">
+        <h3>The Roamkeep relay</h3>
+        <p>Tells a phone "check for news". It never sees names, places or locations, and keeps
+          no record of what it sends.</p>
+      </div>
+    </div>
+
+    <div class="cards">
+      <div class="card"><h3>No analytics, no ads</h3>
+        <p>No trackers and no crash reporting. Nothing about you is sent to us.</p></div>
+      <div class="card"><h3>Notifications with no content</h3>
+        <p>The wake-up has no words in it. Your phone reads the details from your own database
+          and writes the notification itself.</p></div>
+      <div class="card"><h3>Locked to your family</h3>
+        <p>Row-level security in the database keeps each family's data unreadable to anyone
+          outside it, even with a modified app.</p></div>
+      <div class="card"><h3>Check it yourself</h3>
+        <p>The source is public. <a href="https://github.com/roamkeep/roamkeep">Read the code</a>
+          and test every claim on this page.</p></div>
+    </div>
+  </div>
+</section>
+
+<section class="sec" aria-labelledby="fam">
+  <div class="wrap split">
+    <div>
+      <span class="kicker">Families, not surveillance</span>
+      <h2 id="fam">Nobody is tracked without knowing</h2>
+      <p class="lead">Roamkeep is for families who agree to share with each other. It is built so
+        it can't quietly become anything else.</p>
+    </div>
+    <ul class="ticks">
+      <li><strong>Everyone sees everyone.</strong> There are no one-way watchers in a family.</li>
+      <li><strong>Adults can pause.</strong> For an hour, two, or the rest of the evening, and the
+        family sees it's paused.</li>
+      <li><strong>Always on show.</strong> A notification is up whenever location is being recorded,
+        and it comes back if it's swiped away.</li>
+      <li><strong>No quiet changes.</strong> If an owner marks someone as a child or changes what
+        they can do, that person is told.</li>
+      <li><strong>Owners approve new members.</strong> A forwarded invite is a request, not a way in.</li>
+      <li><strong>Always a way out.</strong> Anyone can disconnect their phone, and the family sees
+        that they did.</li>
+    </ul>
+  </div>
+</section>
+
+<section class="sec sec-alt" aria-labelledby="need">
+  <div class="wrap split">
+    <div>
+      <span class="kicker">What you need</span>
+      <h2 id="need">Five minutes, on one phone</h2>
+      <ul class="ticks">
+        <li><strong>Android phones</strong> for everyone who shares their location. There is no
+          iPhone app.</li>
+        <li><strong>A free Supabase account</strong> for the person who sets it up. Supabase runs
+          your family's database for you, on your own account.</li>
+        <li><strong>About five minutes</strong> on that person's phone. Everyone else just taps
+          an invite.</li>
+      </ul>
+      <div class="btns">
+        <a class="btn" href="/get-started/">Get started</a>
+        <a class="btn btn-ghost" href="/faq/">Questions</a>
+      </div>
+    </div>
+    <div class="panel">
+      <p class="price">Free</p>
+      <p>No ads, no subscriptions and no paid features. Nothing is held back.</p>
+      <p class="quiet small">Roamkeep is made by one person and funded by people who choose to
+        <a href="/support/">support the project</a>.</p>
+    </div>
+  </div>
+</section>

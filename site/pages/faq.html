@@ -1,0 +1,208 @@
+<!-- {"title": "Questions · Roamkeep", "description": "Answers about privacy, Supabase, cost, Android, children, battery and how Roamkeep was built.", "path": "/faq/"} -->
+
+<section class="page-head">
+  <div class="wrap narrow">
+    <span class="kicker">Questions</span>
+    <h1>Frequently asked questions</h1>
+    <p class="lead">Straight answers, including the ones that aren't flattering.</p>
+  </div>
+</section>
+
+<section class="article faq">
+  <div class="wrap narrow">
+
+    <h2>Privacy</h2>
+    <details>
+      <summary>Can you see where my family is?</summary>
+      <div>
+        <p>No. Your family's locations go to your family's own database, and nothing we run ever
+          receives them. The only service we operate for the app is a small relay that wakes phones
+          with an empty message. It never sees names, places or locations, and it keeps no record of
+          what it sends.</p>
+        <p>The source is public, so you don't have to take our word for any of this.</p>
+      </div>
+    </details>
+    <details>
+      <summary>Could someone use Roamkeep to track me without my knowing?</summary>
+      <div>
+        <p>It is built so that it can't be used that way. Everyone in a family sees everyone else,
+          so there are no one-way watchers. A notification is on screen whenever location is being
+          recorded, and it comes back if it's swiped away. If an owner changes what someone can do,
+          that person is told. Anyone can disconnect their phone at any time, and the family sees
+          that they did.</p>
+        <p>Our terms forbid using Roamkeep to track anyone without their knowledge.</p>
+      </div>
+    </details>
+    <details>
+      <summary>Someone has an old invite link. Can they get in?</summary>
+      <div>
+        <p>Not once its join code has stopped working. An invite link carries two things: your
+          family's server address and a join code. The address never changes, but on its own it only
+          gets someone to the front door. They can't see anyone, and they can't make an account
+          unless your family has new accounts open.</p>
+        <p>The join code is what lets someone ask to join. It stops working after 72 hours, or as
+          soon as an owner rotates it. New families also start with <strong>Approve new
+          members</strong> on, so even a current code only lets someone ask, and an owner
+          decides.</p>
+        <p>If an invite has gone somewhere it shouldn't, rotate the code from the invite, and
+          decline anyone you don't recognise in the Family tab. Removing someone from your family
+          changes the code for you, so the invite they joined with stops working.</p>
+      </div>
+    </details>
+    <details>
+      <summary>Can an owner reset my password?</summary>
+      <div>
+        <p>Yes, unless you're an owner too. Your family's server sends no email, so someone who
+          forgets their password gets back in with a one-time code from an owner, which works for
+          15 minutes.</p>
+        <p>Because that code reaches your account, your phone tells you the moment one is made for
+          you and again when it's used, and your account can't be deleted for a day after a reset.
+          If you didn't ask for a code, talk to your family's owners. Owners reset their own
+          password through the Supabase account that holds the server.</p>
+      </div>
+    </details>
+    <details>
+      <summary>Why does it use Google's notification service?</summary>
+      <div>
+        <p>On Android, the only way to wake a phone that's asleep is Firebase Cloud Messaging. What
+          we send through it is empty: no names, no places, not even what kind of event happened. Your
+          phone then reads what happened from your family's database and writes the notification
+          itself.</p>
+      </div>
+    </details>
+
+    <h2>Setting up</h2>
+    <details>
+      <summary>What is Supabase, and why do I need an account?</summary>
+      <div>
+        <p>Supabase is a company that runs databases. Your family's Roamkeep data lives in a project
+          on your own Supabase account, on their free plan, in the region you choose. That is what
+          keeps it out of our hands: you hold the keys, and you can export or delete it whenever you
+          like. The Roamkeep app sets it all up for you in about five minutes.</p>
+      </div>
+    </details>
+    <details>
+      <summary>Is there an iPhone app?</summary>
+      <div>
+        <p>No. Roamkeep is for Android only. Arrive and leave alerts mean the phone has to watch for
+          places in the background, even with the app closed, and that takes a native app for each
+          kind of phone. Everyone who shares their location needs an Android phone.</p>
+      </div>
+    </details>
+    <details>
+      <summary>How is it different from OwnTracks or Home Assistant?</summary>
+      <div>
+        <p>Both are good, and both need a server that someone keeps running around the clock.
+          Roamkeep's database is run for you by Supabase, on your own account, and the app adds what a
+          family needs: saved places with arrive and leave alerts, a week of history, SOS, and roles
+          for children.</p>
+      </div>
+    </details>
+
+    <h2>Cost and the future</h2>
+    <details>
+      <summary>What does it cost?</summary>
+      <div>
+        <p>Roamkeep is free: no ads, no subscriptions and no paid features. Supabase's free plan is
+          enough for a family. Supabase pauses free projects that nobody uses for a week, and a family
+          using Roamkeep every day keeps it awake.</p>
+      </div>
+    </details>
+    <details>
+      <summary>What happens if you stop working on Roamkeep?</summary>
+      <div>
+        <p>Your family's database is yours, so your data stays where it is and the app keeps working
+          with it. The one shared piece is the relay that sends wake-ups. If it ever stopped, alerts
+          would appear when someone next opens the app instead of straight away. Keeping that relay
+          running is the first thing <a href="/support/">donations</a> pay for.</p>
+      </div>
+    </details>
+    <details>
+      <summary>Is Roamkeep open source?</summary>
+      <div>
+        <p>It is source-available. All of the code is public, and you can read it, build it and run
+          it for your own family. It is released under the Business Source License, which is not an
+          open-source licence, and each version becomes Apache 2.0, which is, on a date set in the
+          licence. We say "source-available" rather than "open source" on purpose.</p>
+      </div>
+    </details>
+
+    <h2>Using it</h2>
+    <details>
+      <summary>How much battery does it use?</summary>
+      <div>
+        <p>That's your choice. Auto records closely while you're moving and drops to low power when
+          you're still. Live, Balanced and Saver trade detail for battery life, and you can change mode
+          at any time.</p>
+      </div>
+    </details>
+    <details>
+      <summary>Does it ever get arrivals wrong?</summary>
+      <div>
+        <p>Sometimes. Phone location is best-effort: phones lose signal, go flat and get throttled by
+          Android. One known case: driving past a saved place without stopping can announce "arrived"
+          and "left" in the same minute. A fix is designed. Until then, you can choose whose alerts you
+          get for each place.</p>
+        <p>Roamkeep is not an emergency service. In an emergency, call your local emergency number.</p>
+      </div>
+    </details>
+    <details>
+      <summary>What can a child do in Roamkeep?</summary>
+      <div>
+        <p>A member marked as a child can't pause sharing, leave the Keep or delete their own
+          account. They can always disconnect their phone, and the family sees that they did. They can
+          also ask the owners to delete their account, and an owner does it.</p>
+      </div>
+    </details>
+    <details>
+      <summary>I see errors in my Supabase logs. Is something wrong?</summary>
+      <div>
+        <p>Usually not. Your family's server refuses things it should refuse, and Postgres logs
+          each refusal as an error. The ones you can expect:</p>
+        <ul>
+          <li>Errors with a plain name, like <code>signups_closed</code>, <code>family_exists</code>
+            or <code>not_owner</code>. Roamkeep raises these on purpose: someone tried to make an
+            account while new accounts were closed, or to do something their role doesn't
+            allow.</li>
+          <li><code>new row violates row-level security policy</code>, a few at a time. A phone
+            whose member was removed keeps trying until it notices, and then stops by
+            itself.</li>
+          <li>A rare <code>23505 duplicate key … checkins_pkey</code>. A phone sent an arrival
+            again after the answer to the first try was lost. Nothing is duplicated.</li>
+        </ul>
+        <p>A <code>23505</code> on every arrival means a phone is on version 4.9.2 or older, and updating
+          the app ends it. Anything else, or anything that keeps growing, is worth
+          <a href="https://github.com/roamkeep/roamkeep/issues">reporting</a>. Leave out your
+          project's address.</p>
+      </div>
+    </details>
+    <details>
+      <summary>How do I delete my account, or all of my family's data?</summary>
+      <div>
+        <p>From the app, in <strong>Settings → Delete my account</strong>. The
+          <a href="/delete-account/">account deletion page</a> covers children, owners and deleting
+          everything at once.</p>
+      </div>
+    </details>
+
+    <h2>Trust</h2>
+    <!-- Approved by the owner (plan C5, 2026-10-06). Never name the tool or vendor. -->
+    <details>
+      <summary>How was Roamkeep built?</summary>
+      <div>
+        <p>Roamkeep is designed and run by one person, David Carabetta, who made every product and
+          privacy decision and tests it on real phones. Much of the code was written with an AI coding
+          assistant, working under his direction and review.</p>
+        <p>It has been tested by 12 people over several months. The bugs those tests found, and why
+          each fix is the way it is, are written up in the code itself.</p>
+      </div>
+    </details>
+    <details>
+      <summary>Has it been audited?</summary>
+      <div>
+        <p>Not independently yet. <a href="/security/#reviewed">The security page</a> says exactly what
+          has been reviewed, by whom, and what is planned.</p>
+      </div>
+    </details>
+  </div>
+</section>

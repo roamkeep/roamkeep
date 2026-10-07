@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  API 30 and below (minSdk here is 23, so this range is real). Redundant
+  while allowBackup="false" — an app excluded from backup has nothing to
+  filter — but it is the file that decides if allowBackup is ever flipped
+  back, and it costs nothing to be right in advance.
+-->
+<full-backup-content>
+    <exclude domain="root" />
+    <exclude domain="file" />
+    <exclude domain="database" />
+    <exclude domain="sharedpref" />
+    <exclude domain="external" />
+</full-backup-content>

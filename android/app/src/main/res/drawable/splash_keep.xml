@@ -1,0 +1,24 @@
+<!--
+  The Roamkeep mark as a vector, used as the Android 12+ splash icon.
+  Geometry matches assets/icon.svg. The group is named so the
+  animated-vector wrapper can scale it.
+-->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="240dp"
+    android:height="240dp"
+    android:viewportWidth="100"
+    android:viewportHeight="100">
+    <group
+        android:name="mark"
+        android:pivotX="50"
+        android:pivotY="53">
+        <path
+            android:name="keep"
+            android:fillColor="#FFFFFF"
+            android:pathData="M26,18 L35,18 L35,26 L44,26 L44,18 L56,18 L56,26 L65,26 L65,18 L74,18 L74,60 L50,88 L26,60 Z" />
+        <path
+            android:name="window"
+            android:fillColor="#FF6B5B"
+            android:pathData="M40,58 L40,44 A10,10 0 0 1 60,44 L60,58 Z" />
+    </group>
+</vector>

@@ -1,0 +1,87 @@
+apply plugin: 'com.android.application'
+
+android {
+    namespace 'com.roamkeep.mockgps'
+    compileSdk 35
+
+    defaultConfig {
+        applicationId "com.roamkeep.mockgps"
+        minSdk 23
+        targetSdk 35
+        versionCode 1
+        versionName "1.0"
+    }
+
+    buildTypes {
+        debug {
+            // Debug only, on purpose. There is no release variant and no
+            // signing config: this must never be distributable.
+            minifyEnabled false
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+}
+
+// ONE dependency, and it took a device to justify it.
+//
+// The first version had none, and mocked location the classic way:
+// LocationManager.addTestProvider + setTestProviderLocation. On a handset
+// that produced a trail alternating between the replayed route and the real
+// position, and mocking every provider on the device did not fix it.
+//
+// The reason is that those are two different systems. Roamkeep reads Play
+// Services' FusedLocationProviderClient, which runs its own location engine
+// and can take GNSS straight from the HAL — it is not obliged to consult
+// LocationManager's providers at all. The API that actually controls it is
+// FusedLocationProviderClient.setMockMode/setMockLocation, and that lives
+// here.
+//
+// The security argument survives the change, because the part of it that
+// was ever enforceable was never "no dependencies" — it was NO NETWORK. The
+// app still has no INTERNET permission, the OS still denies it every
+// socket, and verifyNoInternet still fails the build if that changes. A
+// library it cannot phone home with is a much weaker concern than an
+// unauditable app that can.
+dependencies {
+    implementation 'com.google.android.gms:play-services-location:21.3.0'
+}
+
+/**
+ * Fail the build if the packaged manifest can reach the network.
+ *
+ * This is not belt-and-braces. AGP ADDS android.permission.INTERNET to debug
+ * builds on its own, so the first build of this app shipped with network
+ * access despite the manifest never asking for it. The manifest now removes
+ * it explicitly with tools:node="remove", and this task is what stops that
+ * removal being quietly dropped by an AGP upgrade or an edit.
+ *
+ * "No network" is the whole reason to build this rather than install
+ * something off the store, so it is checked, not asserted.
+ */
+tasks.register('verifyNoInternet') {
+    doLast {
+        def manifests = fileTree(layout.buildDirectory.dir('intermediates')) {
+            include '**/merged_manifest*/**/AndroidManifest.xml'
+        }.files
+        if (manifests.isEmpty()) {
+            throw new GradleException('verifyNoInternet: found no merged manifest to check.')
+        }
+        def offenders = manifests.findAll { it.text.contains('android.permission.INTERNET') }
+        if (!offenders.isEmpty()) {
+            throw new GradleException(
+                'INTERNET permission is in the packaged manifest:\n  ' +
+                offenders.collect { it.path }.join('\n  ') +
+                '\nThis app must have no network access. Check the tools:node="remove" ' +
+                'entry in AndroidManifest.xml.')
+        }
+        println "verifyNoInternet: ok — ${manifests.size()} merged manifest(s), no INTERNET permission"
+    }
+}
+
+tasks.matching { it.name.startsWith('assemble') }.configureEach {
+    finalizedBy 'verifyNoInternet'
+}

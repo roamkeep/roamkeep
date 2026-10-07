@@ -1,0 +1,13 @@
+[
+  {
+    "relation": ["delegate_permission/common.handle_all_urls"],
+    "target": {
+      "namespace": "android_app",
+      "package_name": "com.roamkeep.app",
+      "sha256_cert_fingerprints": [
+        "2C:8F:69:B8:01:3B:F5:DC:0E:6D:74:4D:ED:47:7F:6E:CE:3A:7E:D5:24:E2:4A:A5:CC:4A:C6:72:58:25:AE:FA",
+        "A0:E8:6E:37:23:64:E1:B7:3E:56:E6:24:40:79:AD:30:77:D0:02:3B:F8:FE:F3:D7:BC:1F:60:5A:34:3B:D6:8D"
+      ]
+    }
+  }
+]
