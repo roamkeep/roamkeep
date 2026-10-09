@@ -299,6 +299,15 @@ public class LocationUpdateReceiver extends BroadcastReceiver {
         if (!prefs.hasContext()) return;   // not signed in — nothing to write
         if (prefs.isPaused()) return;      // self-paused — write nothing
         if (prefs.isServerRejected()) return;  // server stopped accepting us
+        // 4.11.1: the notification was switched off while we were running.
+        // Nothing from this batch is written; the service stops.
+        if (!LocationForegroundService.canDisclose(ctx)) {
+            LocationForegroundService.stopForDisclosure(ctx, "location batch");
+            return;
+        }
+        // Here, before the early returns below, so a phone parked for days
+        // still runs it.
+        maybePruneHistory(prefs, new SupabaseRest(ctx));
         SupabaseRest rest = new SupabaseRest(ctx);
         String keepId   = prefs.getKeepId();
         String memberId = prefs.getMemberId();
@@ -618,6 +627,38 @@ public class LocationUpdateReceiver extends BroadcastReceiver {
         }
 
         if (prefs.getRejectStreak() >= RLS_REJECTIONS_TO_STOP) stopForServerRejection(ctx, prefs);
+    }
+
+    /**
+     * The family's 7-day retention, run from here at most once a day
+     * (4.11.1). The privacy page promises it, and it rested on two things
+     * that need not happen: pg_cron being enabled on the family's project,
+     * and someone opening the app (which prunes at launch). A family whose
+     * phones track headlessly for a week on a project without pg_cron kept
+     * everything. Every tracking phone now prunes, so the promise holds
+     * wherever anyone is sharing at all.
+     *
+     * prune_keep_history deletes only what the policy already says is gone,
+     * for the caller's own Keep, so any member's phone may run it. Stamped
+     * before the call: one attempt a day, even when it fails. v16 and up.
+     */
+    static final long PRUNE_EVERY_MS = 24L * 60 * 60 * 1000;
+    static final int SCHEMA_WITH_PRUNE = 16;
+
+    private static void maybePruneHistory(PrefsStore prefs, SupabaseRest rest) {
+        if (prefs.getSchemaVersion() < SCHEMA_WITH_PRUNE) return;
+        long now = System.currentTimeMillis();
+        if (!pruneDue(prefs.getLastPruneMs(), now)) return;
+        prefs.setLastPruneMs(now);
+        int status = rest.pruneKeepHistory();
+        if (status < 200 || status >= 300) {
+            prefs.journal("retention: daily prune failed (" + status + "), next try in a day");
+        }
+    }
+
+    /** Pure, for RetentionPruneTest. A clock that moved back counts as due. */
+    static boolean pruneDue(long lastMs, long nowMs) {
+        return lastMs <= 0 || nowMs < lastMs || nowMs - lastMs >= PRUNE_EVERY_MS;
     }
 
     /** Pin cadence for a tracking mode. See PIN_EVERY_*. */

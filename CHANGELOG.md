@@ -7,6 +7,42 @@ the app says so, and an owner updates it from **Settings → Family server**.
 An older server keeps working; it just goes without the new features that
 need it.
 
+## 4.11.1 (in testing)
+
+Fixes from an independent review of the whole app. Update your family's
+server too (Settings → Family server): most of the protections are on the
+server, and they cover every version of the app.
+
+- **Leaving deletes you.** Leaving a family, being removed by an owner, and
+  a child's request being completed now all delete the person's account on
+  the family's server, not only their membership and history. In Settings
+  that is one button, **Leave and delete my account**. To bring someone back,
+  invite them again.
+- **No notification, no sharing.** Roamkeep always shows a notification while
+  it shares your location. If notifications are turned off for it, it now
+  stops sharing, your family sees "Not sharing: notifications are off", and
+  the app shows you how to turn them back on. Before, it carried on without
+  the notification.
+- **Reset codes are checked again when they are used.** A code stops working
+  if, before it is used, its member becomes an owner or leaves the family, or
+  whoever made it is no longer an owner. The one-day block on deleting an
+  account after a reset is gone: removing someone already deletes them.
+- **Members waiting for approval can do nothing at all** until an owner lets
+  them in, and a child can't be made an owner.
+- **Location history is deleted after 7 days even if nobody opens the app**:
+  every phone that is sharing now runs the clean-up once a day.
+- **Deleted places stop being watched.** If your family deleted its last place
+  while your phone was in the background, your phone kept watching it and
+  could still say you arrived or left. Fixed, along with a case where a place
+  that failed to register on the phone was never tried again.
+- **Signing out or disconnecting without signal** now really signs this phone
+  out, and tells you if your family couldn't be told.
+- **Setup links** that carry the wrong kind of key, or anything odd, are
+  refused. Nothing the app keeps for diagnosis is older than 7 days, and
+  release builds no longer write place names to the system log.
+- **SOS** now says the alert was sent to your family, and to call your local
+  emergency number in an emergency, rather than promising they were notified.
+
 ## 4.11.0 (in testing)
 
 The launch release.

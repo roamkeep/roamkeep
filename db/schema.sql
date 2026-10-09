@@ -510,11 +510,18 @@ END$$;
 --
 -- CREATE OR REPLACE keeps the OID the policies reference, so they pick up
 -- the change without being recreated.
+--
+-- v18: every function in this file ends its search_path with pg_temp. Left
+-- out, pg_temp is searched FIRST for tables, so a session able to create a
+-- temporary table named keep_members could feed this function its own rows
+-- and read any family. The API cannot run CREATE TEMP TABLE, so this was
+-- never reachable through the anon key, but the Postgres manual's rule for
+-- SECURITY DEFINER is pg_temp last, and it costs nothing.
 CREATE OR REPLACE FUNCTION private_user_keep_ids()
 RETURNS SETOF uuid
 LANGUAGE sql
 SECURITY DEFINER
-SET search_path = public
+SET search_path = public, pg_temp
 STABLE
 AS $$ SELECT keep_id FROM keep_members WHERE user_id = auth.uid() AND approved $$;
 REVOKE ALL ON FUNCTION private_user_keep_ids() FROM PUBLIC, anon;
@@ -586,12 +593,17 @@ UPDATE keep_member_push p
 -- policies everywhere else in this file. Who you have quietly stopped
 -- hearing about is nobody else's business, including other members of
 -- your own Keep.
+--
+-- v18: (member_id, keep_id) as a PAIR, like the three tables above and
+-- below. Checked separately, someone in two Keeps (possible only on a server
+-- from before v16) could file a row with one Keep's member id and the
+-- other's keep_id.
 DROP POLICY IF EXISTS "Members read own notify prefs" ON keep_notify_prefs;
 CREATE POLICY "Members read own notify prefs"
   ON keep_notify_prefs FOR SELECT TO authenticated
   USING (
     keep_id IN (SELECT private_user_keep_ids())
-    AND member_id IN (SELECT id FROM keep_members WHERE user_id = auth.uid())
+    AND (member_id, keep_id) IN (SELECT id, keep_id FROM keep_members WHERE user_id = auth.uid())
   );
 
 DROP POLICY IF EXISTS "Members write own notify prefs" ON keep_notify_prefs;
@@ -599,7 +611,7 @@ CREATE POLICY "Members write own notify prefs"
   ON keep_notify_prefs FOR INSERT TO authenticated
   WITH CHECK (
     keep_id IN (SELECT private_user_keep_ids())
-    AND member_id IN (SELECT id FROM keep_members WHERE user_id = auth.uid())
+    AND (member_id, keep_id) IN (SELECT id, keep_id FROM keep_members WHERE user_id = auth.uid())
     -- Subject and place must belong to the SAME keep, or a member could
     -- write a row referencing another family's ids.
     AND subject_member_id IN (SELECT id FROM keep_members WHERE keep_id = keep_notify_prefs.keep_id)
@@ -611,7 +623,7 @@ CREATE POLICY "Members delete own notify prefs"
   ON keep_notify_prefs FOR DELETE TO authenticated
   USING (
     keep_id IN (SELECT private_user_keep_ids())
-    AND member_id IN (SELECT id FROM keep_members WHERE user_id = auth.uid())
+    AND (member_id, keep_id) IN (SELECT id, keep_id FROM keep_members WHERE user_id = auth.uid())
   );
 
 -- ROAMKEEP_META — readable by everyone including anon, because the
@@ -739,6 +751,21 @@ CREATE POLICY "Members can delete own history"
   ON location_history FOR DELETE TO authenticated
   USING (member_id IN (SELECT id FROM keep_members WHERE user_id = auth.uid()));
 
+-- v18: the table privileges RLS does not govern. Supabase's default
+-- privileges grant every client role ALL on a new table, and RLS filters
+-- rows for SELECT, INSERT, UPDATE and DELETE only. TRUNCATE ignores it
+-- entirely: a role holding it empties a table whatever the policies say.
+-- PostgREST never issues one, so the anon key could not, but nothing a
+-- client does needs TRUNCATE, REFERENCES or TRIGGER on any of these.
+-- Re-run on every apply, so a table added later is covered too.
+REVOKE TRUNCATE, REFERENCES, TRIGGER
+  ON keeps, keep_members, checkins, keep_places, location_history, keep_join_attempts,
+     roamkeep_meta, keep_notify_prefs, keep_member_push, roamkeep_secrets, password_reset_codes
+  FROM anon, authenticated;
+-- Nothing on the client side touches these two at all: only the DEFINER
+-- functions (as the table owner) and the Edge Functions (service role) do.
+REVOKE ALL ON keep_join_attempts, roamkeep_secrets FROM anon, authenticated;
+
 
 -- ── CODE GENERATOR ────────────────────────────────────────
 -- 12 chars from a 31-symbol unambiguous alphabet (no 0/O/1/I/L) via
@@ -749,7 +776,7 @@ CREATE OR REPLACE FUNCTION _roamkeep_gen_code()
 RETURNS text
 LANGUAGE plpgsql
 VOLATILE
-SET search_path = public, extensions
+SET search_path = public, extensions, pg_temp
 AS $$
 DECLARE
   alphabet constant text := 'ABCDEFGHJKMNPQRSTUVWXYZ23456789';  -- 31 symbols
@@ -776,7 +803,7 @@ REVOKE ALL ON FUNCTION _roamkeep_gen_code() FROM PUBLIC, anon, authenticated;
 CREATE OR REPLACE FUNCTION _roamkeep_guard_member_cols()
 RETURNS trigger
 LANGUAGE plpgsql
-SET search_path = public
+SET search_path = public, pg_temp
 AS $$
 BEGIN
   IF (NEW.role         IS DISTINCT FROM OLD.role
@@ -795,6 +822,14 @@ BEGIN
       -- pending member could PATCH themselves in — if they could see their
       -- own row, which they cannot; the guard holds regardless.
       OR NEW.approved     IS DISTINCT FROM OLD.approved
+      -- v18: the row's identity. Nothing changes either legitimately. The
+      -- id is what every other row points at, and created_at decides which
+      -- membership my_membership, delete_my_account and
+      -- request_account_deletion act on for an account in two Keeps (only
+      -- possible on a server from before v16), so neither is the member's
+      -- to move.
+      OR NEW.id           IS DISTINCT FROM OLD.id
+      OR NEW.created_at   IS DISTINCT FROM OLD.created_at
       -- v17: a child's deletion request moves only through
       -- request_account_deletion(), which wakes the owners. A direct PATCH
       -- would skip the "children only" rule.
@@ -834,7 +869,7 @@ CREATE OR REPLACE FUNCTION _roamkeep_guard_place_cols()
 RETURNS trigger
 LANGUAGE plpgsql
 SECURITY DEFINER
-SET search_path = public
+SET search_path = public, pg_temp
 AS $$
 BEGIN
   IF NEW.keep_id IS DISTINCT FROM OLD.keep_id THEN
@@ -879,7 +914,7 @@ CREATE TRIGGER trg_guard_place_cols
 CREATE OR REPLACE FUNCTION _roamkeep_checkin_normalise()
 RETURNS trigger
 LANGUAGE plpgsql
-SET search_path = public
+SET search_path = public, pg_temp
 AS $$
 DECLARE
   v_name   text;
@@ -917,7 +952,7 @@ REVOKE ALL ON FUNCTION _roamkeep_checkin_normalise() FROM PUBLIC, anon, authenti
 CREATE OR REPLACE FUNCTION _roamkeep_place_cap()
 RETURNS trigger
 LANGUAGE plpgsql
-SET search_path = public
+SET search_path = public, pg_temp
 AS $$
 BEGIN
   IF (SELECT count(*) FROM keep_places WHERE keep_id = NEW.keep_id) >= 90 THEN
@@ -945,7 +980,7 @@ CREATE OR REPLACE FUNCTION roamkeep_schema_version()
 RETURNS TABLE (schema_version integer, min_app_build integer)
 LANGUAGE sql
 SECURITY DEFINER
-SET search_path = public
+SET search_path = public, pg_temp
 STABLE
 AS $$
   SELECT m.schema_version, m.min_app_build FROM roamkeep_meta m
@@ -994,7 +1029,7 @@ CREATE OR REPLACE FUNCTION set_project_url(p_url text)
 RETURNS boolean
 LANGUAGE plpgsql
 SECURITY DEFINER
-SET search_path = public
+SET search_path = public, pg_temp
 AS $$
 DECLARE
   v_is_owner boolean;
@@ -1008,14 +1043,18 @@ BEGIN
     IF p_url <> regexp_replace(v_iss, '/auth/v1$', '') THEN
       RETURN false;
     END IF;
+    -- v18: an APPROVED owner, here and in every owner check below. Approval
+    -- arrived in v17 but only the functions written for it asked; the older
+    -- ones took role = 'owner' alone, so a pending member an owner had
+    -- promoted could administer the family before being let in.
     SELECT EXISTS (
       SELECT 1 FROM keep_members
-      WHERE user_id = auth.uid() AND role = 'owner'
+      WHERE user_id = auth.uid() AND role = 'owner' AND approved
     ) INTO v_is_owner;
   ELSE
     SELECT EXISTS (
       SELECT 1 FROM keep_members m
-      WHERE m.user_id = auth.uid() AND m.role = 'owner'
+      WHERE m.user_id = auth.uid() AND m.role = 'owner' AND m.approved
         AND m.keep_id = (SELECT k.id FROM keeps k ORDER BY k.created_at, k.id LIMIT 1)
     ) INTO v_is_owner;
   END IF;
@@ -1051,7 +1090,7 @@ CREATE OR REPLACE FUNCTION checkin_recipients(p_checkin uuid)
 RETURNS TABLE (member_id uuid, fcm_token text)
 LANGUAGE sql
 SECURITY DEFINER
-SET search_path = public
+SET search_path = public, pg_temp
 STABLE
 AS $$
   SELECT m.id, p.fcm_token
@@ -1096,7 +1135,7 @@ CREATE OR REPLACE FUNCTION keep_push_recipients(p_keep uuid)
 RETURNS TABLE (member_id uuid, fcm_token text)
 LANGUAGE sql
 SECURITY DEFINER
-SET search_path = public
+SET search_path = public, pg_temp
 STABLE
 AS $$
   SELECT p.member_id, p.fcm_token
@@ -1116,7 +1155,7 @@ CREATE OR REPLACE FUNCTION keep_owner_push_recipients(p_keep uuid)
 RETURNS TABLE (member_id uuid, fcm_token text)
 LANGUAGE sql
 SECURITY DEFINER
-SET search_path = public
+SET search_path = public, pg_temp
 STABLE
 AS $$
   SELECT p.member_id, p.fcm_token
@@ -1138,7 +1177,7 @@ CREATE OR REPLACE FUNCTION reset_notice_recipients(p_user uuid)
 RETURNS TABLE (member_id uuid, fcm_token text)
 LANGUAGE sql
 SECURITY DEFINER
-SET search_path = public
+SET search_path = public, pg_temp
 STABLE
 AS $$
   SELECT p.member_id, p.fcm_token
@@ -1261,7 +1300,7 @@ CREATE OR REPLACE FUNCTION public.roamkeep_notify_places()
   RETURNS trigger
   LANGUAGE plpgsql
   SECURITY DEFINER
-  SET search_path = public, net
+  SET search_path = public, net, pg_temp
 AS $fn$
 DECLARE
   v_url text;
@@ -1346,7 +1385,7 @@ CREATE OR REPLACE FUNCTION public.roamkeep_notify_join()
   RETURNS trigger
   LANGUAGE plpgsql
   SECURITY DEFINER
-  SET search_path = public, net
+  SET search_path = public, net, pg_temp
 AS $fn$
 DECLARE
   v_url text;
@@ -1414,7 +1453,7 @@ CREATE OR REPLACE FUNCTION public.roamkeep_notify_reset()
   RETURNS trigger
   LANGUAGE plpgsql
   SECURITY DEFINER
-  SET search_path = public, net
+  SET search_path = public, net, pg_temp
 AS $fn$
 DECLARE
   v_url text;
@@ -1488,7 +1527,7 @@ BEGIN
         RETURNS trigger
         LANGUAGE plpgsql
         SECURITY DEFINER
-        SET search_path = public, net
+        SET search_path = public, net, pg_temp
       AS $fn$
       DECLARE
         v_url text;
@@ -1521,6 +1560,25 @@ BEGIN
   END IF;
 END$$;
 
+-- v18: the parts of the above that are safe to apply to ANY installed copy,
+-- whichever body it has, applied every time. Before, they ran only when the
+-- body was replaced, so re-pasting this file to repair a project left a
+-- deleted check-in trigger deleted (no check-in or SOS push at all) and a
+-- loosened grant loosened. The body guard above is unchanged: a working
+-- copy with its URL written in is still never swapped for one that would
+-- no-op. ALTER ... SET search_path adds pg_temp without replacing the body.
+DO $$
+BEGIN
+  EXECUTE 'REVOKE ALL ON FUNCTION public.roamkeep_notify_checkin() FROM public, anon, authenticated';
+  EXECUTE 'ALTER FUNCTION public.roamkeep_notify_checkin() SET search_path = public, net, pg_temp';
+  IF NOT EXISTS (SELECT 1 FROM pg_trigger
+                  WHERE tgname = 'on_checkin_notify'
+                    AND tgrelid = 'public.checkins'::regclass) THEN
+    EXECUTE 'CREATE TRIGGER on_checkin_notify AFTER INSERT ON public.checkins '
+         || 'FOR EACH ROW EXECUTE FUNCTION public.roamkeep_notify_checkin()';
+  END IF;
+END$$;
+
 CREATE OR REPLACE FUNCTION create_keep(
   p_family_name text,
   p_display_name text,
@@ -1529,7 +1587,7 @@ CREATE OR REPLACE FUNCTION create_keep(
 RETURNS TABLE (member_id uuid, keep_id uuid, keep_code text, keep_name text)
 LANGUAGE plpgsql
 SECURITY DEFINER
-SET search_path = public
+SET search_path = public, pg_temp
 AS $$
 DECLARE
   v_uid uuid := auth.uid();
@@ -1621,7 +1679,7 @@ CREATE OR REPLACE FUNCTION join_keep_by_code(
 RETURNS TABLE (status text, member_id uuid, keep_id uuid, keep_code text, keep_name text)
 LANGUAGE plpgsql
 SECURITY DEFINER
-SET search_path = public
+SET search_path = public, pg_temp
 AS $$
 DECLARE
   v_uid uuid := auth.uid();
@@ -1709,7 +1767,7 @@ CREATE OR REPLACE FUNCTION rotate_keep_code(p_keep_id uuid)
 RETURNS TABLE (keep_code text, code_expires_at timestamptz)
 LANGUAGE plpgsql
 SECURITY DEFINER
-SET search_path = public
+SET search_path = public, pg_temp
 AS $$
 DECLARE
   v_uid uuid := auth.uid();
@@ -1724,7 +1782,7 @@ BEGIN
 
   SELECT EXISTS (
     SELECT 1 FROM keep_members
-     WHERE keep_id = p_keep_id AND user_id = v_uid AND role = 'owner'
+     WHERE keep_id = p_keep_id AND user_id = v_uid AND role = 'owner' AND approved
   ) INTO v_is_owner;
   IF NOT v_is_owner THEN
     RAISE EXCEPTION 'not_owner';
@@ -1766,7 +1824,7 @@ CREATE OR REPLACE FUNCTION get_invite(p_keep_id uuid)
 RETURNS TABLE (keep_code text, code_expires_at timestamptz)
 LANGUAGE plpgsql
 SECURITY DEFINER
-SET search_path = public
+SET search_path = public, pg_temp
 AS $$
 BEGIN
   IF auth.uid() IS NULL THEN
@@ -1774,7 +1832,7 @@ BEGIN
   END IF;
   IF NOT EXISTS (
     SELECT 1 FROM keep_members m
-     WHERE m.keep_id = p_keep_id AND m.user_id = auth.uid() AND m.role = 'owner'
+     WHERE m.keep_id = p_keep_id AND m.user_id = auth.uid() AND m.role = 'owner' AND m.approved
   ) THEN
     RAISE EXCEPTION 'not_owner';
   END IF;
@@ -1784,10 +1842,46 @@ $$;
 REVOKE ALL ON FUNCTION get_invite(uuid) FROM PUBLIC, anon;
 GRANT EXECUTE ON FUNCTION get_invite(uuid) TO authenticated;
 
--- remove_member: owner-only kick. location_history + checkins cascade on
--- the member delete; we also delete history explicitly so the privacy
--- intent is visible and survives any future FK change. Owner can't remove
--- self (that's the leave path).
+-- v18: LEAVING DELETES YOU. However someone leaves a family (they leave, an
+-- owner removes them, or an owner completes a child's request), everything
+-- about them goes, their sign-in included. Before v18 a removal left the
+-- sign-in behind: an email address and a password hash with no family,
+-- which on a one-family server can do nothing but join again. Deleting it
+-- also retires the rules that existed only to protect that leftover
+-- account: an owner could already wipe an adult's data by removing them, so
+-- "an owner may not delete an adult's account" and the day-long block on
+-- deletion after a password reset protected nothing.
+--
+-- One function so the three callers cannot drift. The callers check who may
+-- do it; this only does it. History explicitly, as everywhere, so the
+-- privacy promise does not rest on a foreign key; the membership, and from
+-- it check-ins, the push row and preferences by cascade; then the account,
+-- unless it is still in another Keep (possible only on a server from before
+-- v16), where deleting it would take that membership too.
+CREATE OR REPLACE FUNCTION _roamkeep_delete_member(p_member_id uuid)
+RETURNS void
+LANGUAGE plpgsql
+SET search_path = public, pg_temp
+AS $$
+DECLARE
+  v_uid uuid;
+BEGIN
+  SELECT user_id INTO v_uid FROM keep_members WHERE id = p_member_id;
+  IF NOT FOUND THEN
+    RETURN;
+  END IF;
+  DELETE FROM location_history WHERE member_id = p_member_id;
+  DELETE FROM keep_members WHERE id = p_member_id;
+  IF NOT EXISTS (SELECT 1 FROM keep_members WHERE user_id = v_uid) THEN
+    DELETE FROM auth.users WHERE id = v_uid;
+  END IF;
+END;
+$$;
+-- Internal: the DEFINER functions call it, clients never do.
+REVOKE ALL ON FUNCTION _roamkeep_delete_member(uuid) FROM PUBLIC, anon, authenticated;
+
+-- remove_member: owner-only kick. Owner can't remove self (that's the leave
+-- path). v18: the person is deleted, sign-in and all (see above).
 --
 -- v17: it also rotates the join code. The removed person's phone keeps the
 -- invite it joined with (so it can offer Join again), and on a keep without
@@ -1798,7 +1892,7 @@ CREATE OR REPLACE FUNCTION remove_member(p_member_id uuid)
 RETURNS void
 LANGUAGE plpgsql
 SECURITY DEFINER
-SET search_path = public
+SET search_path = public, pg_temp
 AS $$
 DECLARE
   v_uid uuid := auth.uid();
@@ -1826,14 +1920,13 @@ BEGIN
 
   SELECT EXISTS (
     SELECT 1 FROM keep_members
-     WHERE keep_id = v_keep_id AND user_id = v_uid AND role = 'owner'
+     WHERE keep_id = v_keep_id AND user_id = v_uid AND role = 'owner' AND approved
   ) INTO v_is_owner;
   IF NOT v_is_owner THEN
     RAISE EXCEPTION 'not_owner';
   END IF;
 
-  DELETE FROM location_history WHERE member_id = p_member_id;
-  DELETE FROM keep_members WHERE id = p_member_id;
+  PERFORM _roamkeep_delete_member(p_member_id);
   PERFORM rotate_keep_code(v_keep_id);
 END;
 $$;
@@ -1851,11 +1944,17 @@ GRANT EXECUTE ON FUNCTION remove_member(uuid) TO authenticated;
 -- that strands the keep, its places and everyone still in it with nobody
 -- able to administer them — their exit is deleting the Supabase project;
 -- and you can only leave as yourself.
+--
+-- v18: leaving deletes you, sign-in included (see _roamkeep_delete_member),
+-- which makes it delete_my_account by another name for everyone but the
+-- sole member of a Keep: they are the last owner here, and delete_my_account
+-- takes their whole family with them. A pending member may still leave:
+-- that is how they withdraw a request.
 CREATE OR REPLACE FUNCTION leave_keep(p_member_id uuid)
 RETURNS void
 LANGUAGE plpgsql
 SECURITY DEFINER
-SET search_path = public
+SET search_path = public, pg_temp
 AS $$
 DECLARE
   v_uid uuid := auth.uid();
@@ -1889,22 +1988,16 @@ BEGIN
     RAISE EXCEPTION 'member_not_found';
   END IF;
 
-  IF v_member.role = 'owner' THEN
+  IF v_member.role = 'owner' AND v_member.approved THEN
     SELECT count(*) INTO v_owner_count
       FROM keep_members
-     WHERE keep_id = v_member.keep_id AND role = 'owner';
+     WHERE keep_id = v_member.keep_id AND role = 'owner' AND approved;
     IF v_owner_count <= 1 THEN
       RAISE EXCEPTION 'last_owner';
     END IF;
   END IF;
 
-  -- Explicit, though location_history cascades off the member row anyway:
-  -- this is the line that makes the privacy claim true, and it should be
-  -- visible here rather than depending on a foreign key someone might later
-  -- change. checkins, keep_member_push and keep_notify_prefs go with the
-  -- row by cascade.
-  DELETE FROM location_history WHERE member_id = v_member.id;
-  DELETE FROM keep_members WHERE id = v_member.id;
+  PERFORM _roamkeep_delete_member(v_member.id);
 END;
 $$;
 REVOKE ALL ON FUNCTION leave_keep(uuid) FROM PUBLIC, anon;
@@ -1912,16 +2005,25 @@ GRANT EXECUTE ON FUNCTION leave_keep(uuid) TO authenticated;
 
 -- set_member_role: owner-only (owner ⊆ adults, so "only adults change
 -- roles" holds). Refuses to demote the last owner.
+--
+-- v18: and refuses to make an owner of a child or of a member still waiting
+-- for approval. set_member_type already kept an owner from becoming a
+-- child; nothing stopped the other order, and a child owner could then
+-- demote the real owners and delete their own account, leaving the family
+-- with nobody to run it. A pending owner could administer a family that
+-- had not let them in.
 CREATE OR REPLACE FUNCTION set_member_role(p_member_id uuid, p_role text)
 RETURNS void
 LANGUAGE plpgsql
 SECURITY DEFINER
-SET search_path = public
+SET search_path = public, pg_temp
 AS $$
 DECLARE
   v_uid uuid := auth.uid();
   v_keep_id uuid;
   v_cur_role text;
+  v_cur_type text;
+  v_cur_approved boolean;
   v_is_owner boolean;
   v_owner_count int;
 BEGIN
@@ -1941,22 +2043,34 @@ BEGIN
   -- v16: lock first, then read the role the decision rests on — see
   -- leave_keep. Two owners demoting each other at once each saw two owners.
   PERFORM 1 FROM keeps WHERE id = v_keep_id FOR UPDATE;
-  SELECT role INTO v_cur_role FROM keep_members WHERE id = p_member_id;
+  SELECT role, member_type, approved INTO v_cur_role, v_cur_type, v_cur_approved
+    FROM keep_members WHERE id = p_member_id;
   IF NOT FOUND THEN
     RAISE EXCEPTION 'member_not_found';
   END IF;
 
   SELECT EXISTS (
     SELECT 1 FROM keep_members
-     WHERE keep_id = v_keep_id AND user_id = v_uid AND role = 'owner'
+     WHERE keep_id = v_keep_id AND user_id = v_uid AND role = 'owner' AND approved
   ) INTO v_is_owner;
   IF NOT v_is_owner THEN
     RAISE EXCEPTION 'not_owner';
   END IF;
 
-  IF v_cur_role = 'owner' AND p_role = 'member' THEN
+  IF p_role = 'owner' AND v_cur_role <> 'owner' THEN
+    IF v_cur_type = 'child' THEN
+      RAISE EXCEPTION 'child_cannot_be_owner';
+    END IF;
+    IF NOT v_cur_approved THEN
+      RAISE EXCEPTION 'member_pending';
+    END IF;
+  END IF;
+
+  -- Only an approved owner counts, and only demoting one can strand the
+  -- family: demoting an owner still pending (from before v18) never does.
+  IF v_cur_role = 'owner' AND v_cur_approved AND p_role = 'member' THEN
     SELECT count(*) INTO v_owner_count
-      FROM keep_members WHERE keep_id = v_keep_id AND role = 'owner';
+      FROM keep_members WHERE keep_id = v_keep_id AND role = 'owner' AND approved;
     IF v_owner_count <= 1 THEN
       RAISE EXCEPTION 'last_owner';
     END IF;
@@ -1978,7 +2092,7 @@ CREATE OR REPLACE FUNCTION set_member_type(p_member_id uuid, p_type text)
 RETURNS void
 LANGUAGE plpgsql
 SECURITY DEFINER
-SET search_path = public
+SET search_path = public, pg_temp
 AS $$
 DECLARE
   v_uid uuid := auth.uid();
@@ -2001,7 +2115,7 @@ BEGIN
 
   SELECT EXISTS (
     SELECT 1 FROM keep_members
-     WHERE keep_id = v_keep_id AND user_id = v_uid AND role = 'owner'
+     WHERE keep_id = v_keep_id AND user_id = v_uid AND role = 'owner' AND approved
   ) INTO v_is_owner;
   IF NOT v_is_owner THEN
     RAISE EXCEPTION 'not_owner';
@@ -2011,8 +2125,13 @@ BEGIN
     RAISE EXCEPTION 'owner_must_be_adult';
   END IF;
 
+  -- v18: becoming a child ends any pause set as an adult. Children may not
+  -- pause, and a pause outliving the change kept one going for up to a day.
   PERFORM set_config('roamkeep.priv', 'on', true);
-  UPDATE keep_members SET member_type = p_type WHERE id = p_member_id;
+  UPDATE keep_members
+     SET member_type  = p_type,
+         paused_until = CASE WHEN p_type = 'child' THEN NULL ELSE paused_until END
+   WHERE id = p_member_id;
   PERFORM set_config('roamkeep.priv', 'off', true);  -- close the window
 END;
 $$;
@@ -2026,24 +2145,30 @@ CREATE OR REPLACE FUNCTION pause_member(p_member_id uuid, p_until timestamptz)
 RETURNS void
 LANGUAGE plpgsql
 SECURITY DEFINER
-SET search_path = public
+SET search_path = public, pg_temp
 AS $$
 DECLARE
   v_uid uuid := auth.uid();
   v_owner_uid uuid;
   v_type text;
+  v_approved boolean;
 BEGIN
   IF v_uid IS NULL THEN
     RAISE EXCEPTION 'not_authenticated';
   END IF;
 
-  SELECT user_id, member_type INTO v_owner_uid, v_type
+  SELECT user_id, member_type, approved INTO v_owner_uid, v_type, v_approved
     FROM keep_members WHERE id = p_member_id;
   IF NOT FOUND THEN
     RAISE EXCEPTION 'member_not_found';
   END IF;
   IF v_owner_uid <> v_uid THEN
     RAISE EXCEPTION 'not_authorized';
+  END IF;
+  -- v18: a member still waiting for approval writes nothing (see
+  -- private_user_keep_ids), and that includes through this function.
+  IF NOT v_approved THEN
+    RAISE EXCEPTION 'member_pending';
   END IF;
   IF v_type = 'child' THEN
     RAISE EXCEPTION 'child_cannot_pause';
@@ -2065,22 +2190,26 @@ CREATE OR REPLACE FUNCTION resume_member(p_member_id uuid)
 RETURNS void
 LANGUAGE plpgsql
 SECURITY DEFINER
-SET search_path = public
+SET search_path = public, pg_temp
 AS $$
 DECLARE
   v_uid uuid := auth.uid();
   v_owner_uid uuid;
+  v_approved boolean;
 BEGIN
   IF v_uid IS NULL THEN
     RAISE EXCEPTION 'not_authenticated';
   END IF;
 
-  SELECT user_id INTO v_owner_uid FROM keep_members WHERE id = p_member_id;
+  SELECT user_id, approved INTO v_owner_uid, v_approved FROM keep_members WHERE id = p_member_id;
   IF NOT FOUND THEN
     RAISE EXCEPTION 'member_not_found';
   END IF;
   IF v_owner_uid <> v_uid THEN
     RAISE EXCEPTION 'not_authorized';
+  END IF;
+  IF NOT v_approved THEN
+    RAISE EXCEPTION 'member_pending';   -- v18, as pause_member
   END IF;
 
   PERFORM set_config('roamkeep.priv', 'on', true);
@@ -2099,7 +2228,7 @@ CREATE OR REPLACE FUNCTION rename_keep(p_keep_id uuid, p_name text)
 RETURNS TABLE (keep_name text)
 LANGUAGE plpgsql
 SECURITY DEFINER
-SET search_path = public
+SET search_path = public, pg_temp
 AS $$
 DECLARE
   v_uid uuid := auth.uid();
@@ -2114,7 +2243,7 @@ BEGIN
 
   SELECT EXISTS (
     SELECT 1 FROM keep_members
-     WHERE keep_id = p_keep_id AND user_id = v_uid AND role = 'owner'
+     WHERE keep_id = p_keep_id AND user_id = v_uid AND role = 'owner' AND approved
   ) INTO v_is_owner;
   IF NOT v_is_owner THEN
     RAISE EXCEPTION 'not_owner';
@@ -2142,12 +2271,13 @@ CREATE OR REPLACE FUNCTION update_member_profile(
 RETURNS void
 LANGUAGE plpgsql
 SECURITY DEFINER
-SET search_path = public
+SET search_path = public, pg_temp
 AS $$
 DECLARE
   v_uid uuid := auth.uid();
   v_keep_id uuid;
   v_target_uid uuid;
+  v_target_approved boolean;
   v_is_owner boolean;
 BEGIN
   IF v_uid IS NULL THEN
@@ -2160,7 +2290,7 @@ BEGIN
     RAISE EXCEPTION 'invalid_avatar';
   END IF;
 
-  SELECT keep_id, user_id INTO v_keep_id, v_target_uid
+  SELECT keep_id, user_id, approved INTO v_keep_id, v_target_uid, v_target_approved
     FROM keep_members WHERE id = p_member_id;
   IF NOT FOUND THEN
     RAISE EXCEPTION 'member_not_found';
@@ -2169,11 +2299,16 @@ BEGIN
   IF v_target_uid <> v_uid THEN
     SELECT EXISTS (
       SELECT 1 FROM keep_members
-       WHERE keep_id = v_keep_id AND user_id = v_uid AND role = 'owner'
+       WHERE keep_id = v_keep_id AND user_id = v_uid AND role = 'owner' AND approved
     ) INTO v_is_owner;
     IF NOT v_is_owner THEN
       RAISE EXCEPTION 'not_authorized';
     END IF;
+  ELSIF NOT v_target_approved THEN
+    -- v18: editing your own profile is a write, and a member still waiting
+    -- for approval makes none. The name they joined with is what the owners
+    -- are deciding on.
+    RAISE EXCEPTION 'member_pending';
   END IF;
 
   UPDATE keep_members
@@ -2207,7 +2342,7 @@ CREATE OR REPLACE FUNCTION prune_keep_history()
 RETURNS TABLE (history_deleted integer, checkins_deleted integer)
 LANGUAGE plpgsql
 SECURITY DEFINER
-SET search_path = public
+SET search_path = public, pg_temp
 AS $$
 DECLARE
   v_uid uuid := auth.uid();
@@ -2218,16 +2353,17 @@ BEGIN
     RAISE EXCEPTION 'not_authenticated';
   END IF;
 
+  -- v18: approved members only, like every other write (m.approved).
   DELETE FROM location_history lh
    USING keep_members m
-   WHERE m.user_id = v_uid
+   WHERE m.user_id = v_uid AND m.approved
      AND lh.keep_id = m.keep_id
      AND lh.recorded_at < now() - interval '7 days';
   GET DIAGNOSTICS v_h = ROW_COUNT;
 
   DELETE FROM checkins c
    USING keep_members m
-   WHERE m.user_id = v_uid
+   WHERE m.user_id = v_uid AND m.approved
      AND c.keep_id = m.keep_id
      AND c.created_at < now() - interval '7 days';
   GET DIAGNOSTICS v_c = ROW_COUNT;
@@ -2249,7 +2385,7 @@ CREATE OR REPLACE FUNCTION my_membership()
 RETURNS TABLE (member_id uuid, keep_id uuid, keep_name text, approved boolean, joined_at timestamptz)
 LANGUAGE sql
 SECURITY DEFINER
-SET search_path = public
+SET search_path = public, pg_temp
 STABLE
 AS $$
   SELECT m.id, m.keep_id, k.name, m.approved, m.created_at
@@ -2270,7 +2406,7 @@ CREATE OR REPLACE FUNCTION set_require_approval(p_keep_id uuid, p_on boolean)
 RETURNS void
 LANGUAGE plpgsql
 SECURITY DEFINER
-SET search_path = public
+SET search_path = public, pg_temp
 AS $$
 DECLARE
   v_uid uuid := auth.uid();
@@ -2302,7 +2438,7 @@ CREATE OR REPLACE FUNCTION approve_member(p_member_id uuid)
 RETURNS void
 LANGUAGE plpgsql
 SECURITY DEFINER
-SET search_path = public
+SET search_path = public, pg_temp
 AS $$
 DECLARE
   v_uid uuid := auth.uid();
@@ -2342,7 +2478,7 @@ CREATE OR REPLACE FUNCTION decline_member(p_member_id uuid)
 RETURNS void
 LANGUAGE plpgsql
 SECURITY DEFINER
-SET search_path = public
+SET search_path = public, pg_temp
 AS $$
 DECLARE
   v_uid uuid := auth.uid();
@@ -2387,7 +2523,7 @@ CREATE OR REPLACE FUNCTION set_signups(p_closed boolean, p_open_until timestampt
 RETURNS void
 LANGUAGE plpgsql
 SECURITY DEFINER
-SET search_path = public
+SET search_path = public, pg_temp
 AS $$
 DECLARE
   v_uid uuid := auth.uid();
@@ -2484,7 +2620,7 @@ CREATE OR REPLACE FUNCTION delete_my_account()
 RETURNS void
 LANGUAGE plpgsql
 SECURITY DEFINER
-SET search_path = public
+SET search_path = public, pg_temp
 AS $$
 DECLARE
   v_uid uuid := auth.uid();
@@ -2496,17 +2632,20 @@ BEGIN
     RAISE EXCEPTION 'not_authenticated';
   END IF;
 
-  -- v17 (self-review R1): not within a day of a password reset by code. An
-  -- owner can reset an adult member's password; this keeps a reset from
-  -- ending in the account's deletion before the person has heard about it
-  -- (on_reset_notice tells them at once).
-  IF EXISTS (SELECT 1 FROM password_reset_codes r
-              WHERE r.user_id = v_uid AND r.redeemed_at > now() - interval '24 hours') THEN
-    RAISE EXCEPTION 'recent_reset';
-  END IF;
-
-  SELECT * INTO v_member FROM keep_members WHERE user_id = v_uid ORDER BY created_at LIMIT 1;
-  IF FOUND THEN
+  -- v18: no longer refused for a day after a password reset by code (v17,
+  -- self-review R1). Since v18 an owner removing a member deletes them too,
+  -- so the block protected nothing an owner could not already do, and a
+  -- second code cleared it anyway (it read the redemption off the code row,
+  -- which a new code resets). The member is still told at once when a code
+  -- is made and when it is used.
+  --
+  -- v18: every membership, not only the oldest. An account in two Keeps
+  -- (possible only on a server from before v16) could delete itself while
+  -- the last owner of the second one, leaving that family with nobody to
+  -- run it. Locked in keep order, so two deletions cannot deadlock.
+  FOR v_member IN
+    SELECT * FROM keep_members WHERE user_id = v_uid ORDER BY keep_id
+  LOOP
     IF v_member.member_type = 'child' THEN
       RAISE EXCEPTION 'child_cannot_delete';
     END IF;
@@ -2514,9 +2653,9 @@ BEGIN
     PERFORM 1 FROM keeps WHERE id = v_member.keep_id FOR UPDATE;
     SELECT count(*) INTO v_others
       FROM keep_members WHERE keep_id = v_member.keep_id AND id <> v_member.id;
-    IF v_member.role = 'owner' THEN
+    IF v_member.role = 'owner' AND v_member.approved THEN
       SELECT count(*) INTO v_owners
-        FROM keep_members WHERE keep_id = v_member.keep_id AND role = 'owner';
+        FROM keep_members WHERE keep_id = v_member.keep_id AND role = 'owner' AND approved;
       IF v_owners <= 1 AND v_others > 0 THEN
         RAISE EXCEPTION 'last_owner';
       END IF;
@@ -2526,7 +2665,7 @@ BEGIN
       -- The family is just them; its keep, places and history go too.
       DELETE FROM keeps WHERE id = v_member.keep_id;
     END IF;
-  END IF;
+  END LOOP;
 
   DELETE FROM auth.users WHERE id = v_uid;
 END;
@@ -2549,7 +2688,7 @@ CREATE OR REPLACE FUNCTION issue_password_reset(p_member_id uuid)
 RETURNS text
 LANGUAGE plpgsql
 SECURITY DEFINER
-SET search_path = public, extensions
+SET search_path = public, extensions, pg_temp
 AS $$
 DECLARE
   v_uid uuid := auth.uid();
@@ -2624,7 +2763,7 @@ CREATE OR REPLACE FUNCTION redeem_password_reset(p_email text, p_code text, p_ne
 RETURNS text
 LANGUAGE plpgsql
 SECURITY DEFINER
-SET search_path = public, extensions
+SET search_path = public, extensions, pg_temp
 AS $$
 DECLARE
   v_uid uuid;
@@ -2656,6 +2795,25 @@ BEGIN
     RETURN 'invalid';
   END IF;
 
+  -- v18: the rules issue_password_reset checked are checked AGAIN now, when
+  -- the code is used, because the family can change in the 15 minutes
+  -- between. Checked only at issue, a code made for a member still worked
+  -- after they were made an owner, and after they were removed from the
+  -- family, when nobody was left to tell them (their phones are woken
+  -- through their membership, which had gone). The target must still be an
+  -- approved member of the Keep the code was made in, and not an owner; the
+  -- one who made it must still be an approved owner there. Otherwise the
+  -- code is burnt, with the same 'invalid' as every other failure.
+  IF NOT EXISTS (SELECT 1 FROM keep_members t
+                  WHERE t.user_id = v_uid AND t.keep_id = v_row.keep_id
+                    AND t.approved AND t.role <> 'owner')
+     OR NOT EXISTS (SELECT 1 FROM keep_members i
+                     WHERE i.user_id = v_row.issued_by AND i.keep_id = v_row.keep_id
+                       AND i.approved AND i.role = 'owner') THEN
+    UPDATE password_reset_codes SET code_hash = NULL WHERE user_id = v_uid;
+    RETURN 'invalid';
+  END IF;
+
   IF length(coalesce(p_new_password, '')) < 8 THEN
     RETURN 'weak_password';
   END IF;
@@ -2682,7 +2840,7 @@ CREATE OR REPLACE FUNCTION request_account_deletion(p_on boolean)
 RETURNS void
 LANGUAGE plpgsql
 SECURITY DEFINER
-SET search_path = public
+SET search_path = public, pg_temp
 AS $$
 DECLARE
   v_uid uuid := auth.uid();
@@ -2720,11 +2878,15 @@ GRANT EXECUTE ON FUNCTION request_account_deletion(boolean) TO authenticated;
 -- remove_member is the owner's part there. Refused when the account is in
 -- another Keep too (possible only from before v16), so no owner reaches
 -- into a second family.
+--
+-- v18: since remove_member deletes the account too, this is remove_member
+-- for children, kept for the 4.11.0 app's "Delete account" button. Its
+-- children-only rule stays, because that is what that app promises.
 CREATE OR REPLACE FUNCTION delete_child_account(p_member_id uuid)
 RETURNS void
 LANGUAGE plpgsql
 SECURITY DEFINER
-SET search_path = public
+SET search_path = public, pg_temp
 AS $$
 DECLARE
   v_uid uuid := auth.uid();
@@ -2759,10 +2921,11 @@ BEGIN
     RAISE EXCEPTION 'member_elsewhere';
   END IF;
 
-  -- As delete_my_account: history explicitly, then the account, from which
-  -- the membership, check-ins, push row and preferences cascade.
-  DELETE FROM location_history WHERE member_id = v_target.id;
-  DELETE FROM auth.users WHERE id = v_target.user_id;
+  -- v18: the same deletion as remove_member and leave_keep, and the same
+  -- rotation as remove_member: the child's phone keeps the invite it
+  -- joined with.
+  PERFORM _roamkeep_delete_member(v_target.id);
+  PERFORM rotate_keep_code(v_target.keep_id);
 END;
 $$;
 REVOKE ALL ON FUNCTION delete_child_account(uuid) FROM PUBLIC, anon;
@@ -2842,9 +3005,9 @@ END$$;
 -- upgrade path, and it must never walk a database BACKWARDS if someone
 -- runs an older checkout of it against a newer database.
 
-INSERT INTO roamkeep_meta (id, schema_version) VALUES (true, 17)
+INSERT INTO roamkeep_meta (id, schema_version) VALUES (true, 18)
   ON CONFLICT (id) DO UPDATE
-    SET schema_version = GREATEST(roamkeep_meta.schema_version, 17),
+    SET schema_version = GREATEST(roamkeep_meta.schema_version, 18),
         updated_at = now();
 
 

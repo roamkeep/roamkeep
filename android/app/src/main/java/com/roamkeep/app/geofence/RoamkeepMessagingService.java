@@ -566,29 +566,38 @@ public class RoamkeepMessagingService extends MessagingService {
             JSONArray arr = new JSONArray(body);
             for (int i = 0; i < arr.length(); i++) {
                 JSONObject o = arr.optJSONObject(i);
-                if (o == null) continue;
-                String id = o.optString("id", null);
-                String name = o.optString("name", null);
-                if (id == null || name == null) continue;
-                places.add(new PrefsStore.Place(
-                        id, name, o.optString("icon", "📍"),
-                        o.optDouble("lat"), o.optDouble("lng"),
-                        (float) o.optDouble("radius_m", 100)));
+                String id = o == null ? null : o.optString("id", null);
+                String name = o == null ? null : o.optString("name", null);
+                double lat = o == null ? Double.NaN : o.optDouble("lat");
+                double lng = o == null ? Double.NaN : o.optDouble("lng");
+                double radius = o == null ? Double.NaN : o.optDouble("radius_m", 100);
+                // 4.11.1: a row that isn't whole refuses the whole list, the
+                // same as an unreadable body. Skipping it and arming the rest
+                // as "complete" pruned that place as if it had been deleted.
+                if (!GeofenceArmer.validPlaceRow(id, name, lat, lng, radius)) {
+                    prefs.journal("push: places list had a malformed row — leaving state alone");
+                    return;
+                }
+                places.add(new PrefsStore.Place(id, name, o.optString("icon", "📍"), lat, lng, (float) radius));
             }
         } catch (Exception e) {
             Log.w(TAG, "sync: bad places payload — leaving state alone", e);
             return;
         }
 
-        String sig = GeofenceArmer.signature(places);
+        final String sig = GeofenceArmer.signature(places);
         String was = prefs.getPlacesSignature();
-        // null means "never armed", which is different from "" ("armed an
-        // empty list"). A first-ever arm must go ahead even with nothing
-        // in it, so that the signature gets recorded.
+        // null means "never armed" (or "the last registration failed",
+        // 4.11.1), which is different from "" ("armed an empty list"). A
+        // first-ever arm must go ahead even with nothing in it, so that the
+        // signature gets recorded.
         if (sig.equals(was)) return;
 
-        GeofenceArmer.Result r = GeofenceArmer.arm(ctx, places, "push");
-        prefs.setPlacesSignature(sig);
+        // Recorded only once Play Services has taken it (4.11.1). If this
+        // process is gone before it answers, nothing is recorded and the
+        // next wake simply arms again.
+        GeofenceArmer.Result r = GeofenceArmer.arm(ctx, places, "push",
+                (res, accepted) -> prefs.setPlacesSignature(accepted ? sig : null));
 
         // Journal only when something actually changed. A line on every
         // wake-up would bury the rest of the journal, and the journal is

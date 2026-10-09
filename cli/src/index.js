@@ -30,7 +30,7 @@
 
 import path from 'node:path';
 import { randomBytes } from 'node:crypto';
-import { intro, outro, text, select, confirm, spinner, isCancel, cancel, note, log } from '@clack/prompts';
+import { intro, outro, text, password, select, confirm, spinner, isCancel, cancel, note, log } from '@clack/prompts';
 import color from 'picocolors';
 import QRCode from 'qrcode';
 import { createClient, waitForProject, ApiError } from './api.js';
@@ -263,7 +263,10 @@ async function main() {
       'It is only used on this machine, to talk to your own account.',
       'You need a Supabase access token',
     );
-    token = stop(await text({
+    // Masked (4.11.1): this token can create and delete projects in the
+    // account, and a terminal on screen, scrollback or a recording would
+    // otherwise keep it in plain view.
+    token = stop(await password({
       message: 'Paste your access token',
       validate: (v) => (!v || v.trim().length < 20 ? 'That does not look like a token' : undefined),
     })).trim();

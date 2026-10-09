@@ -54,6 +54,26 @@ if (!/^https:\/\//i.test(url)) {
   process.exit(1);
 }
 
+// 4.11.1: never put a key that bypasses row-level security in a link the
+// whole family will hold. Same rule as privilegedKey() in app.js and
+// cli/src/link.js (cli/test.mjs checks all three).
+function privilegedKey(k) {
+  if (/^sb_secret_/i.test(k)) return true;
+  const parts = k.split('.');
+  if (parts.length !== 3) return false;
+  try {
+    const claims = JSON.parse(Buffer.from(parts[1], 'base64url').toString('utf8'));
+    return !!claims && claims.role === 'service_role';
+  } catch (_) {
+    return false;
+  }
+}
+if (privilegedKey(key)) {
+  console.error('That is a secret (service-role) key. A setup link needs the public anon or\n' +
+    'publishable key (Supabase → Project Settings → API keys).');
+  process.exit(1);
+}
+
 // ── Guard: is the Supabase CLI linked at a different project? ─────
 // `supabase link` and `npm run link` share a word and nothing else.
 // This script only ever reads deploy.config.json, so "I linked the test

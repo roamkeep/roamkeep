@@ -37,3 +37,14 @@
 # (R8 still writes mapping.txt under app/build/outputs/mapping/release —
 # keep that file per release if you want to de-obfuscate traces).
 -keepattributes SourceFile,LineNumberTable
+
+# 4.11.1: no verbose, debug or info logging in a release build. Those lines
+# name places and times ("duplicate ENTER for Home"), and logcat is not ours
+# to age out: it goes into bug reports and support captures. Warnings and
+# errors stay, and carry no names (see GeofenceReceiver, SupabaseRest). The
+# journal, which the app shows and trims to 7 days, is the record we keep.
+-assumenosideeffects class android.util.Log {
+    public static int v(...);
+    public static int d(...);
+    public static int i(...);
+}

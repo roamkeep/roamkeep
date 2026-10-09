@@ -159,6 +159,16 @@ public class GeofenceReceiver extends BroadcastReceiver {
             return;
         }
 
+        // 4.11.1: while the tracking notification cannot be shown, nothing is
+        // shared, so a transition is treated as it is during a pause: not
+        // written, not even as state. After the error branch above on
+        // purpose: re-registering dropped fences is not recording, and
+        // skipping it would leave them dead after sharing resumes.
+        if (!LocationForegroundService.canDisclose(context)) {
+            LocationForegroundService.stopForDisclosure(context, "geofence transition");
+            return;
+        }
+
         int transition = event.getGeofenceTransition();
         String type;
         if (transition == Geofence.GEOFENCE_TRANSITION_ENTER) {
@@ -391,12 +401,14 @@ public class GeofenceReceiver extends BroadcastReceiver {
                     continue;
                 }
             } else {
-                if (!prefs.isInsidePlace(placeId)) {
-                    Log.i(TAG, "spurious EXIT for " + p.name + " — not currently inside, skipping");
+                // 4.11.1: one atomic step, as the ENTER side has been since
+                // 4.8.7. Test-then-remove let two workers handling the same
+                // EXIT both find "inside" and both announce a departure.
+                if (!prefs.claimExitPlace(placeId)) {
+                    Log.i(TAG, "spurious EXIT — not currently inside, skipping");
                     spurious.add(p.name);   // journalled once, after the loop
                     continue;
                 }
-                prefs.removeInsidePlace(placeId);
                 // An arrival still held at its own departure. Either the
                 // stay itself proves it — arriving from travel and staying
                 // past the dwell, which the breadcrumb path would normally
@@ -544,8 +556,10 @@ public class GeofenceReceiver extends BroadcastReceiver {
                     // breadcrumb fire (seconds away on the move), geofence
                     // fire, or app launch will retry it.
                     prefs.journal("geo: " + type + " " + p.name + " POST failed — queued");
-                    Log.w(TAG, "checkin insert failed for " + p.name
-                            + " — queued for retry (pending=" + prefs.pendingCount() + ")");
+                    // No place name in logcat (4.11.1): the journal line above
+                    // says which, and the journal is ours to age out.
+                    Log.w(TAG, "checkin insert failed — queued for retry (pending="
+                            + prefs.pendingCount() + ")");
                 }
             } finally {
                 releaseInFlight(id);
@@ -582,26 +596,35 @@ public class GeofenceReceiver extends BroadcastReceiver {
             if (!claimInFlight(id)) { busy++; continue; }
             SupabaseRest.Result r;
             try {
+                // 4.11.1: this drain works from a snapshot, and another sender
+                // may have delivered and removed the row since it was taken.
+                // Holding the claim, ask the queue itself before sending.
+                if (!prefs.isPendingCheckin(id)) continue;
                 r = rest.insertCheckin(entry);
+                // ...and settle it BEFORE the claim is released, as
+                // fileCheckin does. Releasing first left a moment in which a
+                // second drain could claim the row and POST it again.
+                if (r == SupabaseRest.Result.SUCCESS
+                        || r == SupabaseRest.Result.DUPLICATE
+                        || r == SupabaseRest.Result.REJECTED) {
+                    prefs.removePendingCheckin(id);
+                }
             } finally {
                 releaseInFlight(id);
             }
             if (r == SupabaseRest.Result.SUCCESS) {
-                prefs.removePendingCheckin(id);
                 drained++;
             } else if (r == SupabaseRest.Result.DUPLICATE) {
                 // Already there: an earlier POST landed but its response
                 // never came back. Cleared, but NOT counted as delivered —
                 // that count used to include these, which is how a
                 // double-send passed for a successful retry in the journal.
-                prefs.removePendingCheckin(id);
                 alreadyThere++;
             } else if (r == SupabaseRest.Result.REJECTED) {
                 // The server refused this payload and always will. It used
                 // to stop the drain like a network failure, so one such
                 // entry at the head held every later check-in back until 50
                 // newer ones pushed it out of the queue.
-                prefs.removePendingCheckin(id);
                 dropped++;
                 droppedWhy = rest.lastSqlState();
             } else {

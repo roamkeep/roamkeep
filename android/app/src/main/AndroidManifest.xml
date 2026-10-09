@@ -170,12 +170,15 @@
              reboot (BOOT_COMPLETED / LOCKED_BOOT_COMPLETED) and app
              updates (MY_PACKAGE_REPLACED — every APK install kills the
              process and nothing else restarts the service until the
-             next manual app open). -->
+             next manual app open).
+             Exported only because the system sends these; all three are
+             protected broadcasts no other app can send. 4.11.1 dropped the
+             OEM QUICKBOOT_POWERON action, which is not protected
+             everywhere, so any installed app could have sent it. -->
         <receiver android:name="com.roamkeep.app.geofence.BootReceiver" android:exported="true">
             <intent-filter>
                 <action android:name="android.intent.action.BOOT_COMPLETED" />
                 <action android:name="android.intent.action.LOCKED_BOOT_COMPLETED" />
-                <action android:name="android.intent.action.QUICKBOOT_POWERON" />
                 <action android:name="android.intent.action.MY_PACKAGE_REPLACED" />
             </intent-filter>
         </receiver>

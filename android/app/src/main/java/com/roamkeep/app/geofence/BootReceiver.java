@@ -43,10 +43,12 @@ public class BootReceiver extends BroadcastReceiver {
     public void onReceive(Context context, Intent intent) {
         String action = intent.getAction();
         boolean pkgReplaced = Intent.ACTION_MY_PACKAGE_REPLACED.equals(action);
+        // Protected system broadcasts only (4.11.1: no QUICKBOOT_POWERON, an
+        // OEM action not every device protects). The manifest no longer
+        // lists it either; this check is what holds if one ever arrives.
         if (!pkgReplaced
                 && !Intent.ACTION_BOOT_COMPLETED.equals(action)
-                && !Intent.ACTION_LOCKED_BOOT_COMPLETED.equals(action)
-                && !"android.intent.action.QUICKBOOT_POWERON".equals(action)) {
+                && !Intent.ACTION_LOCKED_BOOT_COMPLETED.equals(action)) {
             return;
         }
         String why = pkgReplaced ? "update" : "boot";

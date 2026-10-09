@@ -95,6 +95,21 @@ final class GeofenceArmer {
     }
 
     /**
+     * Whether one row of a place list is whole (4.11.1). Both callers that
+     * parse a list (the bridge, the push reconcile) used to SKIP a bad row
+     * and arm the rest as the complete list, so one malformed row read as
+     * "that place was deleted" and was pruned. They now refuse the whole
+     * list instead and leave every store as it was. Pure, for PlaceRowTest.
+     */
+    static boolean validPlaceRow(String id, String name, double lat, double lng, double radius) {
+        return SupabaseRest.isUuid(id)
+                && name != null && !name.trim().isEmpty()
+                && !Double.isNaN(lat) && lat >= -90 && lat <= 90
+                && !Double.isNaN(lng) && lng >= -180 && lng <= 180
+                && !Double.isNaN(radius) && !Double.isInfinite(radius) && radius > 0;
+    }
+
+    /**
      * A stable fingerprint of a place list.
      *
      * Includes name and icon, not just geometry. The JS-side signature
@@ -116,15 +131,39 @@ final class GeofenceArmer {
     }
 
     /**
+     * Told once the outcome is known (4.11.1). Callers used to record the
+     * list as applied the moment they had ASKED Play Services to register
+     * it, so a registration that failed was never retried: the next
+     * reconcile saw an identical list and skipped it.
+     *
+     * `accepted` is true when Play Services took the fences, and also when
+     * there were none to register or no location permission to register
+     * them with. Both of those are settled until something changes, and each
+     * change has its own way back in (a new list; reconcileSetup re-arming
+     * on a grant). It is false only when the registration was refused or
+     * threw, which is the case worth retrying.
+     *
+     * Runs on the caller's thread for the immediate outcomes and on the main
+     * thread for Play Services' answer.
+     */
+    interface Done {
+        void settled(Result result, boolean accepted);
+    }
+
+    static Result arm(Context context, List<PrefsStore.Place> places, String why) {
+        return arm(context, places, why, null);
+    }
+
+    /**
      * Register every place in one shot, and prune anything absent.
      *
-     * Synchronous as far as the caller is concerned: Play Services'
-     * addGeofences is async, so `armed` is what we ASKED to arm. The
-     * journal line is written from the callback with the real outcome.
+     * Play Services' addGeofences is async, so the returned `armed` is what
+     * we ASKED to arm; `done`, if given, hears the real outcome. The journal
+     * line is written from the callback.
      *
      * @param places the COMPLETE current list — see the class comment.
      */
-    static Result arm(Context context, List<PrefsStore.Place> places, String why) {
+    static Result arm(Context context, List<PrefsStore.Place> places, String why, Done done) {
         final Context ctx = context.getApplicationContext();
         final PrefsStore prefs = new PrefsStore(ctx);
 
@@ -132,6 +171,8 @@ final class GeofenceArmer {
         Set<String> wanted = new HashSet<>();
         int stored = 0;
 
+        // Callers validate the whole list before calling (4.11.1): a row
+        // skipped here would read as a deletion and be pruned.
         for (PrefsStore.Place p : places) {
             if (p == null || p.id == null || p.name == null) continue;
             wanted.add(p.id);
@@ -181,8 +222,15 @@ final class GeofenceArmer {
                 prefs.removePlace(id);
                 prefs.removeInsidePlace(id);
             }
+            final int deadCount = dead.size();
             try {
-                LocationServices.getGeofencingClient(ctx).removeGeofences(dead);
+                // The metadata is already gone, so a removal that fails
+                // cannot be found again by this scan; at least say so. An
+                // orphaned fence that fires is skipped by GeofenceReceiver
+                // (no metadata), so it can announce nothing.
+                LocationServices.getGeofencingClient(ctx).removeGeofences(dead)
+                        .addOnFailureListener(e -> prefs.journal("geo: prune of " + deadCount
+                                + " place(s) FAILED in Play Services (" + why + ") — " + e.getMessage()));
             } catch (Exception e) {
                 Log.w(TAG, "removeGeofences(dead) failed", e);
             }
@@ -190,16 +238,21 @@ final class GeofenceArmer {
         }
 
         if (fences.isEmpty()) {
-            return new Result(0, stored, dead.size(), false);
+            Result r = new Result(0, stored, dead.size(), false);
+            if (done != null) done.settled(r, true);
+            return r;
         }
         if (!haveFineLocation(ctx)) {
             prefs.journal("geo: " + stored + " place(s) stored but NOT armed (no location permission)");
-            return new Result(0, stored, dead.size(), true);
+            Result r = new Result(0, stored, dead.size(), true);
+            if (done != null) done.settled(r, true);
+            return r;
         }
 
         final int n = fences.size();
         final int prunedCount = dead.size();
         final boolean bg = haveBackgroundLocation(ctx);
+        final Result asked = new Result(n, stored, prunedCount, false);
         GeofencingRequest req = new GeofencingRequest.Builder()
                 // 0 = don't fire on initial state (e.g. already-inside)
                 .setInitialTrigger(0)
@@ -208,18 +261,23 @@ final class GeofenceArmer {
         try {
             LocationServices.getGeofencingClient(ctx)
                     .addGeofences(req, pendingIntent(ctx))
-                    .addOnSuccessListener(unused -> prefs.journal(
-                            "geo: armed " + n + " fence(s) (" + why + ")"
-                                    + (bg ? "" : " (foreground only — no background permission)")))
+                    .addOnSuccessListener(unused -> {
+                        prefs.journal("geo: armed " + n + " fence(s) (" + why + ")"
+                                + (bg ? "" : " (foreground only — no background permission)"));
+                        if (done != null) done.settled(asked, true);
+                    })
                     .addOnFailureListener(e -> {
                         Log.w(TAG, "arm failed (" + why + ")", e);
                         prefs.journal("geo: ARM FAILED (" + n + " fence(s), " + why + ") — " + e.getMessage());
+                        if (done != null) done.settled(asked, false);
                     });
         } catch (SecurityException e) {
             Log.w(TAG, "arm threw SecurityException", e);
             prefs.journal("geo: ARM FAILED (" + why + ") — " + e.getMessage());
-            return new Result(0, stored, prunedCount, true);
+            Result r = new Result(0, stored, prunedCount, true);
+            if (done != null) done.settled(r, false);
+            return r;
         }
-        return new Result(n, stored, prunedCount, false);
+        return asked;
     }
 }

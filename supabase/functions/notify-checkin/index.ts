@@ -72,9 +72,10 @@ const RELAY_BATCH = 20;   // relay's per-call token cap
  * because most owners will never run the command — and a check that is off
  * for most deployments is not a check.
  *
- * `null` = looked up, no secret there, which is the expand case: a function
- * deployed against a database that has not run the v14 migration keeps
- * working exactly as it did before.
+ * `null` = no roamkeep_secrets TABLE at all, which is the expand case: a
+ * function deployed against a database that has not run the v14 migration
+ * keeps working exactly as it did before. A table without a usable secret
+ * in it is not that case (v18, below).
  *
  * FAILS CLOSED. Until 4.9.0 a lookup that ERRORED was also cached as null,
  * for the life of the isolate — so one database blip during a cold start
@@ -100,7 +101,15 @@ async function webhookSecret(sb: ReturnType<typeof createClient>): Promise<strin
     }
     throw new Error(`webhook secret lookup failed: ${error.code || error.message}`);
   }
-  const value = (data as { webhook_secret?: string } | null)?.webhook_secret ?? null;
+  // v18: the table is there, so the secret must be too. No row, NULL or an
+  // empty string used to mean "no secret" and switched the check off, which
+  // only a missing TABLE may do: schema.sql seeds the row and no client can
+  // delete it, so its absence is damage, not an old database. Same answer
+  // as a failed lookup: 503, not cached.
+  const value = (data as { webhook_secret?: unknown } | null)?.webhook_secret;
+  if (typeof value !== 'string' || value.length === 0) {
+    throw new Error('webhook secret lookup failed: no secret in roamkeep_secrets');
+  }
   cachedSecret = { value, at: Date.now() };
   return value;
 }

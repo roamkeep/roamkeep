@@ -94,8 +94,9 @@ const RELAY_BATCH = 20;   // relay's per-call token cap
  * and this function reads the same row with the service-role key — so there
  * is nothing for an owner to configure and no way for the two to drift.
  *
- * `null` = no secret there, which leaves the check open so a function
- * deployed ahead of the v14 migration keeps working.
+ * `null` = no roamkeep_secrets TABLE, which leaves the check open so a
+ * function deployed ahead of the v14 migration keeps working. A table
+ * without a usable secret in it fails closed (v18, below).
  *
  * Fails CLOSED on any other lookup error (503, not cached), and expires after
  * SECRET_TTL_MS so a rotated secret is picked up — see notify-checkin, where
@@ -114,7 +115,15 @@ async function webhookSecret(sb: ReturnType<typeof createClient>): Promise<strin
     }
     throw new Error(`webhook secret lookup failed: ${error.code || error.message}`);
   }
-  const value = (data as { webhook_secret?: string } | null)?.webhook_secret ?? null;
+  // v18: the table is there, so the secret must be too. No row, NULL or an
+  // empty string used to mean "no secret" and switched the check off, which
+  // only a missing TABLE may do: schema.sql seeds the row and no client can
+  // delete it, so its absence is damage, not an old database. Same answer
+  // as a failed lookup: 503, not cached.
+  const value = (data as { webhook_secret?: unknown } | null)?.webhook_secret;
+  if (typeof value !== 'string' || value.length === 0) {
+    throw new Error('webhook secret lookup failed: no secret in roamkeep_secrets');
+  }
   cachedSecret = { value, at: Date.now() };
   return value;
 }

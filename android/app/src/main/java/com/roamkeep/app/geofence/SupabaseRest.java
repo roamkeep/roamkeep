@@ -112,9 +112,18 @@ public class SupabaseRest {
      * PATCH /rest/v1/keep_members?id=eq.<memberId> with the given body.
      */
     public boolean updateMember(String memberId, JSONObject body) {
-        String path = "/rest/v1/keep_members?id=eq." + memberId;
+        // Encoded like every other filter value (4.11.1). The id is checked to
+        // be a UUID where it enters (NativeGeofencePlugin.initialize); this is
+        // the second fence, so a stored value can never add a filter clause.
+        String path = "/rest/v1/keep_members?id=eq." + enc(memberId);
         int status = doJsonWithRefresh("PATCH", path, body.toString(), "return=minimal");
         return status >= 200 && status < 300;
+    }
+
+    /** Run the family's 7-day retention (prune_keep_history, v16+). Returns
+     *  the raw HTTP status. See LocationUpdateReceiver.maybePruneHistory. */
+    public int pruneKeepHistory() {
+        return doJsonWithRefresh("POST", "/rest/v1/rpc/prune_keep_history", "{}", "return=minimal");
     }
 
     /**
@@ -173,6 +182,40 @@ public class SupabaseRest {
     static String enc(String s) {
         try { return URLEncoder.encode(s == null ? "" : s, StandardCharsets.UTF_8.name()); }
         catch (Exception e) { return ""; }
+    }
+
+    /**
+     * Whether a family server address is safe to store and send credentials
+     * to: https with a host, and no user-info, query or fragment (4.11.1). A
+     * path is allowed, for a self-hosted server behind a proxy; requests are
+     * built as the address plus "/rest/v1/...", so a path cannot move them
+     * to another host.
+     *
+     * The web layer is trusted to pass the address the person approved, and
+     * normally does. This is for when it does not: everything this class
+     * sends carries the session's bearer token, so the address it is handed
+     * is checked here as well as in the app. Pure, for NativeInputTest.
+     */
+    static boolean isHttpsServerUrl(String url) {
+        if (url == null) return false;
+        try {
+            java.net.URI u = new java.net.URI(url);
+            return "https".equals(u.getScheme())
+                    && u.getHost() != null && !u.getHost().isEmpty()
+                    && u.getRawUserInfo() == null
+                    && u.getRawQuery() == null
+                    && u.getRawFragment() == null;
+        } catch (java.net.URISyntaxException e) {
+            return false;
+        }
+    }
+
+    private static final java.util.regex.Pattern UUID_RE = java.util.regex.Pattern.compile(
+            "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$");
+
+    /** Whether an id is a UUID, the only shape a row id here ever has. */
+    static boolean isUuid(String s) {
+        return s != null && UUID_RE.matcher(s).matches();
     }
 
     /** Current battery percentage (0–100), or -1 if unavailable. Cheap
@@ -268,7 +311,7 @@ public class SupabaseRest {
             }
             int code = conn.getResponseCode();
             if (code < 200 || code >= 300) {
-                Log.w(TAG, "GET " + path + " → " + code);
+                Log.w(TAG, "GET " + logPath(path) + " → " + code);
                 return new GetResult(code, null);
             }
             try (BufferedReader r = new BufferedReader(new InputStreamReader(
@@ -279,7 +322,7 @@ public class SupabaseRest {
                 return new GetResult(code, sb.toString());
             }
         } catch (IOException e) {
-            Log.w(TAG, "GET " + path + " IO error: " + e.getMessage());
+            Log.w(TAG, "GET " + logPath(path) + " IO error: " + e.getClass().getSimpleName());
             return new GetResult(-1, null);
         } finally {
             if (conn != null) conn.disconnect();
@@ -312,8 +355,17 @@ public class SupabaseRest {
             if (status >= 200 && status < 300) prefs.resetRejectStreak();
             else if (status == 403 && RLS_DENIED.equals(lastSqlState)) prefs.bumpRejectStreak();
         }
-        if (status < 200 || status >= 300) Log.w(TAG, method + " " + path + " → " + status);
+        if (status < 200 || status >= 300) Log.w(TAG, method + " " + logPath(path) + " → " + status);
         return status;
+    }
+
+    /** A request path for logcat, without its query (4.11.1). The query
+     *  carries member and keep ids and time windows; the table and the
+     *  status say what went wrong without them. */
+    static String logPath(String path) {
+        if (path == null) return "";
+        int q = path.indexOf('?');
+        return q < 0 ? path : path.substring(0, q);
     }
 
     /**
@@ -367,7 +419,7 @@ public class SupabaseRest {
             }
             return code;
         } catch (IOException e) {
-            Log.w(TAG, method + " " + path + " IO error: " + e.getMessage());
+            Log.w(TAG, method + " " + logPath(path) + " IO error: " + e.getClass().getSimpleName());
             return -1;
         } finally {
             if (conn != null) conn.disconnect();
@@ -478,7 +530,7 @@ public class SupabaseRest {
         String url = prefs.getSupabaseUrl();
         String ref = extractProjectRef(url);
         if (ref == null) {
-            Log.w(TAG, "mirror skipped: can't derive project ref from " + url);
+            Log.w(TAG, "mirror skipped: can't derive a project ref from the stored URL");
             return;
         }
         String key = "sb-" + ref + "-auth-token";
@@ -512,7 +564,7 @@ public class SupabaseRest {
             target.put("token_type", "bearer");
             cap.edit().putString(key, root.toString()).apply();
         } catch (JSONException e) {
-            Log.w(TAG, "mirror parse failed: " + e.getMessage());
+            Log.w(TAG, "mirror parse failed");   // not the message: it can quote the session
         }
     }
 

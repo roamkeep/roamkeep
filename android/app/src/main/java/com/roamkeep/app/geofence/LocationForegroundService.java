@@ -301,6 +301,75 @@ public class LocationForegroundService extends Service {
                 new Intent(ctx.getApplicationContext(), LocationForegroundService.class));
     }
 
+    // ── No recording without the notification (4.11.1) ────────────────
+    //
+    // The privacy page promises a notification "whenever it is recording
+    // your location". Until 4.11.1 that held only while nothing went wrong:
+    // with the app's notifications turned off, or this channel blocked, the
+    // service ran and recorded with nothing on screen, and a start Android
+    // refused to promote carried on as an ordinary service. For an app that
+    // records where someone is, a notification that can be switched off
+    // while recording carries on is the difference between sharing and
+    // covert tracking. So the notification is a precondition, not a
+    // courtesy: every path that records asks canDisclose() first, and when
+    // the answer is no, sharing stops (owner decision 2026-10-09). The
+    // family is told once, through this member's status, and the app tells
+    // the person why when it is next opened.
+
+    /** What a stopped member's status says, shared with app.js
+     *  (STATUS_NOTIFICATIONS_OFF). */
+    static final String STATUS_NOTIFICATIONS_OFF = "🔕 Not sharing: notifications are off";
+    static final String STATUS_DEFAULT = "📍 Location sharing on";
+
+    /** Whether the tracking notification can be shown right now. */
+    static boolean canDisclose(Context ctx) {
+        boolean appEnabled = NotificationManagerCompat.from(ctx).areNotificationsEnabled();
+        int importance = -1;   // no channel yet: it is created at start, at LOW
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            NotificationManager nm = (NotificationManager) ctx.getSystemService(Context.NOTIFICATION_SERVICE);
+            NotificationChannel ch = nm == null ? null : nm.getNotificationChannel(CHANNEL_ID);
+            if (ch != null) importance = ch.getImportance();
+        }
+        return disclosureAllowed(appEnabled, importance);
+    }
+
+    /** Pure, for DisclosureGateTest. The app's notifications must be on,
+     *  and the tracking channel not blocked (IMPORTANCE_NONE, which is 0).
+     *  -1 means no channel exists yet. */
+    static boolean disclosureAllowed(boolean appEnabled, int channelImportance) {
+        return appEnabled && channelImportance != NotificationManager.IMPORTANCE_NONE;
+    }
+
+    /**
+     * Stop sharing because the notification cannot be shown. Safe to call
+     * from any thread and any number of times: the journal line and the
+     * status the family sees are written once per stop, not per call.
+     */
+    static void stopForDisclosure(Context context, String why) {
+        final Context ctx = context.getApplicationContext();
+        final PrefsStore prefs = new PrefsStore(ctx);
+        if (prefs.markSharingStopped()) {
+            prefs.journal("sharing: STOPPED, the tracking notification can't be shown ("
+                    + why + "); nothing is recorded until it can");
+            postStatus(ctx, prefs, STATUS_NOTIFICATIONS_OFF);
+        }
+        stop(ctx);
+    }
+
+    /** Best effort, off the calling thread (onStartCommand is on main). */
+    private static void postStatus(Context ctx, PrefsStore prefs, String status) {
+        if (!prefs.hasContext()) return;
+        new Thread(() -> {
+            try {
+                org.json.JSONObject upd = new org.json.JSONObject();
+                upd.put("status", status);
+                new SupabaseRest(ctx).updateMember(prefs.getMemberId(), upd);
+            } catch (Exception e) {
+                Log.w(TAG, "status update failed", e);
+            }
+        }, "RoamkeepStatus").start();
+    }
+
     @Override
     public void onCreate() {
         super.onCreate();
@@ -441,6 +510,27 @@ public class LocationForegroundService extends Service {
             stopForeground(true);
             stopSelf();
             return START_NOT_STICKY;
+        }
+
+        // 4.11.1: no notification, no recording (see canDisclose). A start
+        // Android would not promote used to carry on as an ordinary service,
+        // recording with nothing on screen. The next app open, boot or
+        // geofence kick starts it again, promoted.
+        if (!promoted) {
+            gate.journal("fgs: stopped, not foreground so no notification (" + why + "); nothing recorded");
+            stopSelf();
+            return START_NOT_STICKY;
+        }
+        if (!canDisclose(this)) {
+            stopForDisclosure(this, "service start: " + why);
+            stopForeground(true);
+            stopSelf();
+            return START_NOT_STICKY;
+        }
+        // Back after a stop: say so, once, and put the family's view back.
+        if (gate.clearSharingStopped()) {
+            gate.journal("sharing: resumed, the tracking notification is showing again");
+            postStatus(this, gate, STATUS_DEFAULT);
         }
 
         // Cancel any leftover PendingIntent-based request from a previous

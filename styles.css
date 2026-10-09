@@ -892,6 +892,14 @@ input[type=range]::-moz-range-thumb {
   padding: 9px 13px; font-size: 12.5px; line-height: 1.45;
   text-align: center; flex-shrink: 0;
 }
+/* Sharing stopped for want of a notification (4.11.1). A button, because
+   tapping it is the fix; styled as the strip above, in the SOS colours so
+   it reads as "this is not working", not as advice. */
+.disclosure-banner {
+  width: 100%; border: 0; border-bottom: 1px solid var(--sos-soft);
+  background: var(--sos-soft); color: var(--sos-2);
+  font: inherit; font-size: 12.5px; font-weight: 600; cursor: pointer;
+}
 
 /* The outdated-database screen reuses .card, so the error glyph needs
    centring that #s-err (which is not in a card) gets from its own rules. */

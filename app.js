@@ -44,12 +44,14 @@
   // member is then asked again on next open, which is what makes the
   // published "changes will be noted in the app's release notes" line
   // honest rather than a formality. Do not bump it for a typo.
-  const TERMS_VERSION = 2;
-  const TERMS_DATE = '3 October 2026';        // matches landing/terms
+  // 3 (4.11.1): leaving now deletes your account, and sharing stops while
+  // notifications are off; both change what someone is agreeing to.
+  const TERMS_VERSION = 3;
+  const TERMS_DATE = '9 October 2026';        // matches landing/terms
   // Tracked separately because the two documents move independently — v14
   // changed only the privacy policy, and showing one date for both on the
   // very screen asking people to agree again would be its own small lie.
-  const PRIVACY_DATE = '6 October 2026';      // matches landing/privacy
+  const PRIVACY_DATE = '9 October 2026';      // matches landing/privacy
   const TERMS_URL = 'https://get.roamkeep.app/terms';
   const PRIVACY_URL = 'https://get.roamkeep.app/privacy';
   const TERMS_STORE_KEY = 'rk_terms';
@@ -63,6 +65,10 @@
   // never carried one.
   const STATUS_DEFAULT = '📍 Location sharing on';
   const STATUS_DISCONNECTED = '🔌 Disconnected this device';
+  // 4.11.1: written by the native side when it stops sharing because the
+  // tracking notification cannot be shown (LocationForegroundService
+  // .STATUS_NOTIFICATIONS_OFF; keep the two identical).
+  const STATUS_NOTIFICATIONS_OFF = '🔕 Not sharing: notifications are off';
 
   // Assigned once a backend is resolved; every consumer reads these.
   let SB_URL = '';
@@ -116,6 +122,12 @@
   // owner) or "ask an owner" (everyone else) — never an error.
   const SCHEMA_WITH_V17_ACCOUNTS = 17;
 
+  // v18: leaving deletes you. Leave, an owner's Remove and a completed child
+  // request all delete the sign-in too, so the screens say so. On 17 the
+  // app says what that server does: Remove leaves the sign-in, and adults
+  // leave through delete_my_account.
+  const SCHEMA_WITH_LEAVE_DELETES = 18;
+
   // What to assume when roamkeep_meta / roamkeep_schema_version() is
   // absent. Every database provisioned before v12 is at 11 (the last
   // migration before the marker existed), so absence is a KNOWN version,
@@ -127,7 +139,7 @@
   // which provision.js carries (cli/test.mjs checks the two agree). Not a
   // requirement — NEEDS_SCHEMA is that — but what Settings measures a
   // family's server against when it offers an owner the update.
-  const SHIPPED_SCHEMA = 17;
+  const SHIPPED_SCHEMA = 18;
 
   // 4.7.0 shipped this equal to SCHEMA_PRE_META, so the gate was INERT on
   // arrival — a gate that demanded its own migration would have locked
@@ -300,6 +312,16 @@
   //
   // Also accepts the custom scheme (com.roamkeep.app://s#...) and a bare
   // fragment pasted on its own.
+  //
+  // 4.11.1: checked properly, not just "starts with https". A version this
+  // build does not know is refused rather than guessed at. The server must
+  // be an https address with a host and no user-info, query or fragment
+  // (a path is allowed, for a self-hosted server behind a proxy). The key
+  // must be present, bounded, and NOT a key that bypasses row-level
+  // security: a secret key or a service_role JWT pasted into a setup link
+  // by mistake would hand every holder of it the whole database. The same
+  // rules hold in cli/src/link.js and tools/setup-link.js; cli/test.mjs
+  // runs all three.
   function parseSetupLink(text) {
     if (!text) return null;
     const s = String(text).trim();
@@ -307,16 +329,38 @@
     const frag = hash >= 0 ? s.slice(hash + 1) : s;
     let p;
     try { p = new URLSearchParams(frag); } catch (_) { return null; }
-    const u = p.get('u'), k = p.get('k');
-    if (!u || !k) return null;
+    const v = p.get('v');
+    if (v !== null && v !== '1') return null;
+    const u = p.get('u');
+    const k = (p.get('k') || '').trim();
+    if (!u || !k || k.length > 4096 || privilegedKey(k)) return null;
     let url;
     try {
       // base64url → the project URL. Tolerate a plain URL too, so a
       // hand-written link is not a silent failure.
       url = /^https?:\/\//i.test(u) ? u : atob(u.replace(/-/g, '+').replace(/_/g, '/'));
     } catch (_) { return null; }
-    if (!/^https:\/\/[^\s]+$/i.test(url)) return null;
-    return { url: url.replace(/\/+$/, ''), anonKey: k.trim(), code: p.get('c') || null };
+    let at;
+    try { at = new URL(url); } catch (_) { return null; }
+    if (at.protocol !== 'https:' || !at.hostname || at.username || at.password
+        || at.search || at.hash) return null;
+    const code = p.get('c');
+    if (code !== null && !/^[A-Za-z0-9-]{1,64}$/.test(code)) return null;
+    return { url: (at.origin + at.pathname).replace(/\/+$/, ''), anonKey: k, code: code || null };
+  }
+
+  // A key that bypasses row-level security: a Supabase secret key, or a
+  // legacy JWT whose role is service_role. Never connected with, never
+  // handed out.
+  function privilegedKey(k) {
+    if (/^sb_secret_/i.test(k)) return true;
+    const parts = String(k).split('.');
+    if (parts.length !== 3) return false;
+    try {
+      const b64 = parts[1].replace(/-/g, '+').replace(/_/g, '/');
+      const claims = JSON.parse(atob(b64 + '='.repeat((4 - (b64.length % 4)) % 4)));
+      return !!claims && claims.role === 'service_role';
+    } catch (_) { return false; }
   }
 
   // Inverse of parseSetupLink — used by the invite share sheet.
@@ -515,16 +559,17 @@
     if (code.includes('last_owner')) return 'A Keep needs at least one owner. Make someone else an owner first.';
     if (code.includes('owner_must_be_adult')) return 'An owner must be an adult. Remove their owner role first.';
     if (code.includes('child_cannot_pause')) return 'Children can’t pause their own location.';
-    if (code.includes('cannot_remove_self')) return 'You can’t remove yourself here. Use Leave this Keep in Settings.';
+    if (code.includes('cannot_remove_self')) return 'You can’t remove yourself here. Use ' + leaveLabel() + ' in Settings.';
+    if (code.includes('child_cannot_be_owner')) return 'A child can’t be an owner. Mark them as an adult first.';
     if (code.includes('child_cannot_leave')) return 'Children can’t leave a Keep on their own. Ask an adult in your family.';
     if (code.includes('invalid_pause')) return 'Pick a pause length up to 24 hours.';
     if (code.includes('protected_column')) return 'That change has to go through the family controls.';
     if (code.includes('recent_reset')) return 'Your password was reset with a code in the last day, so this account can’t be deleted until a day has passed. If you didn’t reset it, talk to your family’s owners.';
-    if (code.includes('child_cannot_delete')) return 'Children can’t delete their own account. Ask an owner to (Settings → Delete my account).';
+    if (code.includes('child_cannot_delete')) return 'Children can’t delete their own account. Ask an owner to (Settings → ' + leaveLabel() + ').';
     if (code.includes('not_child')) return 'Only a child’s account can be deleted by an owner. An adult deletes their own.';
     if (code.includes('member_elsewhere')) return 'That account is in another Keep too, so it can’t be deleted from here.';
     if (code.includes('family_exists')) return 'This family server already has a family on it. Ask one of its owners for an invite, or tap Use a different family server to set up your own.';
-    if (code.includes('already_member')) return 'This account is already in a Keep. Leave it first (Settings → Leave this Keep), or sign up with a different email.';
+    if (code.includes('already_member')) return 'This account is already in a Keep. Leave it first (Settings → ' + leaveLabel() + '), or sign up with a different email.';
     if (code.includes('too_many_places')) return 'This Keep already has the maximum of 90 places. Delete one before adding another.';
     if (code.includes('cannot_reset_owner')) return 'Owners can’t be given a reset code. An owner resets their password with the Supabase account that holds your family’s server (sign-in screen → Forgot password?).';
     if (code.includes('cannot_reset_self')) return 'Change your own password in Settings.';
@@ -760,7 +805,44 @@
     // disconnecting an old phone after moving to a new one) logged the
     // person's OTHER devices out too, and their native tracking stopped
     // within the hour with no screen to say why.
-    await S.sb.auth.signOut({ scope: 'local' });
+    const offline = !(await signOutHere());
+    if (offline) {
+      // No SIGNED_OUT event comes from a sign-out the server never heard,
+      // and supabase-js still holds the session in memory. A reload starts
+      // clean from the storage signOutHere has just emptied.
+      location.reload();
+    }
+  }
+
+  // 4.11.1: sign out on THIS device, and make sure the session is gone from
+  // it whether or not the server heard. supabase-js returns early, before
+  // clearing anything, when its logout request fails on the network, and it
+  // resolves rather than throws, so "Sign out" and "Disconnect" made offline
+  // left a working session in storage that the next start picked up again.
+  // Its keys are removed here directly, after it has had its chance.
+  // @returns true if the server confirmed the sign-out.
+  async function signOutHere() {
+    let res = null;
+    try { res = S.sb ? await S.sb.auth.signOut({ scope: 'local' }) : null; }
+    catch (e) { res = { error: e }; }
+    let key = null;
+    try { key = S.sb && S.sb.auth && S.sb.auth.storageKey; } catch (_) {}
+    if (!key && SB_URL) {
+      const ref = /^https:\/\/([^./]+)\./.exec(SB_URL);
+      if (ref) key = 'sb-' + ref[1] + '-auth-token';
+    }
+    if (key) {
+      const store = buildAuthStorage();
+      for (const k of [key, key + '-code-verifier', key + '-user']) {
+        try { await store.removeItem(k); } catch (_) {}
+        try { window.localStorage && window.localStorage.removeItem(k); } catch (_) {}
+      }
+    }
+    if (res && res.error) {
+      console.warn('sign-out not confirmed by the server; this device is signed out anyway', res.error);
+      return false;
+    }
+    return true;
   }
 
   // ── AVATAR PICKER ──────────────────────────────────────────────
@@ -1015,10 +1097,11 @@
         lng: p.lng,
         radius: p.radius_m
       });
-      // Caller has already folded p into S.places, so the OS and S.places
-      // now agree — record that, or the next resume would re-arm the
-      // whole set for a change we just applied one fence at a time.
-      _armedSig = placesSignature();
+      // 4.11.1: no longer stamps _armedSig. It used to record the WHOLE of
+      // S.places as armed after one fence, which certified any other
+      // change that had reached S.places meanwhile, including one whose
+      // own delta failed. The next resume now re-arms the full list once,
+      // which is the path that proves it.
     } catch (e) { console.warn('NG.addGeofence', e); }
   }
 
@@ -1041,7 +1124,7 @@
     if (!NG || !id) return;
     try {
       await NG.removeGeofence({ id });
-      _armedSig = placesSignature();
+      // No _armedSig stamp, for the reason in syncNativeAddPlace.
     } catch (e) { console.warn('NG.removeGeofence', e); }
   }
 
@@ -1327,6 +1410,9 @@
     // — popping the disclosure sheet on a fully granted device and gating
     // its permission requests for the rest of the session.
     const _st0 = isNative() ? await setupStatus() : null;
+    // 4.11.1: before startGPS below, so the app's own location writes are
+    // stopped from the first fix when notifications are off.
+    if (_st0) await applyDisclosureState(_st0);
     if (_st0 && !_st0.fineLocation) {
       _disclosurePending = true;
       await openSetup();
@@ -1360,6 +1446,7 @@
       try {
         const st = await setupStatus();
         _hadBackgroundLocation = st ? !!st.backgroundLocation : null;
+        if (st) await applyDisclosureState(st);
         if (await setupIncomplete()) await openSetup();
       } finally {
         // The last moment launch may open a sheet. Anything that wants to
@@ -1484,12 +1571,14 @@
     // while backgrounded, or a resume triggered on another device).
     reconcileMyPause();
 
+    // Whether THIS refetch read the place list; the re-arm below keys on it.
+    let placesOk = false;
     try {
       // Same ordering constraint as launch — loadPlaces reads S.members.
       // Promise.all raced them, so on resume insidePlaces could be seeded
       // from a member row that had not arrived yet.
       await loadTwice(loadMembers);
-      await Promise.all([loadTwice(loadCheckins), loadTwice(loadPlaces)]);
+      [, placesOk] = await Promise.all([loadTwice(loadCheckins), loadTwice(loadPlaces)]);
       // Realtime is dropped while backgrounded, so a preference changed
       // on this person's other device only arrives via this refetch.
       await loadNotifyPrefs();
@@ -1516,7 +1605,15 @@
     // _armedSig === null means we have never armed — which includes the
     // device that had no places at all at launch, so the FIRST place the
     // family ever creates has to arm from here too.
-    if (isNative() && (S.places || []).length && !isPausedRow(myMember())) {
+    //
+    // 4.11.1: keyed on THIS refetch succeeding, not on the list being
+    // non-empty. The old length guard skipped exactly the case the prune
+    // exists for: the family's last place deleted while this phone was in
+    // the background, which then kept its fence and went on filing
+    // check-ins for a place that no longer existed. And a refetch that
+    // FAILED left an older S.places behind, which must not be armed as if
+    // it were current.
+    if (isNative() && placesOk && !isPausedRow(myMember())) {
       if (placesSignature() !== _armedSig) {
         await rearmGeofencesFromPlaces('places changed while backgrounded', true);
       }
@@ -1637,6 +1734,11 @@
       .eq('keep_id', S.keepId).order('created_at');
     if (error) { console.warn('loadPlaces', error); return false; }
     S.places = data || [];
+    // 4.11.1: this session has read the authoritative list at least once,
+    // so an empty S.places means "the family has no places" and must reach
+    // the native side, rather than "not loaded yet" (see
+    // rearmGeofencesFromPlaces).
+    S._placesLoaded = true;
     // Seed insidePlaces from the current member row so reopening
     // the app after being inside a place doesn't re-fire 'arrived'.
     const me = S.members.find(m => m.id === S.myId);
@@ -2881,6 +2983,9 @@
     // (e.g. it was armed before the pause), write nothing. No pin push,
     // no breadcrumb, no geofence transition — the pause means dark.
     if (isPausedRow(myMember())) return;
+    // 4.11.1: the same while sharing is stopped because the tracking
+    // notification cannot be shown (see applyDisclosureState).
+    if (S._sharingStopped) return;
     const when = (typeof whenMs === 'number' && whenMs > 0) ? whenMs : Date.now();
     const whenIso = new Date(when).toISOString();
     const now = Date.now();
@@ -3060,7 +3165,7 @@
       if (inside && !was) {
         S.insidePlaces.add(p.id);
         if (nativeActive) continue;
-        await S.sb.from('checkins').insert({
+        const { error } = await S.sb.from('checkins').insert({
           keep_id: S.keepId,
           member_id: S.myId,
           member_name: myName,
@@ -3073,12 +3178,17 @@
           place_id: p.id,
           created_at: ts
         });
+        // 4.11.1: postgrest-js resolves { error } rather than throwing, so a
+        // failed arrival used to be marked as handled and was never filed:
+        // nothing re-sends it until the person leaves and comes back. Undo
+        // the state instead, and the next fix tries again.
+        if (error) { console.warn('arrival not filed', error); S.insidePlaces.delete(p.id); continue; }
         await S.sb.from('keep_members').update({ last_place_id: p.id })
           .eq('id', S.myId);
       } else if (!inside && was) {
         S.insidePlaces.delete(p.id);
         if (nativeActive) continue;
-        await S.sb.from('checkins').insert({
+        const { error } = await S.sb.from('checkins').insert({
           keep_id: S.keepId,
           member_id: S.myId,
           member_name: myName,
@@ -3088,6 +3198,7 @@
           place_id: p.id,
           created_at: ts
         });
+        if (error) { console.warn('departure not filed', error); S.insidePlaces.add(p.id); continue; }
         // Clear last_place_id only if this was the one they were in.
         if (me && me.last_place_id === p.id) {
           await S.sb.from('keep_members').update({ last_place_id: null })
@@ -3919,11 +4030,15 @@
             dataset: { action: 'set-member-type', id: m.id, type: m.member_type === 'child' ? 'adult' : 'child' },
             text: m.member_type === 'child' ? 'Mark adult' : 'Mark child'
           }),
-          el('button', {
-            class: 'mc-act',
-            dataset: { action: 'set-member-role', id: m.id, role: m.role === 'owner' ? 'member' : 'owner' },
-            text: m.role === 'owner' ? 'Remove owner' : 'Make owner'
-          }),
+          // Not offered for a child (4.11.1): an owner must be an adult, and
+          // from v18 the server refuses it (child_cannot_be_owner).
+          (m.role === 'owner' || m.member_type !== 'child')
+            ? el('button', {
+                class: 'mc-act',
+                dataset: { action: 'set-member-role', id: m.id, role: m.role === 'owner' ? 'member' : 'owner' },
+                text: m.role === 'owner' ? 'Remove owner' : 'Make owner'
+              })
+            : null,
           // v17. Never on another owner's row: a code goes to whoever makes
           // it, so it would hand one owner another's account (the server
           // refuses it too — cannot_reset_owner).
@@ -3937,7 +4052,12 @@
           }),
           // v17. A child's account is the family's to manage, asked or not;
           // never an adult's (delete_child_account refuses: not_child).
-          (S.schemaVersion >= SCHEMA_WITH_V17_ACCOUNTS && m.member_type === 'child')
+          // 4.11.1: not from v18, where Remove deletes the account itself
+          // ("leaving deletes you"); two buttons doing one thing only asked
+          // which was worse. A child's own request still has its button in
+          // the requests list.
+          (S.schemaVersion >= SCHEMA_WITH_V17_ACCOUNTS && S.schemaVersion < SCHEMA_WITH_LEAVE_DELETES
+            && m.member_type === 'child')
             ? el('button', { class: 'mc-act danger', dataset: { action: 'delete-child', id: m.id }, text: 'Delete account' })
             : null
         ]);
@@ -4764,7 +4884,12 @@
     const msg = $('sos-msg');
     if (msg) {
       msg.textContent =
-          state === 'sent'    ? '🆘 ALERT SENT. Your family has been notified!'
+          // 4.11.1: "sent", not "notified". What this app can know is that
+          // the alert reached the family's server; the push to each phone
+          // is best effort, and a phone that is off or has notifications
+          // off shows it only when opened.
+          state === 'sent'    ? '🆘 ALERT SENT to your family. Their phones are being alerted. '
+                                + 'In an emergency, also call your local emergency number.'
         : state === 'sending' ? '🆘 Sending alert…'
         : state === 'failed'  ? '⚠️ ALERT NOT SENT YET. Can’t reach your family’s server. '
                                 + 'Retrying automatically. In an emergency, call your local emergency number.'
@@ -4987,9 +5112,13 @@
       action: 'setup-fix-battery', cta: 'Allow'
     },
     {
-      key: 'notifications', required: false, icon: '🔔',
+      // 4.11.1: required. Roamkeep shows a notification whenever it shares
+      // your location, and stops sharing if it can't (see
+      // applyDisclosureState). This also answers for a blocked tracking
+      // channel, not only Android 13's permission.
+      key: 'notifications', required: true, icon: '🔔',
       title: 'Notifications',
-      why: 'Needed for arrive/leave alerts and SOS to reach you.',
+      why: 'Roamkeep always shows a notification while it shares your location. With notifications off, sharing stops. Also how arrive/leave alerts and SOS reach you.',
       action: 'setup-fix-notifications', cta: 'Allow'
     }
   ];
@@ -5033,9 +5162,14 @@
     const places = S.places || [];
     // An empty list is not the same as nothing to do: armPlaces prunes
     // whatever the native side still holds, so "the family deleted every
-    // place" has to reach it. Only skip when there is nothing to prune
-    // either — i.e. we have never armed.
-    if (!places.length && _armedSig === null) return 0;
+    // place" has to reach it.
+    //
+    // 4.11.1: skip an empty list only while this session has never READ
+    // the list (S._placesLoaded). The old test, "we have never armed",
+    // also skipped it on every cold start, although the native side keeps
+    // its places from the last session: so a family whose last place was
+    // deleted while this phone was closed kept that fence for good.
+    if (!places.length && !S._placesLoaded) return 0;
     if (!force && Date.now() - _lastArmMs < ARM_THROTTLE_MS) {
       console.info('skip re-arm (' + why + '): armed ' +
         Math.round((Date.now() - _lastArmMs) / 1000) + 's ago');
@@ -5045,6 +5179,9 @@
     const NG = nativeGeo();
     // One bridge call, one registration, one journal line.
     if (NG && typeof NG.armPlaces === 'function') {
+      // The list being armed, fixed now: S.places can change while the
+      // bridge call is out, and what is recorded must be what was sent.
+      const sig = placesSignature();
       try {
         const res = await NG.armPlaces({
           places: places.map(p => ({
@@ -5053,9 +5190,12 @@
           }))
         });
         console.info('armed geofences (' + why + ')', res);
-        _armedSig = placesSignature();
+        // 4.11.1: native answers once Play Services has, with ok:false if
+        // it refused. Only an accepted list is recorded; a refused one
+        // leaves the record empty, so the next resume tries again.
+        _armedSig = (res && res.ok === false) ? null : sig;
         return (res && res.armed) || 0;
-      } catch (e) { console.warn('armPlaces', e); return 0; }
+      } catch (e) { console.warn('armPlaces', e); _armedSig = null; return 0; }
     }
     // Older native build without armPlaces: fall back to one call per place.
     for (const p of places) await syncNativeAddPlace(p);
@@ -5197,7 +5337,18 @@
     // launchApp defers push init behind the disclosure gate, that gap would
     // have swallowed the whole first session.
     await initPushNotifications(true);
+    // 4.11.1: once the prompt has been refused, or the tracking channel
+    // blocked, Android shows no dialog again; the only way back is the
+    // app's notification settings. Go there rather than doing nothing.
+    const st = await setupStatus();
+    if (st && !st.notifications) {
+      const NG = nativeGeo();
+      if (NG && typeof NG.openNotificationSettings === 'function') {
+        try { await NG.openNotificationSettings(); } catch (e) { console.warn('openNotificationSettings', e); }
+      }
+    }
     await renderSetup();
+    await reconcileSetup();
   }
 
   // Called on every resume. Permission changes made in system settings
@@ -5220,10 +5371,45 @@
       toast('✅ Arrive/leave alerts are now active', 'ok');
     }
     _hadBackgroundLocation = nowHas;
+    await applyDisclosureState(st);
     // Keep the sheet honest if it happens to be open.
     if ($('setup-sheet') && $('setup-sheet').classList.contains('open')) {
       await renderSetup();
     }
+  }
+
+  // 4.11.1: no sharing without the tracking notification. The privacy page
+  // promises it "whenever it is recording your location", and with the
+  // app's notifications off (or the tracking channel blocked) the native
+  // side used to record anyway. Now it stops itself and sets this member's
+  // status so the family can see; this side shows the person why, writes
+  // nothing either, and starts sharing again once notifications are back.
+  // Settings changes fire no callback, so this runs on every resume.
+  async function applyDisclosureState(st) {
+    const off = !st.notifications;
+    const wasOff = !!S._sharingStopped;
+    S._sharingStopped = off;
+    const banner = $('disclosure-banner');
+    if (banner) banner.style.display = off ? 'block' : 'none';
+    if (off) return;
+    if (!wasOff && !st.sharingStopped) return;
+    // Back on. The service's own start clears the native stop and puts the
+    // default status back; restarting it is the whole job here, except
+    // when the person has paused (the service would stop again at once).
+    if (!isPausedRow(myMember())) await startNativeLocationUpdates();
+    const me = myMember();
+    if (me && me.status === STATUS_NOTIFICATIONS_OFF) {
+      try {
+        const { error } = await S.sb.from('keep_members')
+          .update({ status: STATUS_DEFAULT })
+          .eq('id', S.myId)
+          .eq('status', STATUS_NOTIFICATIONS_OFF);
+        if (!error) { me.status = STATUS_DEFAULT; renderMembers(); }
+      } catch (_) { /* best effort; the native side posts it too */ }
+    }
+    // Said only when this session saw it off; a stop that happened and
+    // ended while the app was closed restarts quietly.
+    if (wasOff) toast('✅ Notifications are on, so location sharing is back on', 'ok');
   }
 
   function closeInvite() {
@@ -5382,20 +5568,31 @@
   // producing three resume RPCs, three native re-arms and three toasts.
   let _resumeInFlight = null;
 
-  async function resumeMe() {
+  // explicit: the person tapped Resume, ending a pause early. Otherwise the
+  // pause has run out and this only catches the app up.
+  async function resumeMe(explicit) {
     if (_resumeInFlight) return _resumeInFlight;
-    _resumeInFlight = _resumeMeImpl();
+    _resumeInFlight = _resumeMeImpl(explicit === true);
     try { return await _resumeInFlight; } finally { _resumeInFlight = null; }
   }
 
-  async function _resumeMeImpl() {
+  async function _resumeMeImpl(explicit) {
     const me = myMember();
     if (!me) return;
-    S._pausedActive = false;
+    let failed = null;
     try {
       const { error } = await S.sb.rpc('resume_member', { p_member_id: S.myId });
       if (error) throw error;
-    } catch (e) { console.warn('resume_member', e); }
+    } catch (e) { console.warn('resume_member', e); failed = e; }
+    // 4.11.1: an EARLY resume the server refused leaves the pause standing.
+    // The family still sees "paused", so this phone must not quietly start
+    // recording again and say "resumed". A pause that has simply run out is
+    // over whatever the RPC said, which is why that case goes on regardless.
+    if (failed && explicit && isPausedRow(me)) {
+      toast('Couldn’t resume sharing: ' + mapRpcError(failed) + '. You are still paused.', 'err');
+      return;
+    }
+    S._pausedActive = false;
     me.paused_until = null;                        // optimistic regardless
     if (_autoResumeTimer) { clearTimeout(_autoResumeTimer); _autoResumeTimer = null; }
     await clearPauseOnNative();
@@ -5430,7 +5627,14 @@
       // without wiping stored context/places (so resume re-arms cleanly).
       // Deliberately NOT clearAll() — that would wipe auth + places + the
       // pending-checkin queue.
-      try { await NG.setPaused({ pausedUntil: String(untilMs || 0) }); } catch (_) {}
+      try { await NG.setPaused({ pausedUntil: String(untilMs || 0) }); }
+      catch (e) {
+        // 4.11.1: the person has just been told they are paused, so at the
+        // very least stop recording. Swallowing this left tracking running
+        // under a "paused" screen.
+        console.warn('setPaused', e);
+        try { await NG.stopLocationUpdates(); } catch (_) {}
+      }
     } else if (NG) {
       // Older native build without setPaused: best-effort stop.
       try { await NG.stopLocationUpdates(); } catch (_) {}
@@ -5792,7 +5996,15 @@
     // phone keeps the invite it joined with, and without approval that code
     // let them straight back in. Unused invites die with it, so say so first.
     const rotates = S.schemaVersion >= SCHEMA_WITH_V17_ACCOUNTS;
-    if (!confirm('Remove ' + name + ' from the Keep? Their location history is deleted too.' +
+    // 4.11.1: from v18 removing someone deletes their account on this
+    // server too ("leaving deletes you"), so say so; on an older server it
+    // still leaves their sign-in behind.
+    const deletes = S.schemaVersion >= SCHEMA_WITH_LEAVE_DELETES;
+    if (!confirm('Remove ' + name + ' from the Keep? ' +
+      (deletes
+        ? 'Their account on this family server is deleted, with their location history and check-ins. '
+          + 'To bring them back you would invite them again.'
+        : 'Their location history is deleted too.') +
       (rotates ? ' Your invite code changes, so any invite you’ve sent stops working.' : '') +
       ' This can’t be undone.')) return;
     try {
@@ -5865,7 +6077,7 @@
     'rotate-code': rotateCode,
     'share-invite': shareInvite,
     'pause-me': (t) => pauseMe(t),
-    'resume-me': resumeMe,
+    'resume-me': () => resumeMe(true),
     'set-member-role': (t) => setMemberRole(t),
     'set-member-type': (t) => setMemberType(t),
     'close-role-notice': closeRoleNotice,
@@ -6955,9 +7167,17 @@
     if (!App || typeof App.addListener !== 'function') return;
     _pvLifecycleBound = true;
     try {
-      App.addListener('appStateChange', (st) => { if (st && st.isActive === false) pvForgetToken(); });
+      App.addListener('appStateChange', (st) => {
+        // 4.11.1: remembered as well as acted on. Forgetting the token on the
+        // way out only clears what is already there; a token check still
+        // waiting on the network would otherwise store it AFTER the app had
+        // gone to the background, and keep it there (see pvTokenGo, pvRun).
+        _pvBackground = !!(st && st.isActive === false);
+        if (_pvBackground) pvForgetToken();
+      });
     } catch (_) {}
   }
+  let _pvBackground = false;
 
   // Leaving the app between steps drops the token; a run in progress keeps
   // it until the run ends (see the section header).
@@ -7198,6 +7418,7 @@
           }
           throw e;
         }
+        if (pvLeftDuringCheck()) return;
         PV.api = api;
         pvPanel('run');
         pvRun();
@@ -7206,6 +7427,7 @@
       // A new server: creating a project needs an organization-wide token,
       // and listing organizations is both the token check and the picker.
       const orgs = await api.listOrganizations();
+      if (pvLeftDuringCheck()) return;
       PV.api = api;
       PV.orgs = Array.isArray(orgs) ? orgs : [];
       pvPrepareWhere();
@@ -7215,6 +7437,17 @@
     } finally {
       if (btn) btn.disabled = false;
     }
+  }
+
+  // The app went to the background while the token was being checked. The
+  // check's answer arrives anyway, but the token must not be kept: nothing
+  // is running yet that needs it, which is the rule for leaving the app
+  // between steps. (4.11.1)
+  function pvLeftDuringCheck() {
+    if (!_pvBackground) return false;
+    pvPanel('token', { root: true });
+    setErr('pv-token-err', 'Roamkeep forgot the token when you left the app, to keep it safe. Paste it again to carry on.');
+    return true;
   }
 
   function pvPrepareWhere() {
@@ -7361,6 +7594,10 @@
     } finally {
       PV.running = false;
       pvKeepAwake(false);
+      // 4.11.1: a run keeps the token while the app is in the background,
+      // but only until it ends. One that failed out there used to leave it
+      // in place for as long as the app stayed open.
+      if (_pvBackground) PV.api = null;
     }
   }
 
@@ -7552,13 +7789,25 @@
    * somebody a button that is certain to fail. Re-evaluated on every open,
    * because roles and member_type both change while the app is running.
    */
+  // 4.11.1 (schema v18, "leaving deletes you"): one way out. On a server with
+  // v17's account features, leaving a family and deleting your account are
+  // the same act: delete_my_account takes the sign-in with everything else,
+  // and from v18 leave_keep, an owner's Remove and a completed child request
+  // do too. So the separate "Leave this Keep" button goes, and "Delete my
+  // account" says what it is. A server older than v17 has no account
+  // deletion, and keeps "Leave this Keep".
+  function leaveDeletes() { return S.schemaVersion >= SCHEMA_WITH_V17_ACCOUNTS; }
+  function leaveLabel() { return leaveDeletes() ? 'Leave and delete my account' : 'Leave this Keep'; }
+
   function renderLeaveKeep() {
     const btn = $('leave-keep-btn');
     const note = $('leave-keep-note');
     if (!btn || !note) return;
+    const delBtn = $('delete-account-btn');
+    if (delBtn) delBtn.textContent = leaveDeletes() ? 'Leave and delete my account' : 'Delete my account';
 
     const me = myMember();
-    if (!me) { btn.style.display = 'none'; note.style.display = 'none'; return; }
+    if (!me || leaveDeletes()) { btn.style.display = 'none'; note.style.display = 'none'; return; }
 
     const isChild = me.member_type === 'child';
     const owners = S.members.filter(m => m.role === 'owner').length;
@@ -7675,10 +7924,14 @@
       text = 'This deletes your account on this family server and, because nobody else is in it, ' +
         keep + ' with all its places and history. It can’t be undone.';
     } else {
-      text = 'This deletes your account on this family server: your membership of ' + keep + ', your ' +
-        'location history and your check-ins. Places you added stay with the family, and your ' +
-        'family will see you leave. It can’t be undone.';
+      text = 'Leaving ' + keep + ' deletes your account on this family server: your membership, your ' +
+        'location history, your check-ins and your sign-in. Places you added stay with the family, and ' +
+        'your family will see you leave. To come back later you would need a new invite. It can’t be undone.';
     }
+    const title = $('del-title');
+    if (title) title.textContent = leaveLabel();
+    const go = $('del-go');
+    if (go) go.textContent = leaveLabel();
     const body = $('del-body');
     if (body) body.textContent = text;
     const form = $('del-form');
@@ -7686,7 +7939,7 @@
     const askBox = $('del-child');
     if (askBox) askBox.style.display = ask ? '' : 'none';
     const askBtn = $('del-ask');
-    if (askBtn) askBtn.textContent = me && me.deletion_requested_at ? 'Cancel my request' : 'Ask to delete my account';
+    if (askBtn) askBtn.textContent = me && me.deletion_requested_at ? 'Cancel my request' : 'Ask to leave and delete my account';
     setErr('del-child-err', '');
     const inp = $('del-confirm');
     if (inp) inp.value = '';
@@ -7735,7 +7988,7 @@
     const { error } = await S.sb.rpc('delete_my_account');
     if (error) {
       _leaving = false;
-      if (btn) { btn.disabled = false; btn.textContent = 'Delete my account'; }
+      if (btn) { btn.disabled = false; btn.textContent = leaveLabel(); }
       setErr('del-err', mapRpcError(error));
       return;
     }
@@ -7749,7 +8002,7 @@
     S._nativeGeoReady = false;
     S._nativeLocReady = false;
     if (S.channel) { try { S.sb.removeChannel(S.channel); } catch (_) {} S.channel = null; }
-    try { await S.sb.auth.signOut({ scope: 'local' }); } catch (_) {}
+    await signOutHere();
     // No account here any more, so no reason to stay pointed at this server:
     // back to Connect, as after Disconnect.
     await clearBackendConfig();
@@ -7877,7 +8130,7 @@
       if (uErr && (uErr.code === 'user_not_found' || /does not exist/i.test(uErr.message || ''))) {
         toast('Your account on this family server was deleted.', 'err');
         await teardownNative();
-        try { await S.sb.auth.signOut({ scope: 'local' }); } catch (_) {}
+        await signOutHere();
         // SIGNED_OUT does this too, but not if signOut itself failed.
         S.authHandled = false;
         S.user = null;
@@ -8371,11 +8624,16 @@
     // (v14 guards role/member_type/paused_until/keep_id/user_id), so the RLS
     // policy and the trigger both permit this. It has to happen BEFORE
     // signOut() — afterwards there is no session left to write with.
+    // 4.11.1: a resolved write is not a successful one. postgrest-js resolves
+    // { error } offline, and the confirmation above promises the family will
+    // see this, so find out whether they will.
+    let told = !S.myId;
     if (S.myId) {
       try {
-        await S.sb.from('keep_members')
+        const { error } = await S.sb.from('keep_members')
           .update({ online: false, status: STATUS_DISCONNECTED })
           .eq('id', S.myId);
+        told = !error;
       } catch (_) {}
     }
     const NG = nativeGeo();
@@ -8390,9 +8648,16 @@
     unsubscribeTrail();
     // 'local' — this device only. See signOut(): the global default would
     // also sign out the phone this one is usually being replaced BY.
-    try { if (S.sb) await S.sb.auth.signOut({ scope: 'local' }); } catch (_) {}
+    // signOutHere also removes the stored session if the server can't be
+    // reached (4.11.1): "clears the app's stored credentials" must hold
+    // offline too.
+    await signOutHere();
     if (S.channel) { try { S.sb.removeChannel(S.channel); } catch (_) {} S.channel = null; }
     await clearBackendConfig();
+    if (!told) {
+      alert('This device is disconnected, but your family could not be told: it has no '
+        + 'connection right now. To them it will look as if this phone has stopped updating.');
+    }
     // Full reload is the honest way to reset every module-level cache
     // (client, session, member state) rather than hand-clearing each.
     location.reload();

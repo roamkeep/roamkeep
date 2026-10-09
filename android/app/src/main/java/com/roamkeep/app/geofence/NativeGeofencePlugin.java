@@ -198,6 +198,31 @@ public class NativeGeofencePlugin extends Plugin {
     }
 
     /**
+     * Deep-link to this app's notification settings (4.11.1). Once someone
+     * has refused Android 13's notification prompt, or blocked a channel,
+     * Android shows no dialog again, and sharing stays stopped until they
+     * turn notifications back on here. Falls back to the app's page.
+     */
+    @PluginMethod
+    public void openNotificationSettings(PluginCall call) {
+        try {
+            Intent i;
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                i = new Intent(Settings.ACTION_APP_NOTIFICATION_SETTINGS);
+                i.putExtra(Settings.EXTRA_APP_PACKAGE, getContext().getPackageName());
+            } else {
+                i = new Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS);
+                i.setData(Uri.fromParts("package", getContext().getPackageName(), null));
+            }
+            i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+            getContext().startActivity(i);
+            call.resolve();
+        } catch (Exception e) {
+            call.reject("Could not open notification settings", e);
+        }
+    }
+
+    /**
      * Ask to be exempted from battery optimisation. Without this, Doze
      * suspends the foreground service and (per the earlier Doze
      * investigation) can turn GPS off device-wide, stalling both
@@ -281,8 +306,10 @@ public class NativeGeofencePlugin extends Plugin {
                 android.Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED;
         boolean background = Build.VERSION.SDK_INT < 29 || ContextCompat.checkSelfPermission(ctx,
                 android.Manifest.permission.ACCESS_BACKGROUND_LOCATION) == PackageManager.PERMISSION_GRANTED;
-        boolean notifications = Build.VERSION.SDK_INT < 33 || ContextCompat.checkSelfPermission(ctx,
-                android.Manifest.permission.POST_NOTIFICATIONS) == PackageManager.PERMISSION_GRANTED;
+        // 4.11.1: the same question every recording path asks (canDisclose),
+        // not just Android 13's permission: notifications switched off in
+        // settings, or the tracking channel blocked, stop sharing too.
+        boolean notifications = LocationForegroundService.canDisclose(ctx);
 
         boolean ignoringBattery = true;
         PowerManager pm = (PowerManager) ctx.getSystemService(Context.POWER_SERVICE);
@@ -300,6 +327,7 @@ public class NativeGeofencePlugin extends Plugin {
         res.put("fineLocation", fine);
         res.put("backgroundLocation", background);
         res.put("notifications", notifications);
+        res.put("sharingStopped", prefs.isSharingStopped());
         res.put("ignoringBatteryOptimizations", ignoringBattery);
         res.put("autoRevokeWhitelisted", autoRevokeWhitelisted);
         res.put("trackMode", prefs.getTrackMode());
@@ -399,6 +427,15 @@ public class NativeGeofencePlugin extends Plugin {
         if (supabaseUrl == null || anonKey == null || accessToken == null
                 || keepId == null || memberId == null) {
             call.reject("Missing required context field");
+            return;
+        }
+        // 4.11.1: what is stored here is where every headless request goes,
+        // bearer token attached, and what its filters are built from. So the
+        // shapes are checked at the door, not trusted from the web layer.
+        if (!SupabaseRest.isHttpsServerUrl(supabaseUrl)
+                || !SupabaseRest.isUuid(keepId) || !SupabaseRest.isUuid(memberId)
+                || (userId != null && !SupabaseRest.isUuid(userId))) {
+            call.reject("Malformed context field");
             return;
         }
 
@@ -569,27 +606,35 @@ public class NativeGeofencePlugin extends Plugin {
                 JSONObject o = arr.getJSONObject(i);
                 String id   = o.optString("id", null);
                 String name = o.optString("name", null);
-                if (id == null || name == null) continue;
-                places.add(new PrefsStore.Place(
-                        id, name, o.optString("icon", "📍"),
-                        o.optDouble("lat"), o.optDouble("lng"),
-                        (float) o.optDouble("radius", 100)));
+                double lat = o.optDouble("lat"), lng = o.optDouble("lng"), radius = o.optDouble("radius", 100);
+                // 4.11.1: one bad row refuses the whole list. Skipping it and
+                // arming the rest pruned that place as if it were deleted.
+                if (!GeofenceArmer.validPlaceRow(id, name, lat, lng, radius)) {
+                    call.reject("bad places payload: row " + i);
+                    return;
+                }
+                places.add(new PrefsStore.Place(id, name, o.optString("icon", "📍"), lat, lng, (float) radius));
             }
         } catch (JSONException e) {
             call.reject("bad places payload", e);
             return;
         }
 
-        GeofenceArmer.Result r = GeofenceArmer.arm(getContext(), places, "app");
-        // Record what we just armed so a headless reconcile can tell
-        // whether anything actually changed since.
-        new PrefsStore(getContext()).setPlacesSignature(GeofenceArmer.signature(places));
-
-        JSObject res = new JSObject();
-        res.put("armed", r.armed);
-        res.put("stored", r.stored);
-        res.put("pruned", r.pruned);
-        call.resolve(res);
+        // Record the list as applied only once Play Services has taken it
+        // (4.11.1), and answer the app then, so it knows the same. A failed
+        // registration clears the record: the next reconcile, here or from a
+        // push, retries instead of seeing an unchanged list and skipping it.
+        final String sig = GeofenceArmer.signature(places);
+        final PrefsStore prefs = new PrefsStore(getContext());
+        GeofenceArmer.arm(getContext(), places, "app", (r, accepted) -> {
+            prefs.setPlacesSignature(accepted ? sig : null);
+            JSObject res = new JSObject();
+            res.put("armed", r.armed);
+            res.put("stored", r.stored);
+            res.put("pruned", r.pruned);
+            res.put("ok", accepted);
+            call.resolve(res);
+        });
     }
 
     @PluginMethod

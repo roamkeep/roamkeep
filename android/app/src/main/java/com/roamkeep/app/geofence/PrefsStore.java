@@ -202,8 +202,14 @@ public class PrefsStore {
     // updates) and surfaced in the Diagnostics panel — so the next
     // tracking anomaly can be explained from the phone screen instead
     // of a perishable adb logcat buffer.
+    //
+    // 4.11.1: and no older than JOURNAL_MAX_AGE_MS. Its lines name places
+    // and times ("geo: arrived Home"), so on a quiet phone 120 entries could
+    // reach back weeks, past the 7 days the privacy page promises for
+    // everything else about where someone has been.
     private static final String K_JOURNAL = "journal";
     private static final int JOURNAL_CAP = 120;
+    static final long JOURNAL_MAX_AGE_MS = 7L * 24 * 60 * 60 * 1000;
 
     // Check-in payloads the receiver tried to POST but couldn't deliver
     // (transient network failure on the boundary crossing — most often
@@ -399,11 +405,35 @@ public class PrefsStore {
     public void resetRejectStreak() { synchronized (LOCK) {
         if (sp.getInt(K_REJECT_STREAK, 0) != 0) sp.edit().putInt(K_REJECT_STREAK, 0).apply();
     } }
+    // Sharing stopped because the tracking notification could not be shown
+    // (4.11.1, LocationForegroundService.stopForDisclosure). Not the gate
+    // itself, which is asked live every time; this records that WE stopped,
+    // so the stop and the restart are each announced once.
+    private static final String K_SHARING_STOPPED = "sharing_stopped";
+
+    public boolean isSharingStopped() { return sp.getBoolean(K_SHARING_STOPPED, false); }
+
+    /** @return true if this call is the one that stopped sharing. */
+    public boolean markSharingStopped() { synchronized (LOCK) {
+        if (sp.getBoolean(K_SHARING_STOPPED, false)) return false;
+        sp.edit().putBoolean(K_SHARING_STOPPED, true).commit();
+        return true;
+    } }
+
+    /** @return true if sharing had been stopped and this call restarted it. */
+    public boolean clearSharingStopped() { synchronized (LOCK) {
+        if (!sp.getBoolean(K_SHARING_STOPPED, false)) return false;
+        sp.edit().putBoolean(K_SHARING_STOPPED, false).commit();
+        return true;
+    } }
+
     public boolean isServerRejected()           { return sp.getBoolean(K_SERVER_REJECTED, false); }
     public void setServerRejected(boolean on)   { sp.edit().putBoolean(K_SERVER_REJECTED, on).apply(); }
 
-    /** null = never armed. Distinct from "" (armed an empty list), which
-     *  is a real state meaning every place was deleted. */
+    /** The list Play Services last ACCEPTED. null = never armed, or the last
+     *  registration failed (4.11.1: it used to be stamped on the attempt).
+     *  Distinct from "" (armed an empty list), which is a real state meaning
+     *  every place was deleted. */
     public String getPlacesSignature()          { return sp.getString(K_PLACES_SIG, null); }
     public void setPlacesSignature(String sig)  { sp.edit().putString(K_PLACES_SIG, sig).apply(); }
     public boolean isPaused()           { return getPausedUntil() > System.currentTimeMillis(); }
@@ -443,6 +473,12 @@ public class PrefsStore {
     /** The schema version the database last reported, or 0 if never read.
      *  See K_SCHEMA_VERSION: 0 must be treated as "the column is absent". */
     public int getSchemaVersion() { return sp.getInt(K_SCHEMA_VERSION, 0); }
+
+    // When this phone last ran the family's retention prune (4.11.1,
+    // LocationUpdateReceiver.maybePruneHistory). Device bookkeeping only.
+    private static final String K_LAST_PRUNE = "last_prune_ms";
+    public long getLastPruneMs() { return sp.getLong(K_LAST_PRUNE, 0); }
+    public void setLastPruneMs(long ms) { sp.edit().putLong(K_LAST_PRUNE, ms).apply(); }
 
     /** Mirror the version JS read from the database.
      *
@@ -596,9 +632,10 @@ public class PrefsStore {
     private void journalLocked(String event) {
         if (event == null) return;
         try {
-            JSONArray arr = new JSONArray(sp.getString(K_JOURNAL, "[]"));
+            long now = System.currentTimeMillis();
+            JSONArray arr = keptJournal(sp.getString(K_JOURNAL, "[]"), now);
             JSONObject e = new JSONObject();
-            e.put("t", System.currentTimeMillis());
+            e.put("t", now);
             e.put("e", event);
             arr.put(e);
             while (arr.length() > JOURNAL_CAP) arr.remove(0);
@@ -606,8 +643,33 @@ public class PrefsStore {
         } catch (JSONException ignored) {}
     }
 
+    /** The journal as stored, minus anything past its age. Read through
+     *  this too, so a phone that has written nothing for a week does not
+     *  show (or hand over) what the write path would have dropped. */
     public String getJournalRaw() {
-        synchronized (LOCK) { return sp.getString(K_JOURNAL, "[]"); }
+        synchronized (LOCK) {
+            try {
+                return keptJournal(sp.getString(K_JOURNAL, "[]"), System.currentTimeMillis()).toString();
+            } catch (JSONException e) {
+                return "[]";
+            }
+        }
+    }
+
+    private static JSONArray keptJournal(String raw, long nowMs) throws JSONException {
+        JSONArray in = new JSONArray(raw);
+        JSONArray out = new JSONArray();
+        for (int i = 0; i < in.length(); i++) {
+            JSONObject e = in.optJSONObject(i);
+            if (e != null && keepJournalEntry(e.optLong("t", 0), nowMs)) out.put(e);
+        }
+        return out;
+    }
+
+    /** Pure, for JournalAgeTest. A line from the future (the clock moved
+     *  back) is kept: it cannot be judged, and the count cap still bounds it. */
+    static boolean keepJournalEntry(long tMs, long nowMs) {
+        return tMs > 0 && nowMs - tMs <= JOURNAL_MAX_AGE_MS;
     }
 
     public boolean hasContext() {
@@ -616,8 +678,12 @@ public class PrefsStore {
                 && getMemberId() != null;
     }
 
+    /** 4.11.1: under the shared LOCK and written synchronously. Without the
+     *  lock, a read-modify-write already holding it could read the old
+     *  values, lose to the clear, and write them straight back; with apply()
+     *  a process killed just after a disconnect could keep the session. */
     public void clearAll() {
-        sp.edit().clear().apply();
+        synchronized (LOCK) { sp.edit().clear().commit(); }
     }
 
     // ── Places ──────────────────────────────────────────────────────
@@ -826,6 +892,30 @@ public class PrefsStore {
         if (set.remove(id)) setInsidePlaceIds(set);
     } }
 
+    /**
+     * The EXIT half of claimInsidePlace: take the place out of the inside
+     * set and report whether THIS caller is the one that took it out.
+     *
+     * GeofenceReceiver used to ask isInsidePlace and then removeInsidePlace,
+     * two steps, so two workers handling the same EXIT could both see
+     * "inside" and both file a departure, under different ids the primary
+     * key cannot de-duplicate. Same shape, same lock, same synchronous write
+     * as the ENTER side.
+     *
+     * @return true if this call removed the place; false if it was not set.
+     */
+    public boolean claimExitPlace(String id) {
+        if (id == null) return false;
+        synchronized (LOCK) {
+            Set<String> set = getInsidePlaceIds();
+            if (!set.remove(id)) return false;
+            JSONArray out = new JSONArray();
+            for (String v : set) out.put(v);
+            sp.edit().putString(K_INSIDE_PLACE_IDS, out.toString()).commit();
+            return true;
+        }
+    }
+
     // ── Held arrivals ──────────────────────────────────────────────
     //
     // An arrival the drift gate would not announce on the fix it came with.
@@ -983,9 +1073,24 @@ public class PrefsStore {
         return getPendingCheckins().size();
     } }
 
+    /** Whether a check-in is still queued. A drain works from a snapshot,
+     *  and asks this once it holds the row's claim: by then the row may
+     *  have been delivered and removed by another sender. */
+    public boolean isPendingCheckin(String id) { synchronized (LOCK) {
+        if (id == null) return false;
+        for (JSONObject p : getPendingCheckins()) {
+            if (id.equals(p.optString("id", null))) return true;
+        }
+        return false;
+    } }
+
+    /** 4.11.1: commit(), not apply(). The queue is write-ahead: a check-in is
+     *  appended before its POST, so that a process killed mid-request loses
+     *  nothing. apply() made that promise only once the write reached disk,
+     *  and the inside-place state it pairs with is already committed. */
     private void writePending(List<JSONObject> list) {
         JSONArray arr = new JSONArray();
         for (JSONObject p : list) arr.put(p);
-        sp.edit().putString(K_PENDING_CHECKINS, arr.toString()).apply();
+        sp.edit().putString(K_PENDING_CHECKINS, arr.toString()).commit();
     }
 }

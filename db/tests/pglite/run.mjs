@@ -16,7 +16,9 @@
 //      readable "0 setup" row, touching nothing — which is what happened on
 //      staging the first time somebody made the family with v17owner;
 //   F  the SQL the engine writes itself (sign-up window, hand-over, upgrade
-//      check, setUserPassword with hostile input) against the real schema.
+//      check, setUserPassword with hostile input) against the real schema;
+//   G  re-pasting the schema repairs a deleted check-in trigger and a
+//      loosened grant, and the same test fails without the repair block.
 //
 // Options: --from <git ref>  the schema to upgrade from (default: the latest
 //                            v* tag that is not an -rc).
@@ -234,6 +236,36 @@ await section('F engine SQL', async () => {
   console.log(`\n== engine SQL: ${problems.length ? 'WRONG — ' + problems.join('; ') : 'ok'}`)
   if (problems.length) fail('F: ' + problems.join('; '))
   await db.close()
+})
+
+// v18: re-pasting schema.sql is how most owners repair a project, so it must
+// put back a deleted check-in trigger, whichever body the function has (the
+// body itself is only replaced in narrow cases). Run twice: the real schema
+// must repair it, and the schema without its v18 repair block must not, or
+// this section could never fail.
+await section('G repair', async () => {
+  const repairs = async (schema) => {
+    const db = await project()
+    await db.exec(prep(schema))
+    await db.exec(`UPDATE roamkeep_meta SET project_url = 'https://example.supabase.co' WHERE id`)
+    await db.exec(prep(schema))
+    await db.exec('DROP TRIGGER on_checkin_notify ON public.checkins')
+    await db.exec('GRANT EXECUTE ON FUNCTION public.roamkeep_notify_checkin() TO anon')
+    await db.exec(prep(schema))
+    const r = (await db.query(`SELECT exists(SELECT 1 FROM pg_trigger WHERE tgname = 'on_checkin_notify') AS trigger,
+                                      has_function_privilege('anon', 'public.roamkeep_notify_checkin()', 'execute') AS anon`)).rows[0]
+    await db.close()
+    return r.trigger && !r.anon
+  }
+  const src = SCHEMA.replace(/\r\n/g, '\n')
+  const start = src.indexOf('-- v18: the parts of the above that are safe to apply to ANY installed copy')
+  const end = src.indexOf('END$$;', start) + 'END$$;'.length
+  const withRepair = await repairs(SCHEMA)
+  const withoutRepair = start < 0 ? null : await repairs(src.slice(0, start) + src.slice(end))
+  const ok = withRepair && withoutRepair === false
+  console.log(`\n== repair: ${ok ? 'ok' : 'WRONG'} (re-paste restores a deleted check-in trigger and its grant: ${withRepair}; ` +
+    `without the repair block it would not: ${withoutRepair === false})`)
+  if (!ok) fail('G: re-pasting schema.sql does not repair the check-in trigger, or the test cannot tell')
 })
 
 console.log(`\n${failures === 0 ? 'ALL OK' : failures + ' FAILURE(S)'}`)

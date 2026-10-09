@@ -18,6 +18,7 @@ reach.
 | schema_version | Released with | What it changes |
 |---|---|---|
 | 17 | 4.11.0 | Owner approval of joins, the in-app switch for new accounts, password reset without email, and account deletion. The app shows them once the server is on 17. Checked by `../tests/v17-verify.sql` |
+| 18 | 4.11.1 | Leaving, removal and a completed child deletion request delete the sign-in too; reset codes are checked again when used; a pending member is refused by every function, not only by the policies. All server-side, so it protects every app version. Checked by `../tests/v18-verify.sql` |
 
 What each version adds is listed in [`../../CHANGELOG.md`](../../CHANGELOG.md).
 
@@ -25,6 +26,12 @@ What each version adds is listed in [`../../CHANGELOG.md`](../../CHANGELOG.md).
 to true), existing Keeps start with approval off, and new accounts stay open
 unless the dashboard switch was already off, in which case the update hands
 it to the app, still closed.
+
+**On 18,** one behaviour changes for every app version at once: removing a
+member, leaving, and completing a child's deletion request delete the
+person's sign-in too, not only their membership. Bringing someone back
+means inviting them again with sign-ups open, which the invite share already
+offers.
 
 `roamkeep_schema_version()` returns a **number, not a verdict**. That is
 deliberate and should stay that way: a database that answered

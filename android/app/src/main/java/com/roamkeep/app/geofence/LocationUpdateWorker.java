@@ -69,6 +69,13 @@ public class LocationUpdateWorker extends Worker {
                 != PackageManager.PERMISSION_GRANTED) {
             return Result.success();
         }
+        // 4.11.1: this worker has no notification of its own, so it records
+        // only while the foreground service, and so the tracking
+        // notification, is up. The service writes the live pin itself then;
+        // when it is not running, nothing should be recorded at all.
+        if (!LocationForegroundService.running || !LocationForegroundService.canDisclose(ctx)) {
+            return Result.success();
+        }
 
         try {
             Location loc = Tasks.await(

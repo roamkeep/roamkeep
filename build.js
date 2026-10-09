@@ -193,7 +193,22 @@ async function bundleProvision() {
   const stamp = Number((/GREATEST\(roamkeep_meta\.schema_version,\s*(\d+)\)/.exec(onDisk) || [])[1]);
   const problems = [];
   if (!R || R.schemaSql !== onDisk) problems.push('schemaSql is not byte-identical to db/schema.sql (a stale cli/assets/?)');
-  if (!R || JSON.stringify(R.functions) !== JSON.stringify(functions)) problems.push('function sources differ from supabase/functions/');
+  // Read supabase/functions/ here, independently. Comparing against the
+  // `functions` above proved only that the bundle matched its own input:
+  // steps.js prefers cli/assets/ whenever a packed schema is there, so a
+  // pack left behind after an Edge Function edit passed with stale code.
+  const fnDir = path.join(ROOT, 'supabase', 'functions');
+  const onDiskFns = {};
+  for (const slug of (R && R.FUNCTIONS) || []) {
+    const names = fs.readdirSync(path.join(fnDir, slug)).filter((f) => /\.(ts|json)$/.test(f)).sort();
+    onDiskFns[slug] = {
+      files: names.map((name) => ({ name, content: fs.readFileSync(path.join(fnDir, slug, name), 'utf8') })),
+      importMap: names.includes('deno.json') ? 'deno.json' : undefined,
+    };
+  }
+  if (!R || JSON.stringify(R.functions) !== JSON.stringify(onDiskFns)) {
+    problems.push('function sources differ from supabase/functions/ (a stale cli/assets/?)');
+  }
   if (!R || R.SCHEMA_VERSION !== stamp) problems.push('engine SCHEMA_VERSION ' + (R && R.SCHEMA_VERSION) + ' != schema.sql stamp ' + stamp);
   for (const fn of ['createClient', 'waitForProject', 'setupSteps', 'ApiError']) {
     if (!R || typeof R[fn] !== 'function') problems.push('missing export ' + fn);

@@ -378,15 +378,23 @@ select (select schema_version from roamkeep_meta)                    as version,
                           'on_deletion_request','on_reset_notice')
            and not tgisinternal)                                     as triggers,
        (select bool_and(prosrc like '%x-roamkeep-webhook%') from pg_proc
-         where proname = 'roamkeep_notify_checkin')                  as sends_secret;
+         where proname = 'roamkeep_notify_checkin')                  as sends_secret,
+       (select count(*) from information_schema.routines
+         where routine_name = '_roamkeep_delete_member')             as v18_fn,
+       (select bool_and(exists (select 1 from unnest(proconfig) c
+                                 where c like 'search_path=%pg_temp'
+                                    or c = 'search_path=""'))
+          from pg_proc
+         where pronamespace = 'public'::regnamespace and prosecdef)  as pg_temp_last;
 ```
 
-A finished v17 reads `version 17`, `url` set to **this** project,
+A finished v18 reads `version 18`, `url` set to **this** project,
 `checkin_cols 4`, `prefs_table 1`, `recipients_fn 1`, `feed_view 1`,
 `v16_fns 2`, `v17_cols 5`, `reset_table 1`, `v17_fns 12`, `triggers 8`,
-`sends_secret true`.
+`sends_secret true`, `v18_fn 1`, `pg_temp_last true`.
 
-(A finished v16 reads `v17_cols 0`, `reset_table 0`, `v17_fns 0`,
+(A finished v17 reads `v18_fn 0`, `pg_temp_last false` and the rest the
+same. A finished v16 also reads `v17_cols 0`, `reset_table 0`, `v17_fns 0`,
 `triggers 4` and the rest the same. A finished v13–v15 also reads
 `checkin_cols 3`, `v16_fns 0` and `triggers 2`.) If `sends_secret` is **false**, check-in notifications
 are being refused: re-run `db/schema.sql` once `url` is set. It replaces a

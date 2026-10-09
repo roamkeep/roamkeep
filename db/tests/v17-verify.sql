@@ -280,6 +280,10 @@ BEGIN
   -- no longer works, with approval off (the case it lets straight back in).
   -- The code is aged first (one hour left) so the renewal is visible: now()
   -- does not move inside the script. Rolled back, so Max stays for the rest.
+  --
+  -- The old code is tried by v17child, who is in no Keep yet, not by Max:
+  -- from v18 a removal deletes the removed person's account, so Max no
+  -- longer exists to try it. Anyone holding the old code is the same case.
   v_txt := NULL; v_status := NULL; v_b := NULL;
   BEGIN
     PERFORM _v17_act_as(uid_o);
@@ -288,7 +292,7 @@ BEGIN
     PERFORM remove_member(v_m_mid);
     SELECT code IS DISTINCT FROM v_txt, code_expires_at = now() + interval '72 hours'
       INTO v_b, v_ck_b FROM keeps WHERE id = v_keep;
-    PERFORM _v17_act_as(uid_m);
+    PERFORM _v17_act_as(uid_c);
     SELECT j.status INTO v_status FROM join_keep_by_code(v_txt, 'Max', '👦') j;
     RAISE EXCEPTION 'v17_rollback';
   EXCEPTION WHEN OTHERS THEN
@@ -383,11 +387,21 @@ BEGIN
 
   -- A reset by code blocks deleting the account for a day (review R1). Rolls
   -- itself back if the deletion gets through.
+  --
+  -- Retired in v18 (owner decision 2026-10-09): removing a member deletes
+  -- them there, so the block protected nothing, and the deletion now has to
+  -- go through. v18-verify tests the rule that replaced it.
+  SELECT schema_version >= 18 INTO v_b FROM roamkeep_meta;
   BEGIN
     PERFORM delete_my_account();
     RAISE EXCEPTION 'v17_unexpected_success';
   EXCEPTION WHEN OTHERS THEN
-    PERFORM _v17_r('2k no account deletion within a day of a reset by code', SQLERRM LIKE '%recent_reset%', SQLERRM);
+    IF v_b THEN
+      PERFORM _v17_r('2k (retired in v18) deletion right after a reset by code is allowed',
+        SQLERRM = 'v17_unexpected_success', SQLERRM);
+    ELSE
+      PERFORM _v17_r('2k no account deletion within a day of a reset by code', SQLERRM LIKE '%recent_reset%', SQLERRM);
+    END IF;
   END;
 
   -- A reset notice wakes the member's own phones and nobody else's (R1).

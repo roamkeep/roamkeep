@@ -37,23 +37,32 @@ check('config is in the fragment, not the query',
   mine.indexOf('#') < mine.indexOf('u=') && !mine.includes('?'));
 check('carries v=1', mine.includes('v=1'));
 
-// Mirror of parseSetupLink() in app.js — the consumer's view.
-function parseSetupLink(text) {
-  if (!text) return null;
-  const s = String(text).trim();
-  const hash = s.indexOf('#');
-  const frag = hash >= 0 ? s.slice(hash + 1) : s;
-  let p;
-  try { p = new URLSearchParams(frag); } catch { return null; }
-  const u = p.get('u'), k = p.get('k');
-  if (!u || !k) return null;
-  let url;
-  try {
-    url = /^https?:\/\//i.test(u) ? u : atob(u.replace(/-/g, '+').replace(/_/g, '/'));
-  } catch { return null; }
-  if (!/^https:\/\/[^\s]+$/i.test(url)) return null;
-  return { url: url.replace(/\/+$/, ''), anonKey: k.trim(), code: p.get('c') || null };
+// app.js's OWN parseSetupLink and buildSetupLink, cut out of the source and
+// run here (4.11.1). This used to be a hand-copied mirror of the parser, so
+// a change to the real one could leave every check below green; and the
+// app's writer was never compared with the other two at all.
+function cutFromApp(head) {
+  const app = fs.readFileSync(path.join(REPO, 'app.js'), 'utf8');
+  const at = app.indexOf(head);
+  if (at < 0) return null;
+  let depth = 0, i = app.indexOf('{', at);
+  for (; i < app.length; i++) {
+    if (app[i] === '{') depth++;
+    else if (app[i] === '}' && --depth === 0) break;
+  }
+  return app.slice(at, i + 1);
 }
+const appLink = (() => {
+  const srcs = ['function parseSetupLink(text)', 'function privilegedKey(k)', 'function buildSetupLink(code)']
+    .map(cutFromApp);
+  if (srcs.some((s) => !s)) return null;
+  return (sbUrl, sbKey) => new Function('SB_URL', 'SB_KEY', `
+    const SETUP_LINK_BASE = 'https://get.roamkeep.app/s';
+    ${srcs.join('\n')}
+    return { parseSetupLink, buildSetupLink };`)(sbUrl, sbKey);
+})();
+check('app.js setup-link functions found', !!appLink, 'moved or renamed');
+const parseSetupLink = appLink ? appLink(URL_, KEY).parseSetupLink : () => null;
 
 const round = parseSetupLink(mine);
 check('app.js parser accepts it', !!round);
@@ -66,6 +75,47 @@ check('invite code survives', withCode?.code === 'ABC123XYZ789');
 
 check('trailing slash on the project URL is normalised',
   parseSetupLink(buildSetupLink(URL_ + '/', KEY))?.url === URL_);
+
+// The app's own invite share must write the very same link.
+if (appLink) {
+  check('app.js buildSetupLink agrees with the wizard exactly',
+    appLink(URL_, KEY).buildSetupLink(null) === mine);
+  check('...and with an invite code',
+    appLink(URL_, KEY).buildSetupLink('ABC123XYZ789') === buildSetupLink(URL_, KEY, 'ABC123XYZ789'));
+}
+
+// What the app must REFUSE (4.11.1). Each of these used to connect, or try.
+{
+  const frag = (u, k, extra = '') =>
+    '#v=1&u=' + Buffer.from(u).toString('base64url') + '&k=' + encodeURIComponent(k) + extra;
+  const jwt = (claims) => 'eyJhbGciOiJIUzI1NiJ9.' + Buffer.from(JSON.stringify(claims)).toString('base64url') + '.sig';
+  const refused = {
+    'plain http': frag('http://abcdefghijklmnop.supabase.co', KEY),
+    'user-info in the address': frag('https://name:pw@abcdefghijklmnop.supabase.co', KEY),
+    'a query in the address': frag(URL_ + '/?x=1', KEY),
+    'a fragment in the address': frag(URL_ + '/#x', KEY),
+    'an unknown link version': '#v=2&u=' + Buffer.from(URL_).toString('base64url') + '&k=' + KEY,
+    'an empty key': frag(URL_, '   '),
+    'a secret key': frag(URL_, 'sb_secret_abc123'),
+    'a service_role JWT': frag(URL_, jwt({ role: 'service_role' })),
+    'a code with odd characters': frag(URL_, KEY, '&c=' + encodeURIComponent('A<B')),
+  };
+  for (const [what, link] of Object.entries(refused)) {
+    check(`app refuses ${what}`, parseSetupLink(link) === null);
+  }
+  check('app accepts an anon-role JWT', parseSetupLink(frag(URL_, jwt({ role: 'anon' })))?.url === URL_);
+  check('app accepts a self-hosted address with a path',
+    parseSetupLink(frag('https://family.example.org/supabase/', KEY))?.url === 'https://family.example.org/supabase');
+  let threw = false;
+  try { buildSetupLink(URL_, 'sb_secret_abc123'); } catch { threw = true; }
+  check('the wizard refuses to write a link with a secret key', threw);
+  let toolErr = '';
+  try {
+    execFileSync(process.execPath, [path.join(REPO, 'tools', 'setup-link.js'), '--url', URL_,
+      '--key', jwt({ role: 'service_role' })], { encoding: 'utf8', cwd: REPO, stdio: ['ignore', 'pipe', 'pipe'] });
+  } catch (e) { toolErr = String(e.stderr || ''); }
+  check('tools/setup-link.js refuses a service_role key', /secret \(service-role\) key/.test(toolErr), toolErr.slice(0, 80));
+}
 
 // Three-way agreement: the wizard and the bootstrap tool must emit the
 // byte-identical link, or one of them is producing something the app
@@ -515,6 +565,148 @@ const engine = await import('./src/engine.js');
     order.join(' ') === 'extensions extensions schema verify auth webhook functions:notify-checkin functions:notify-places '
       + 'probe:notify-checkin probe:notify-places signups key' && last === 'eyJanon',
     order.join(' '));
+}
+
+// Both Edge Functions' own secret lookup and comparison, cut out of the
+// TypeScript and run against a stubbed database answer. Only a missing TABLE
+// (a database from before v14) may leave the check open; a table without a
+// usable secret in it fails closed, which before v18 it did not.
+console.log('\nedge functions: the webhook secret check');
+{
+  const { transform } = await import('esbuild');
+  const AsyncFunction = Object.getPrototypeOf(async () => {}).constructor;
+  const answers = {
+    'a secret':            { data: { webhook_secret: 'expected' }, error: null },
+    'no row':              { data: null, error: null },
+    'a NULL secret':       { data: { webhook_secret: null }, error: null },
+    'an empty secret':     { data: { webhook_secret: '' }, error: null },
+    'no table (Postgres)': { data: null, error: { code: '42P01' } },
+    'no table (PostgREST)': { data: null, error: { code: 'PGRST205' } },
+    'a database outage':   { data: null, error: { code: '08006' } },
+  };
+  for (const fn of ['notify-checkin', 'notify-places']) {
+    const src = fs.readFileSync(path.join(REPO, 'supabase', 'functions', fn, 'index.ts'), 'utf8');
+    const start = src.indexOf('const SECRET_TTL_MS');
+    const end = src.indexOf('\n}', src.indexOf('async function secretMatches')) + 2;
+    if (start < 0 || end < 2) { check(`${fn}: secret helpers found`, false, 'moved or renamed'); continue; }
+    const js = (await transform(src.slice(start, end), { loader: 'ts' })).code;
+    const outcome = {};
+    for (const [name, answer] of Object.entries(answers)) {
+      const run = new AsyncFunction('sb', js + `
+        try {
+          const want = await webhookSecret(sb);
+          if (want === null) return 'open';
+          const ok = await secretMatches('expected', want);
+          const wrong = await secretMatches('wrong', want);
+          const none = await secretMatches(null, want);
+          return ok && !wrong && !none ? 'checked' : 'BROKEN';
+        } catch (e) { return 'refused'; }`);
+      const sb = { from: () => ({ select: () => ({ maybeSingle: async () => answer }) }) };
+      outcome[name] = await run(sb);
+    }
+    check(`${fn}: a stored secret is required and compared`, outcome['a secret'] === 'checked', outcome['a secret']);
+    check(`${fn}: a table without a usable secret refuses (503)`,
+      ['no row', 'a NULL secret', 'an empty secret'].every((k) => outcome[k] === 'refused'),
+      JSON.stringify(outcome));
+    check(`${fn}: only a missing table leaves the check open`,
+      outcome['no table (Postgres)'] === 'open' && outcome['no table (PostgREST)'] === 'open',
+      JSON.stringify(outcome));
+    check(`${fn}: a database outage refuses (503)`, outcome['a database outage'] === 'refused', outcome['a database outage']);
+  }
+}
+
+// The app's own place-arming code, cut out of app.js and run against a fake
+// native bridge. The contract (the architecture notes, "the recurring bug"): the native
+// side is handed the COMPLETE list, an empty one included, but never a list
+// nobody has read; and a list counts as armed only once native says Play
+// Services took it (4.11.1).
+console.log('\napp: arming geofences from the place list');
+{
+  const app = fs.readFileSync(path.join(REPO, 'app.js'), 'utf8');
+  const cut = (head) => {
+    const at = app.indexOf(head);
+    if (at < 0) return null;
+    let depth = 0, i = app.indexOf('{', at);
+    for (; i < app.length; i++) {
+      if (app[i] === '{') depth++;
+      else if (app[i] === '}' && --depth === 0) break;
+    }
+    return app.slice(at, i + 1);
+  };
+  const sigSrc = cut('function placesSignature()');
+  const armSrc = cut('async function rearmGeofencesFromPlaces(why, force)');
+  if (!sigSrc || !armSrc) {
+    check('place-arming functions found in app.js', false, 'moved or renamed');
+  } else {
+    const AsyncFunction = Object.getPrototypeOf(async () => {}).constructor;
+    const scenario = async (S, answer) => {
+      const calls = [];
+      const NG = { armPlaces: async (arg) => { calls.push(arg.places.map((p) => p.id)); return answer; } };
+      const run = new AsyncFunction('S', 'NG', `
+        let _armedSig = null, _lastArmMs = 0;
+        const ARM_THROTTLE_MS = 15000;
+        const isNative = () => true, nativeGeo = () => NG, syncNativeAddPlace = async () => {};
+        const console = { info() {}, warn() {} };
+        ${sigSrc}
+        ${armSrc}
+        await rearmGeofencesFromPlaces('test', true);
+        return { armedSig: _armedSig };`);
+      const out = await run(S, NG);
+      return { calls, armedSig: out.armedSig };
+    };
+    const home = { id: 'a', lat: 1, lng: 2, radius_m: 100, name: 'Home', icon: '🏠' };
+
+    let r = await scenario({ places: [], _placesLoaded: true }, { armed: 0, ok: true });
+    check('an empty list that was read reaches native (the prune case)',
+      r.calls.length === 1 && r.calls[0].length === 0, JSON.stringify(r.calls));
+    r = await scenario({ places: [] }, { armed: 0, ok: true });
+    check('an empty list nobody has read does not', r.calls.length === 0, JSON.stringify(r.calls));
+    r = await scenario({ places: [home], _placesLoaded: true }, { armed: 1, ok: true });
+    check('a list Play Services accepted is recorded as armed',
+      r.calls.length === 1 && r.armedSig === 'a:1:2:100:Home:🏠', String(r.armedSig));
+    r = await scenario({ places: [home], _placesLoaded: true }, { armed: 0, ok: false });
+    check('a list Play Services refused is not, so it is retried', r.armedSig === null, String(r.armedSig));
+  }
+}
+
+// Sign-out and Disconnect, made offline. supabase-js resolves with an error
+// and stops BEFORE clearing its stored session when the logout request
+// fails on the network; the privacy page says Disconnect "clears the app's
+// stored credentials". signOutHere must remove them either way (4.11.1).
+console.log('\napp: signing out on this device');
+{
+  const app = fs.readFileSync(path.join(REPO, 'app.js'), 'utf8');
+  const at = app.indexOf('async function signOutHere()');
+  let src = null;
+  if (at >= 0) {
+    let depth = 0, i = app.indexOf('{', at);
+    for (; i < app.length; i++) {
+      if (app[i] === '{') depth++;
+      else if (app[i] === '}' && --depth === 0) break;
+    }
+    src = app.slice(at, i + 1);
+  }
+  if (!src) {
+    check('signOutHere found in app.js', false, 'moved or renamed');
+  } else {
+    const AsyncFunction = Object.getPrototypeOf(async () => {}).constructor;
+    for (const [label, answer] of [['offline', { error: { name: 'AuthRetryableFetchError' } }], ['online', { error: null }]]) {
+      const removed = [];
+      const S = { sb: { auth: { storageKey: 'sb-abc-auth-token', signOut: async () => answer } } };
+      const store = { removeItem: async (k) => { removed.push(k); } };
+      const run = new AsyncFunction('S', 'store', `
+        const SB_URL = 'https://abc.supabase.co';
+        const buildAuthStorage = () => store;
+        const window = {};
+        const console = { warn() {} };
+        ${src}
+        return signOutHere();`);
+      const confirmed = await run(S, store);
+      check(`${label}: the stored session is removed from this device`,
+        removed.includes('sb-abc-auth-token'), JSON.stringify(removed));
+      check(`${label}: says whether the server heard`, confirmed === (label === 'online'), String(confirmed));
+    }
+  }
 }
 
 console.log('\nwizard: every source file parses');
