@@ -513,6 +513,18 @@ BEGIN
       NULL;   -- judged below by what is left
     END;
     SELECT count(*) INTO v_n FROM keep_members WHERE user_id = uid_d;
+    -- From v19 a declined account is deleted (v19-verify 1a proves that), so
+    -- asking again takes a new one, made while sign-ups are still inside the
+    -- 3e window. On v17 and v18 the same account asks again.
+    IF NOT EXISTS (SELECT 1 FROM auth.users WHERE id = uid_d) THEN
+      INSERT INTO auth.users (id, instance_id, aud, role, email, encrypted_password,
+                              confirmation_token, recovery_token, email_change_token_new, email_change,
+                              created_at, updated_at)
+        VALUES (gen_random_uuid(), '00000000-0000-0000-0000-000000000000', 'authenticated', 'authenticated',
+                'v17gone@test.local', extensions.crypt('x', extensions.gen_salt('bf')),
+                '', '', '', '', now(), now())
+        RETURNING id INTO uid_d;
+    END IF;
     PERFORM _v17_act_as(uid_d);
     SELECT j.status, j.member_id INTO v_status, v_d_mid
       FROM join_keep_by_code((SELECT code FROM keeps WHERE id = v_keep), 'Gone', '🫥') j;

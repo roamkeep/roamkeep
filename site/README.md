@@ -46,11 +46,21 @@ say-so, because each is a public promise:
 - **`faq`**, "How was Roamkeep built?": the disclosure wording.
 - **`faq`**, "Someone has an old invite link. Can they get in?" (signed
   off 2026-10-07): a link without a current code reaches the server, not the
-  family; codes stop after 72 hours or when rotated; removing someone
-  rotates it. Change it if any of those stops being true.
-- **`security`**, "What has been reviewed", which changes when an
-  independent review is booked or published; and **every release lists the
-  SHA-256 of `app.js`** on GitHub, from 4.11.0.
+  family; codes stop after 72 hours or when rotated; declining or removing
+  someone rotates it and deletes their account (v19). Change it if any of
+  those stops being true.
+- **`security`**, "What has been reviewed" (revised and signed off
+  2026-10-11): the September and October reviews were both AI-assisted and
+  run by the developer, so neither is independent; no independent audit has
+  been done, and paying for one is a donation item (`support` lists it, and
+  the `faq` "Has it been audited?" says the same). It changes when an audit
+  is booked or published. And **every release lists the SHA-256 of
+  `app.js`** on GitHub, from 4.11.0.
+- **`delete-account`** (2026-10-11): this is the deletion URL in Play
+  Console, so its steps must match the app's labels: **Leave and delete my
+  account**; a child's **Ask to leave and delete my account**; an owner's
+  **Remove**, which deletes the person's account. Change it with any change
+  to those labels or to what leaving deletes.
 
 Still to come: the setup video and the promo video (Phase 2), and
 screenshots of the release build (Phase 2).

@@ -13,12 +13,13 @@
 // AND the cleared hash) needs both weakened, or the other one hides it.
 //
 // Steps are named as each script names them: v17-verify's plainly ('2b'),
-// v18-verify's with its prefix ('v18:2b'), because both number from 1.
+// v18-verify's and v19-verify's with their prefix ('v18:2b', 'v19:1a'),
+// because they all number from 1.
 
 import { read, prep, project, addUser } from './supabase.mjs'
 
 const SCHEMA = read('db/schema.sql').replace(/\r\n/g, '\n')
-const VERIFY = [['db/tests/v17-verify.sql', ''], ['db/tests/v18-verify.sql', 'v18:']]
+const VERIFY = [['db/tests/v17-verify.sql', ''], ['db/tests/v18-verify.sql', 'v18:'], ['db/tests/v19-verify.sql', 'v19:']]
 
 // [name, [[from, to, 'last'?], ...], steps that must fail]. 'last' replaces
 // the final occurrence — set_signups shares a clause with set_project_url,
@@ -27,8 +28,10 @@ const MUTATIONS = [
   ['pending members see the keep', [['WHERE user_id = auth.uid() AND approved $$', 'WHERE user_id = auth.uid() $$']], ['1c', '1d']],
   ['guard ignores approved', [['      OR NEW.approved     IS DISTINCT FROM OLD.approved\n', '']], ['1g']],
   ['joins skip approval', [["'member', 'adult', NOT v_keep.require_approval)", "'member', 'adult', true)"]], ['1b']],
-  ['anyone may approve', [["  PERFORM 1 FROM keeps WHERE id = v_keep_id FOR UPDATE;\n  IF NOT EXISTS (",
-                           "  PERFORM 1 FROM keeps WHERE id = v_keep_id FOR UPDATE;\n  IF false AND NOT EXISTS (", 'last']], ['1f', '4a']],
+  // Anchored on approve_member's own "already in" return: from v19
+  // decline_member has the same lock-then-owner-check lines.
+  ['anyone may approve', [["    RAISE EXCEPTION 'not_owner';\n  END IF;\n\n  SELECT approved INTO v_approved FROM keep_members WHERE id = p_member_id;\n  IF v_approved THEN\n    RETURN;",
+                           "    NULL;\n  END IF;\n\n  SELECT approved INTO v_approved FROM keep_members WHERE id = p_member_id;\n  IF v_approved THEN\n    RETURN;"]], ['1f', '4a']],
   ['decline removes approved members', [["  IF v_approved THEN\n    RAISE EXCEPTION 'not_pending';",
                                          "  IF false THEN\n    RAISE EXCEPTION 'not_pending';"]], ['1i']],
   ['sync wakes reach pending members', [['JOIN keep_members m ON m.id = p.member_id AND m.approved   -- v17',
@@ -137,6 +140,23 @@ const MUTATIONS = [
   ['guard ignores created_at', [['      OR NEW.created_at   IS DISTINCT FROM OLD.created_at\n', '']], ['v18:5c']],
   ['notification settings not pair-bound', [['    AND (member_id, keep_id) IN (SELECT id, keep_id FROM keep_members WHERE user_id = auth.uid())\n    -- Subject',
                                               '    AND member_id IN (SELECT id FROM keep_members WHERE user_id = auth.uid())\n    -- Subject']], ['v18:5d']],
+  // v19: Decline deletes the account and changes the code. Anchored on the
+  // lines only decline_member has.
+  ['decline keeps the account', [["    RAISE EXCEPTION 'not_pending';\n  END IF;\n  PERFORM _roamkeep_delete_member(p_member_id);",
+                                  "    RAISE EXCEPTION 'not_pending';\n  END IF;\n  DELETE FROM keep_members WHERE id = p_member_id;"]], ['v19:1a']],
+  ['decline keeps the code', [["  PERFORM _roamkeep_delete_member(p_member_id);\n  PERFORM rotate_keep_code(v_keep_id);\nEND;\n$$;\nREVOKE ALL ON FUNCTION decline_member",
+                               "  PERFORM _roamkeep_delete_member(p_member_id);\nEND;\n$$;\nREVOKE ALL ON FUNCTION decline_member"]], ['v19:1b']],
+  // Two defences: decline_member's own owner check, and rotate_keep_code's,
+  // which it calls last and which refuses anyone but an approved owner, so
+  // the whole decline rolls back. Both must go, or the second hides the first.
+  ['anyone may decline', [["    RAISE EXCEPTION 'not_owner';\n  END IF;\n  SELECT approved INTO v_approved FROM keep_members WHERE id = p_member_id;\n  IF NOT FOUND THEN",
+                           "    NULL;\n  END IF;\n  SELECT approved INTO v_approved FROM keep_members WHERE id = p_member_id;\n  IF NOT FOUND THEN"],
+                           ["  PERFORM _roamkeep_delete_member(p_member_id);\n  PERFORM rotate_keep_code(v_keep_id);\nEND;\n$$;\nREVOKE ALL ON FUNCTION decline_member",
+                            "  PERFORM _roamkeep_delete_member(p_member_id);\nEND;\n$$;\nREVOKE ALL ON FUNCTION decline_member"]], ['v19:1d', 'v19:1e']],
+  ['an owner still waiting may decline', [["role = 'owner' AND approved\n  ) THEN\n    RAISE EXCEPTION 'not_owner';\n  END IF;\n  SELECT approved INTO v_approved FROM keep_members WHERE id = p_member_id;\n  IF NOT FOUND THEN",
+                                           "role = 'owner'\n  ) THEN\n    RAISE EXCEPTION 'not_owner';\n  END IF;\n  SELECT approved INTO v_approved FROM keep_members WHERE id = p_member_id;\n  IF NOT FOUND THEN"],
+                           ["  PERFORM _roamkeep_delete_member(p_member_id);\n  PERFORM rotate_keep_code(v_keep_id);\nEND;\n$$;\nREVOKE ALL ON FUNCTION decline_member",
+                            "  PERFORM _roamkeep_delete_member(p_member_id);\nEND;\n$$;\nREVOKE ALL ON FUNCTION decline_member"]], ['v19:1e']],
 ]
 
 function mutate(src, pairs) {

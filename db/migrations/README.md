@@ -19,6 +19,7 @@ reach.
 |---|---|---|
 | 17 | 4.11.0 | Owner approval of joins, the in-app switch for new accounts, password reset without email, and account deletion. The app shows them once the server is on 17. Checked by `../tests/v17-verify.sql` |
 | 18 | 4.11.1 | Leaving, removal and a completed child deletion request delete the sign-in too; reset codes are checked again when used; a pending member is refused by every function, not only by the policies. All server-side, so it protects every app version. Checked by `../tests/v18-verify.sql` |
+| 19 | 4.11.2 | An owner's Decline deletes the account made to ask and changes the join code. Checked by `../tests/v19-verify.sql` |
 
 What each version adds is listed in [`../../CHANGELOG.md`](../../CHANGELOG.md).
 

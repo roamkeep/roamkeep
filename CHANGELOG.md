@@ -7,6 +7,26 @@ the app says so, and an owner updates it from **Settings → Family server**.
 An older server keeps working; it just goes without the new features that
 need it.
 
+## 4.11.2 (in testing)
+
+Update your family's server too (Settings → Family server) for the change
+to declining.
+
+- **Declining a request deletes the account made to ask**, and changes your
+  invite code, as removing someone does. Before, someone you declined kept
+  the account and the invite, and could keep asking again until the code ran
+  out. The app says both before you decline. The person asking is told and
+  signed out, so they can start again if you invite them.
+- **The Sign In button works after you sign out.** It used to stay greyed
+  out, reading "Please wait", until the app was closed. Create Account, Create
+  Keep and Join had the same fault.
+- **Cancelling a request to join says what it does.** Since 4.11.1, leaving
+  deletes your account, and cancelling a request you're still waiting on
+  counts as leaving. The app now says so before you confirm, and signs this
+  phone out afterwards, so you can make a new account and ask again. Before,
+  it kept going as if the account were still there, and asking again failed
+  with an error. An owner declining your request still keeps your account.
+
 ## 4.11.1 (in testing)
 
 Fixes from an independent review of the whole app. Update your family's

@@ -108,8 +108,10 @@ gets forwarded is a request rather than a way in. When someone joins, owners
 get a "wants to join" notification and the person appears under **Waiting for
 approval** at the top of the Family tab. Until an owner taps **Approve** they
 can't see anyone, and nothing is shared from their phone. If you don't
-recognise them, tap **Decline**, then rotate your invite code (**Rotate code**,
-in the invite) so the invite they used stops working. A Keep created before
+recognise them, tap **Decline**. That deletes the account they made to ask and
+changes your invite code, so the invite they used stops working. Any invite
+you've sent that hasn't been used yet stops too, so share a fresh one. A Keep
+created before
 Roamkeep 4.11.0 lets people straight in until an owner turns on **Settings →
 Approve new members**.
 
@@ -119,8 +121,8 @@ to the front door. It shows them nothing, and lets them make an account only
 while new accounts are open (Step 5). The code is what lets someone ask to
 join, and it stops working after 72 hours or when you rotate it. So a link
 you shared months ago gets nobody in, and with approval on, a forwarded one is
-a request you can decline. Removing someone from the Family tab changes the
-code for you, so the invite they joined with stops working. Any invite you've
+a request you can decline. Declining or removing someone in the Family tab
+changes the code for you, so the invite they used stops working. Any invite you've
 sent that hasn't been used yet stops too, so share a fresh one.
 
 Mark children as **Child** in the Family tab. Adults can pause their own
@@ -385,15 +387,18 @@ select (select schema_version from roamkeep_meta)                    as version,
                                  where c like 'search_path=%pg_temp'
                                     or c = 'search_path=""'))
           from pg_proc
-         where pronamespace = 'public'::regnamespace and prosecdef)  as pg_temp_last;
+         where pronamespace = 'public'::regnamespace and prosecdef)  as pg_temp_last,
+       (select bool_and(prosrc like '%_roamkeep_delete_member%') from pg_proc
+         where proname = 'decline_member')                           as v19_decline;
 ```
 
-A finished v18 reads `version 18`, `url` set to **this** project,
+A finished v19 reads `version 19`, `url` set to **this** project,
 `checkin_cols 4`, `prefs_table 1`, `recipients_fn 1`, `feed_view 1`,
 `v16_fns 2`, `v17_cols 5`, `reset_table 1`, `v17_fns 12`, `triggers 8`,
-`sends_secret true`, `v18_fn 1`, `pg_temp_last true`.
+`sends_secret true`, `v18_fn 1`, `pg_temp_last true`, `v19_decline true`.
 
-(A finished v17 reads `v18_fn 0`, `pg_temp_last false` and the rest the
+(A finished v18 reads `v19_decline false` and the rest the same. A finished
+v17 also reads `v18_fn 0`, `pg_temp_last false` and the rest the
 same. A finished v16 also reads `v17_cols 0`, `reset_table 0`, `v17_fns 0`,
 `triggers 4` and the rest the same. A finished v13–v15 also reads
 `checkin_cols 3`, `v16_fns 0` and `triggers 2`.) If `sends_secret` is **false**, check-in notifications

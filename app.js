@@ -51,7 +51,7 @@
   // Tracked separately because the two documents move independently — v14
   // changed only the privacy policy, and showing one date for both on the
   // very screen asking people to agree again would be its own small lie.
-  const PRIVACY_DATE = '9 October 2026';      // matches landing/privacy
+  const PRIVACY_DATE = '11 October 2026';     // matches landing/privacy
   const TERMS_URL = 'https://get.roamkeep.app/terms';
   const PRIVACY_URL = 'https://get.roamkeep.app/privacy';
   const TERMS_STORE_KEY = 'rk_terms';
@@ -127,6 +127,9 @@
   // app says what that server does: Remove leaves the sign-in, and adults
   // leave through delete_my_account.
   const SCHEMA_WITH_LEAVE_DELETES = 18;
+  // v19: an owner's Decline deletes the account made to ask, and changes the
+  // join code, as Remove does.
+  const SCHEMA_WITH_DECLINE_DELETES = 19;
 
   // What to assume when roamkeep_meta / roamkeep_schema_version() is
   // absent. Every database provisioned before v12 is at 11 (the last
@@ -139,7 +142,7 @@
   // which provision.js carries (cli/test.mjs checks the two agree). Not a
   // requirement — NEEDS_SCHEMA is that — but what Settings measures a
   // family's server against when it offers an owner the update.
-  const SHIPPED_SCHEMA = 18;
+  const SHIPPED_SCHEMA = 19;
 
   // 4.7.0 shipped this equal to SCHEMA_PRE_META, so the gate was INERT on
   // arrival — a gate that demanded its own migration would have locked
@@ -376,7 +379,21 @@
 
   function show(id) {
     document.querySelectorAll('.screen').forEach(s => s.classList.remove('on'));
-    $(id)?.classList.add('on');
+    const screen = $(id);
+    if (!screen) return;
+    screen.classList.add('on');
+    // 4.11.2: a form button busied by btnLoad is put back whenever its screen
+    // is shown. Sign in, Create Account, Create Keep and Join only reset
+    // their button on an error; on success they move to another screen and
+    // left it disabled, reading "Please wait", for the rest of the session.
+    // So after Sign out the Sign In button could not be pressed again
+    // without killing the app, and after a cancelled join request (which
+    // signs out) neither could Create Account.
+    screen.querySelectorAll('button[data-idle]').forEach((b) => {
+      b.disabled = false;
+      b.textContent = b.dataset.idle;
+      delete b.dataset.idle;
+    });
   }
 
   function setMsg(t) {
@@ -408,6 +425,8 @@
     if (!b) return;
     b.disabled = on;
     b.textContent = on ? '⏳ Please wait…' : lbl;
+    // Remembered so show() can put it back (see there).
+    if (on) b.dataset.idle = lbl; else delete b.dataset.idle;
   }
 
   function toast(msg, type) {
@@ -8121,23 +8140,26 @@
    * declined it.
    */
   async function resolveNoMembership() {
-    // An owner may have deleted this account (a child's, v17). The session
-    // outlives the account until its token expires, so ask the auth server,
-    // and only act on its explicit answer: a network failure must never
-    // sign anyone out.
-    try {
-      const { error: uErr } = await S.sb.auth.getUser();
-      if (uErr && (uErr.code === 'user_not_found' || /does not exist/i.test(uErr.message || ''))) {
+    // An owner may have deleted this account: a child's (v17), anyone they
+    // remove (v18), or a request they declined (v19). The session outlives
+    // the account until its token expires, so ask the auth server.
+    if (await accountGone()) {
+      const declined = await wasPendingHere();
+      await prefSet(PENDING_KEY, '');
+      await teardownNative();
+      await signOutHere();
+      // SIGNED_OUT does this too, but not if signOut itself failed.
+      S.authHandled = false;
+      S.user = null;
+      show('s-auth');
+      if (declined) {
+        authTab('up');
+        setErr('auth-err', declinedText(declined));
+      } else {
         toast('Your account on this family server was deleted.', 'err');
-        await teardownNative();
-        await signOutHere();
-        // SIGNED_OUT does this too, but not if signOut itself failed.
-        S.authHandled = false;
-        S.user = null;
-        show('s-auth');
-        return;
       }
-    } catch (_) {}
+      return;
+    }
     if (S.schemaVersion >= SCHEMA_WITH_V17_ACCOUNTS) {
       const { data, error } = await S.sb.rpc('my_membership');
       const row = Array.isArray(data) ? data[0] : data;
@@ -8225,30 +8247,87 @@
     stopPendingPoll();
     const name = (await wasPendingHere()) || S.pendingKeepName || 'the Keep';
     await prefSet(PENDING_KEY, '');
+    // v19: declining deletes the account made to ask, so this session is all
+    // that is left of it. Going back to the Keep screen on it was the 4.11.1
+    // cancel bug again: joining from there fails on a foreign key. Decided by
+    // the auth server's answer rather than the schema version, so an older
+    // server, where a declined account survives, keeps the old behaviour.
+    if (await accountGone()) {
+      await signOutHere();
+      S.authHandled = false;
+      S.user = null;
+      show('s-auth');
+      authTab('up');
+      setErr('auth-err', declinedText(name));
+      return;
+    }
     showKeepScreen();
     keepTab('jo');
     setErr('keep-err', 'Your request to join ' + name + ' wasn’t accepted. If you think that’s a mistake, ask them for a new invite.');
   }
 
+  function declinedText(name) {
+    return 'Your request to join ' + name + ' wasn’t accepted, and the account you made to ask '
+      + 'was deleted. If you think that’s a mistake, ask them for a new invite.';
+  }
+
+  // True only when the auth server says this session's account no longer
+  // exists. Anything else, a network failure included, is false: a check
+  // that can't reach the server must never sign anyone out.
+  async function accountGone() {
+    try {
+      const { error } = await S.sb.auth.getUser();
+      return !!error && (error.code === 'user_not_found' || /does not exist/i.test(error.message || ''));
+    } catch (_) { return false; }
+  }
+
+  // 4.11.2: from v18, leave_keep deletes the leaver's sign-in, and a pending
+  // member's cancel goes through it, so cancelling a request deletes the
+  // account made to send it. Nothing said so, and the app went back to the
+  // Keep screen on an account that no longer existed: joining again then
+  // failed with a raw foreign-key error (keep_join_attempts_user_id_fkey).
+  // An owner's Decline keeps the account; this does not, so the
+  // question says so, and the phone signs out after it. A pending member
+  // has nothing native running (no service, fences or push token), so there
+  // is nothing else to tear down.
   async function cancelPending() {
     const name = S.pendingKeepName || 'this Keep';
-    if (!confirm('Cancel your request to join ' + name + '?')) return;
+    const deletes = S.schemaVersion >= SCHEMA_WITH_LEAVE_DELETES;
+    if (!confirm('Cancel your request to join ' + name + '?' + (deletes
+      ? '\n\nThis also deletes the account you made to join. To ask again later, '
+        + 'you’ll need to create a new one.'
+      : ''))) return;
     let id = S.pendingMemberId;
     if (!id) {
       const { data } = await S.sb.rpc('my_membership');
       const row = Array.isArray(data) ? data[0] : data;
       id = row && !row.approved ? row.member_id : null;
     }
+    let gone = false;
     if (id) {
       const { error } = await S.sb.rpc('leave_keep', { p_member_id: id });
       if (error && !/member_not_found/.test(error.message || '')) {
         setErr('pend-err', mapRpcError(error));
         return;
       }
+      // member_not_found: an owner got there first (declined, which keeps
+      // the account), so the account is still there to use.
+      gone = deletes && !error;
     }
     stopPendingPoll();
     await prefSet(PENDING_KEY, '');
     S.pendingMemberId = null;
+    if (gone) {
+      // As after Sign out: signOutHere empties the stored session even when
+      // the server can't be reached, and without a SIGNED_OUT event a reload
+      // is what starts clean. The server and the invite stay, so the person
+      // can make a new account and ask again.
+      if (!(await signOutHere())) { location.reload(); return; }
+      show('s-auth');
+      authTab('up');
+      toast('Request cancelled, and your account deleted', 'ok');
+      return;
+    }
     showKeepScreen();
     toast('Request cancelled', 'ok');
   }
@@ -8370,8 +8449,14 @@
     const id = t.dataset.id;
     const m = S.pending.find(x => x.id === id);
     const name = m ? m.name : 'them';
-    if (!confirm('Decline ' + name + '?\n\nThey won’t be let in. If you don’t know who this is, '
-      + 'also rotate your invite code (Invite → Rotate code), so the invite they used stops working.')) return;
+    // v19: declining deletes the account they made to ask, and changes the
+    // invite code, as Remove does, so say both before, like Remove.
+    const deletes = S.schemaVersion >= SCHEMA_WITH_DECLINE_DELETES;
+    if (!confirm('Decline ' + name + '?\n\n' + (deletes
+      ? 'They won’t be let in, and the account they made to ask is deleted. Your invite code '
+        + 'changes too, so any invite you’ve sent that hasn’t been used stops working.'
+      : 'They won’t be let in. If you don’t know who this is, also rotate your invite code '
+        + '(Invite → Rotate code), so the invite they used stops working.'))) return;
     t.disabled = true;
     const { error } = await S.sb.rpc('decline_member', { p_member_id: id });
     if (error) {
@@ -8382,7 +8467,8 @@
     }
     S.pending = S.pending.filter(x => x.id !== id);
     renderMembers();
-    toast('Declined ' + name, 'ok');
+    if (deletes) S.keepCode = '';
+    toast('Declined ' + name + (deletes ? '. Your invite code has changed.' : ''), 'ok');
   }
 
   // Settings → Approve new members, and the line about it on the Invite

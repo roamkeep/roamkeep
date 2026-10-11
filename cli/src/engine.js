@@ -25,7 +25,7 @@ const BASE = 'https://api.supabase.com';
  * The schema_version that db/schema.sql stamps as its last statement.
  * Keep in step with that file; cli/test.mjs checks the two agree.
  */
-export const SCHEMA_VERSION = 18;
+export const SCHEMA_VERSION = 19;
 
 /** The Edge Functions every family server needs. */
 export const FUNCTIONS = ['notify-checkin', 'notify-places'];

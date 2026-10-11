@@ -2474,6 +2474,18 @@ $$;
 REVOKE ALL ON FUNCTION approve_member(uuid) FROM PUBLIC, anon;
 GRANT EXECUTE ON FUNCTION approve_member(uuid) TO authenticated;
 
+-- v19: declining a request deletes the account made to send it, and changes
+-- the join code, as removing someone does. Until v19 a declined person kept
+-- both the account and the invite, and could ask again with the same code
+-- until it ran out or an owner rotated it: every ask another "wants to join"
+-- for the owners, slowed only by the per-account attempt limit. Nobody the
+-- family turned away needs an account on its server, and the code they hold
+-- is what lets them ask again. The cost is removal's: invites sent to others
+-- and not yet used stop working, which the app's confirmation says. A pending
+-- member's own Cancel (leave_keep) has deleted the account since v18, so every
+-- way out of a family now does. An account still in another Keep keeps its
+-- sign-in (_roamkeep_delete_member). Takes the keep's lock, like the other
+-- membership changes, and reads `approved` again under it.
 CREATE OR REPLACE FUNCTION decline_member(p_member_id uuid)
 RETURNS void
 LANGUAGE plpgsql
@@ -2488,20 +2500,26 @@ BEGIN
   IF v_uid IS NULL THEN
     RAISE EXCEPTION 'not_authenticated';
   END IF;
-  SELECT keep_id, approved INTO v_keep_id, v_approved FROM keep_members WHERE id = p_member_id;
+  SELECT keep_id INTO v_keep_id FROM keep_members WHERE id = p_member_id;
   IF NOT FOUND THEN
     RAISE EXCEPTION 'member_not_found';
   END IF;
+  PERFORM 1 FROM keeps WHERE id = v_keep_id FOR UPDATE;
   IF NOT EXISTS (
     SELECT 1 FROM keep_members
      WHERE keep_id = v_keep_id AND user_id = v_uid AND role = 'owner' AND approved
   ) THEN
     RAISE EXCEPTION 'not_owner';
   END IF;
+  SELECT approved INTO v_approved FROM keep_members WHERE id = p_member_id;
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'member_not_found';
+  END IF;
   IF v_approved THEN
     RAISE EXCEPTION 'not_pending';
   END IF;
-  DELETE FROM keep_members WHERE id = p_member_id;
+  PERFORM _roamkeep_delete_member(p_member_id);
+  PERFORM rotate_keep_code(v_keep_id);
 END;
 $$;
 REVOKE ALL ON FUNCTION decline_member(uuid) FROM PUBLIC, anon;
@@ -3005,9 +3023,9 @@ END$$;
 -- upgrade path, and it must never walk a database BACKWARDS if someone
 -- runs an older checkout of it against a newer database.
 
-INSERT INTO roamkeep_meta (id, schema_version) VALUES (true, 18)
+INSERT INTO roamkeep_meta (id, schema_version) VALUES (true, 19)
   ON CONFLICT (id) DO UPDATE
-    SET schema_version = GREATEST(roamkeep_meta.schema_version, 18),
+    SET schema_version = GREATEST(roamkeep_meta.schema_version, 19),
         updated_at = now();
 
 
