@@ -7,6 +7,34 @@ the app says so, and an owner updates it from **Settings → Family server**.
 An older server keeps working; it just goes without the new features that
 need it.
 
+## 4.11.3 (in testing)
+
+Update your family's server (Settings → Family server). The fix is on the
+server, so once it is updated it works for every version of the app.
+
+- **Turning notifications back on no longer brings back what you muted.**
+  After a long mute, you used to get a burst of the arrivals and departures
+  from while they were off, going back as far as a week. Now you hear only
+  what happens after you turn them on. This works for all notifications and
+  for one person at one place.
+- **Old arrivals and departures no longer arrive as new.** If your phone was
+  off or out of signal for a while, it no longer shows you arrivals and
+  departures from more than an hour ago when it comes back. They are still in
+  Activity. Each notification now shows when it happened, and an SOS is always
+  shown, however late.
+- **Edit panels sit right on the keyboard and show their buttons.** Typing in
+  a panel that slides up (your name, the family name, a place) no longer
+  leaves a gap above the keyboard, or pushes the top of the panel off the
+  screen. Panels now open at their full height, so Save and Update are on
+  screen without dragging the panel up.
+- **Stronger passwords.** A new password needs at least 8 characters
+  everywhere, and can't be one of the most common passwords or contain your
+  email's name. Changing your password asks for your current one, and your
+  server checks it once updated. Passwords you already have keep working.
+- **Supabase's Security Advisor no longer warns "Extension in Public"** on a
+  server set up from the app. Nothing was exposed, but it looked alarming.
+  Updating your server fixes it.
+
 ## 4.11.2 (in testing)
 
 Update your family's server too (Settings → Family server) for the change

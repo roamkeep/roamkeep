@@ -213,7 +213,7 @@ async function cleanup() {
 
 // ── the probe ─────────────────────────────────────────────────
 const TABLES = ['keeps', 'keep_members', 'checkins', 'location_history', 'keep_places', 'keep_notify_prefs',
-  'keep_member_push', 'password_reset_codes', 'keep_join_attempts', 'roamkeep_secrets'];
+  'keep_member_push', 'password_reset_codes', 'keep_join_attempts', 'roamkeep_secrets', 'checkin_notices'];
 const NIL = '00000000-0000-0000-0000-000000000000';
 // Real argument names: called with none, PostgREST answers "no such
 // function" whatever the caller's privileges, and the test would pass for
@@ -227,10 +227,11 @@ const ARGS = {
   prune_keep_history: {}, get_invite: { p_keep_id: NIL }, set_project_url: { p_url: 'https://x.supabase.co' },
   checkin_recipients: { p_checkin: NIL }, keep_push_recipients: { p_keep: NIL },
   keep_owner_push_recipients: { p_keep: NIL }, reset_notice_recipients: { p_user: NIL },
-  _roamkeep_gen_code: {}, roamkeep_notify_join: {}, roamkeep_notify_reset: {},
+  _roamkeep_gen_code: {}, roamkeep_notify_join: {}, roamkeep_notify_reset: {}, _roamkeep_record_notices: {},
 };
 const NOT_FOR_CLIENTS = ['checkin_recipients', 'keep_push_recipients', 'keep_owner_push_recipients',
-  'reset_notice_recipients', '_roamkeep_gen_code', 'roamkeep_notify_join', 'roamkeep_notify_reset'];
+  'reset_notice_recipients', '_roamkeep_gen_code', 'roamkeep_notify_join', 'roamkeep_notify_reset',
+  '_roamkeep_record_notices'];
 // Refused for want of the privilege (or not exposed at all), not for any
 // other reason.
 const noExec = (r) => r.status === 404 || ([401, 403].includes(r.status) && r.text.includes('permission denied'));
@@ -392,6 +393,19 @@ async function probe() {
     const foreign = Array.isArray(r.json) ? r.json.filter((x) => x.keep_id !== keepId).length : -1;
     rec('A8', foreign === 0, `an adult sees only their own family in ${t}`, `${foreign} foreign row(s); ${brief(r)}`);
   }
+  // v20: only the database writes notices, and each member reads their own.
+  // 42501 for both: a refusal for any other reason (a duplicate, a bad id)
+  // would pass for the wrong one.
+  r = await rest('adult', 'GET', `/checkins?select=id&keep_id=eq.${keepId}&limit=1`);
+  const ck = r.json?.[0]?.id || NIL;
+  r = await rest('adult', 'POST', '/checkin_notices', { checkin_id: ck, member_id: P.adult.mid });
+  rec('A9', r.status === 404 ? null : refused(r, '42501'), r.status === 404
+    ? 'no checkin_notices table: a server before v20' : 'an adult cannot write a notice', brief(r));
+  r = await rest('adult', 'GET', '/checkin_notices?select=member_id');
+  const notMine = Array.isArray(r.json) ? r.json.filter((x) => x.member_id !== P.adult.mid).length : -1;
+  rec('A10', r.status === 404 ? null : notMine === 0, r.status === 404
+    ? 'no checkin_notices table: a server before v20' : 'an adult reads only their own notices',
+    `${notMine} row(s) of other members; ${brief(r)}`);
 
   // ── an owner, and the reset flow (v17 self-review R1, R3) ──
   r = await rpc('owner', 'delete_child_account', { p_member_id: P.adult.mid });
@@ -457,8 +471,17 @@ async function probe() {
     r.text.includes('recipients=2') ? 'woke the whole family: notify-places is not the rc8 function (run Check and repair)' : brief(r));
   r = await rpc(null, 'redeem_password_reset', { p_email: P.adult.email, p_code: adultCode, p_new_password: crypto.randomBytes(12).toString('base64url') });
   rec('O5', r.text.includes('ok'), 'the code redeems signed out', brief(r));
+  // v17 refused deleting your own account for a day after a reset; v18
+  // dropped that on purpose (removing someone already deletes them, so the
+  // block protected nothing). Said per version, as v17-verify 2k does. On 18
+  // and later this deletes the probe's adult, its last use; cleanup copes.
   r = await rpc('adult', 'delete_my_account');
-  rec('R1b', refused(r, 'recent_reset'), 'the account cannot be deleted for a day after a reset', brief(r));
+  if (meta.schema_version >= 18) {
+    rec('R1b', r.status < 300 && !r.text.includes('recent_reset'),
+      'a reset no longer blocks deleting your own account (v18)', brief(r));
+  } else {
+    rec('R1b', refused(r, 'recent_reset'), 'the account cannot be deleted for a day after a reset', brief(r));
+  }
 
   // ── the sign-up gate, through GoTrue itself ──
   await sql(`update roamkeep_meta set signups_closed = true, signups_open_until = null where id`);
@@ -470,9 +493,13 @@ async function probe() {
   // test), so the app reads the gate's state instead (G1c). Reported, not
   // judged.
   rec('G1b', r.text.includes('signups_closed') ? true : null, 'GoTrue passes the reason through as signups_closed', brief(r));
-  const meta = await rest(null, 'GET', '/roamkeep_meta?select=signups_closed,signups_open_until');
-  rec('G1c', meta.status === 200 && meta.json?.[0]?.signups_closed === true,
-    'signed out, the app can read that new accounts are closed (how it explains a refusal)', brief(meta));
+  // `gate`, not `meta`: a const named meta here shadowed the top-level one
+  // for the whole of probe(), so R1c's `meta.project_url` above threw
+  // "Cannot access 'meta' before initialization" and every run from rc10
+  // to 4.11.3-rc2 stopped after R3b.
+  const gate = await rest(null, 'GET', '/roamkeep_meta?select=signups_closed,signups_open_until');
+  rec('G1c', gate.status === 200 && gate.json?.[0]?.signups_closed === true,
+    'signed out, the app can read that new accounts are closed (how it explains a refusal)', brief(gate));
   r = await http('POST', `${URL_}/auth/v1/signup`, { body: {} });
   rec('G2', r.status >= 400, 'closed: an anonymous sign-in is refused', brief(r));
   const settings = await http('GET', `${URL_}/auth/v1/settings`);

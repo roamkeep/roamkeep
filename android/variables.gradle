@@ -4,9 +4,10 @@ ext {
     // latest release: from 31 Aug 2026 an app targeting 35 cannot be
     // updated at all, which surfaced as a closed-testing rejection.
     //
-    // The SDK also ships an "android-36.1" minor platform. Do NOT point
-    // compileSdk at it — minor SDK versions need AGP 8.13+, and AGP here is
-    // 8.7.2. Base 36 satisfies Play either way.
+    // Needs AGP 8.9.1 or later (root build.gradle has 8.13.2 since 4.11.3;
+    // 8.7.2 was only tested to 35 and warned on every build). The SDK also
+    // ships an "android-36.1" minor platform, which 8.13 could build, but
+    // nothing here needs it: base 36 satisfies Play.
     compileSdkVersion = 36
     targetSdkVersion = 36
     androidxActivityVersion = '1.9.2'

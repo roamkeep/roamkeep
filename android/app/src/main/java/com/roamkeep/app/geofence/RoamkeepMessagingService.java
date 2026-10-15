@@ -24,6 +24,7 @@ import org.json.JSONObject;
 import java.net.URLEncoder;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
+import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -61,6 +62,12 @@ public class RoamkeepMessagingService extends MessagingService {
     // cannot spam the shade; anything over it is summarised in one line.
     // SOS is never capped.
     private static final int MAX_PER_WAKE = 5;
+    // 4.11.3: an arrival or departure the server received longer ago than
+    // this is not raised. A phone that was off or out of signal for hours
+    // got them all when it came back, each looking as if it had just
+    // happened. They stay in Activity. SOS has no limit: a late one is still
+    // raised.
+    static final long ALERT_MAX_AGE_MS = 60 * 60 * 1000L;
     // First wake-up after an install has no watermark; only look back
     // this far so we don't replay old history as fresh notifications.
     private static final long COLD_START_LOOKBACK_MS = 10 * 60 * 1000L;
@@ -438,9 +445,19 @@ public class RoamkeepMessagingService extends MessagingService {
             } catch (Exception ignored) {}
         }
 
+        // Too old to be news (4.11.3). Taken out of the notifications only:
+        // the watermark has already moved past them, and they stay in
+        // Activity. Not added to the seen set either, which is capped: an
+        // hour-old row stays too old on every later overlap.
+        int stale = 0;
+        for (Iterator<JSONObject> it = others.iterator(); it.hasNext(); ) {
+            if (tooOldToRaise(parseIsoMs(it.next().optString(col, null)), nowMs)) { it.remove(); stale++; }
+        }
+        final String staleNote = stale > 0 ? "; " + stale + " older than an hour not raised" : "";
+
         if (sos.isEmpty() && others.isEmpty()) {
             if (newest != null) saveMark(prefs, serverClock, newest);
-            prefs.journal("push: wake-up → 0 new");
+            prefs.journal("push: wake-up → 0 new" + staleNote);
             return;
         }
 
@@ -451,7 +468,7 @@ public class RoamkeepMessagingService extends MessagingService {
             JSONObject r = sos.get(i);
             notify(ctx, r.optString("id", "sos-" + i),
                     "🆘 " + r.optString("member_name", "Someone") + " sent an SOS",
-                    "Tap to see their location on the map", true);
+                    "Tap to see their location on the map", true, eventMs(r));
             raised.add(r.optString("id", null));
         }
         // The newest MAX_PER_WAKE arrivals/departures, oldest first; the rest
@@ -463,18 +480,40 @@ public class RoamkeepMessagingService extends MessagingService {
             notify(ctx, r.optString("id", "ci-" + i),
                     r.optString("member_avatar", "📍") + " " + r.optString("member_name", "Someone") + " "
                             + ("arrived".equals(type) ? "arrived at" : "left") + " " + r.optString("place", ""),
-                    "", false);
+                    "", false, eventMs(r));
         }
         if (others.size() > shown) {
             notify(ctx, "roamkeep-summary", "+" + (others.size() - shown) + " more updates",
-                    "Open Roamkeep to see them all", false);
+                    "Open Roamkeep to see them all", false, 0);
         }
         for (JSONObject r : others) raised.add(r.optString("id", null));
 
         prefs.addPushSeenIds(raised);
         if (newest != null) saveMark(prefs, serverClock, newest);
         prefs.journal("push: wake-up → " + (sos.size() + shown) + " notification(s)"
-                + (others.size() > shown ? " + " + (others.size() - shown) + " summarised" : ""));
+                + (others.size() > shown ? " + " + (others.size() - shown) + " summarised" : "")
+                + staleNote);
+    }
+
+    /**
+     * An arrival or departure too old to raise (4.11.3). `atMs` is when the
+     * server received it from v16 (when the sender says it happened, before
+     * that): the clock the watermark pages by, which a sender's wrong clock
+     * cannot push out of the window. An unreadable time, or one ahead of
+     * this phone's clock, is raised: dropping one wrongly is the worse
+     * mistake.
+     */
+    static boolean tooOldToRaise(long atMs, long nowMs) {
+        return atMs >= 0 && nowMs - atMs > ALERT_MAX_AGE_MS;
+    }
+
+    /**
+     * When it happened, as the notification shows it (4.11.3): the event
+     * time the Activity list shows too, so a late one says so instead of
+     * looking new. 0, meaning the moment it is raised, if unreadable.
+     */
+    private static long eventMs(JSONObject r) {
+        return Math.max(0, parseIsoMs(r.optString("created_at", null)));
     }
 
     /** Rows of `arr` (newest first) not already raised. */
@@ -606,11 +645,17 @@ public class RoamkeepMessagingService extends MessagingService {
                 + r.armed + " armed, " + r.pruned + " pruned");
     }
 
-    private void notify(Context ctx, String id, String title, String text, boolean sos) {
-        notifyOn(ctx, sos ? CH_SOS : CH_PLACES, id, title, text, sos);
+    private void notify(Context ctx, String id, String title, String text, boolean sos, long whenMs) {
+        notifyOn(ctx, sos ? CH_SOS : CH_PLACES, id, title, text, sos, whenMs);
     }
 
     private void notifyOn(Context ctx, String channel, String id, String title, String text, boolean sos) {
+        notifyOn(ctx, channel, id, title, text, sos, 0);
+    }
+
+    /** whenMs: the time the notification shows, or 0 for the moment it is raised. */
+    private void notifyOn(Context ctx, String channel, String id, String title, String text, boolean sos,
+                          long whenMs) {
         Intent open = new Intent(ctx, MainActivity.class);
         open.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_CLEAR_TOP);
         PendingIntent pi = PendingIntent.getActivity(
@@ -627,6 +672,7 @@ public class RoamkeepMessagingService extends MessagingService {
                 .setAutoCancel(true)
                 .setContentIntent(pi)
                 .setPriority(sos ? NotificationCompat.PRIORITY_MAX : NotificationCompat.PRIORITY_DEFAULT);
+        if (whenMs > 0) b.setWhen(whenMs).setShowWhen(true);
         if (!text.isEmpty()) b.setContentText(text);
         if (sos) {
             b.setCategory(NotificationCompat.CATEGORY_ALARM)

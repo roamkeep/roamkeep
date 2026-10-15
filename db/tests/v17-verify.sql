@@ -85,7 +85,7 @@ DECLARE
   v_keep uuid; v_code text; v_o_mid uuid; v_m_mid uuid; v_d_mid uuid; v_place uuid;
   v_status text; v_txt text; v_n int; v_b boolean; v_i int;
   v_prev_closed boolean; v_prev_until timestamptz;
-  v_ck uuid; v_ck_b boolean; v_p1 int; v_p2 int; v_p3 int; v_p4 int; v_p5 int; v_p6 int; v_p7 int; v_p8 int;
+  v_ck uuid; v_ck2 uuid; v_ck_b boolean; v_p1 int; v_p2 int; v_p3 int; v_p4 int; v_p5 int; v_p6 int; v_p7 int; v_p8 int;
 BEGIN
   SELECT id INTO uid_o FROM auth.users WHERE email = 'v17owner@test.local';
   SELECT id INTO uid_m FROM auth.users WHERE email = 'v17member@test.local';
@@ -236,12 +236,18 @@ BEGIN
     RESET ROLE;
     PERFORM _v17_act_as(uid_o);
     PERFORM approve_member(v_m_mid);
+    -- A check-in written after approval. From v20 the one written while
+    -- they were pending never reaches them (who is told is decided when a
+    -- check-in is written; v20-verify 1f), so "the same as everyone" is
+    -- proved on a new one, which holds on every version from 17.
+    INSERT INTO checkins (keep_id, member_id, member_name, member_avatar, place, type)
+      VALUES (v_keep, v_o_mid, 'Olivia', '👩', 'v17 test', 'manual') RETURNING id INTO v_ck2;
     SELECT count(*) INTO v_p4 FROM keep_push_recipients(v_keep) r WHERE r.member_id = v_m_mid;
-    SELECT count(*) INTO v_p5 FROM checkin_recipients(v_ck) r WHERE r.member_id = v_m_mid;
+    SELECT count(*) INTO v_p5 FROM checkin_recipients(v_ck2) r WHERE r.member_id = v_m_mid;
     SELECT count(*) INTO v_p6 FROM keep_owner_push_recipients(v_keep);
     PERFORM _v17_act_as(uid_m);
     SET LOCAL ROLE authenticated;
-    SELECT count(*) INTO v_p8 FROM my_checkin_feed;
+    SELECT count(*) INTO v_p8 FROM my_checkin_feed WHERE id = v_ck2;
     RESET ROLE;
     RAISE EXCEPTION 'v17_rollback';
   EXCEPTION WHEN OTHERS THEN

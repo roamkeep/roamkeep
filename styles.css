@@ -1043,15 +1043,19 @@ input[type=range]::-moz-range-thumb {
 }
 /* max(0px, …) so a short sheet (content shorter than the 380px peek) sits
    flush at the bottom instead of the peek transform lifting it up and leaving
-   a gap below it. The keyboard is handled natively (Keyboard resize:native
-   shrinks the WebView), so no manual bottom offset is needed. */
+   a gap below it. Sheets open at .full (showSheet in app.js); the peek is
+   only ever a drag. */
 .sheet.half { transform: translateY(max(0px, calc(100% - 380px))); }
 .sheet.full { transform: translateY(0); }
 .sheet.dragging { transition: none; }
-/* Float ONLY the open sheet above the on-screen keyboard (--kb = occluded
-   height, set by initKeyboardInsets). Scoped to .open so closed sheets stay
-   parked at bottom:0 (translateY(110%)) and never poke back on-screen. */
-.sheet.open { bottom: var(--kb, 0px); }
+/* Float ONLY the open sheet above the on-screen keyboard (--kb = the height
+   the keyboard covers, measured by initKeyboardInsets). Scoped to .open so
+   closed sheets stay parked at bottom:0 (translateY(110%)) and never poke
+   back on-screen. The height comes down by the same amount: lifted at its
+   full 90dvh, a tall sheet's top, title and close button went off the top
+   of the screen where no scroll could reach them (Settings, editing the
+   family name, 4.11.3). */
+.sheet.open { bottom: var(--kb, 0px); max-height: calc(90dvh - var(--kb, 0px)); }
 .sheet-handle {
   padding: 10px 0 6px; cursor: grab;
   display: flex; align-items: center; justify-content: center;

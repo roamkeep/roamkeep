@@ -6,7 +6,7 @@
 -- display RAISE NOTICE output. Read the grid: every row PASS or FAIL.
 --
 -- SETUP (once, before running):
---   1. Apply db/schema.sql (or the v16 migration on top of v15).
+--   1. Apply db/schema.sql.
 --   2. Create TWO auth accounts (app sign-up or Auth dashboard):
 --        v16owner@test.local   v16member@test.local
 --      Neither may belong to a Keep already (v16 allows one per account).

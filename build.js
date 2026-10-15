@@ -255,7 +255,30 @@ function bundleQr() {
   });
 }
 
-bundleProvision().then(bundleQr).then(
+// pwcheck.js: the 5,000 most common passwords the app refuses (4.11.3), from
+// data/common-passwords.txt (tools/gen-common-passwords.mjs says where that
+// comes from). Loaded only on the screens that set a password, and never
+// fetched from anywhere else. Lower-cased, because the check ignores case.
+// Loaded back and asked, like qr.js, so a broken list fails the build.
+function bundlePasswords() {
+  const vm = require('vm');
+  const list =fs.readFileSync(path.join(ROOT, 'data', 'common-passwords.txt'), 'utf8')
+    .split(/\r?\n/).filter(Boolean);
+  const code = 'window.RoamkeepPasswords=(function(){var s=new Set(' + JSON.stringify(list) +
+    ');return{isCommon:function(p){return s.has(String(p).toLowerCase())}}})();\n';
+  const ctx = { window: {} };
+  vm.runInNewContext(code, ctx);
+  const P = ctx.window.RoamkeepPasswords;
+  const problems = [];
+  if (list.length < 1000) problems.push('only ' + list.length + ' entries');
+  if (!P || !P.isCommon('Password1') || !P.isCommon('iloveyou')) problems.push('a common password passed');
+  if (P && P.isCommon('correct horse battery staple')) problems.push('an uncommon password was refused');
+  if (problems.length) throw new Error('[build] pwcheck.js failed its self-check: ' + problems.join(', '));
+  fs.writeFileSync(path.join(DIST, 'pwcheck.js'), code);
+  console.log('[build] bundled pwcheck.js (' + (code.length / 1024).toFixed(1) + ' kB, ' + list.length + ' passwords)');
+}
+
+bundleProvision().then(bundleQr).then(bundlePasswords).then(
   () => console.log(`[build] dist/ ready at ${DIST}`),
   (e) => { console.error(e.message || e); process.exitCode = 1; }
 );

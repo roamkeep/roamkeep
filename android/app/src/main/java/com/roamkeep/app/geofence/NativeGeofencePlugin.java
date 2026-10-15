@@ -9,6 +9,7 @@ import android.content.pm.PackageManager;
 import android.os.Build;
 import android.os.PowerManager;
 import android.util.Log;
+import android.view.View;
 import android.view.WindowManager;
 
 import android.Manifest;
@@ -16,6 +17,8 @@ import android.net.Uri;
 import android.provider.Settings;
 
 import androidx.core.content.ContextCompat;
+import androidx.core.view.ViewCompat;
+import androidx.core.view.WindowInsetsCompat;
 
 import com.getcapacitor.JSObject;
 import com.getcapacitor.Plugin;
@@ -280,6 +283,41 @@ public class NativeGeofencePlugin extends Plugin {
                 getActivity().getWindow().clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
             }
             call.resolve();
+        });
+    }
+
+    /**
+     * How much of the WebView the on-screen keyboard covers right now, in CSS
+     * pixels (4.11.3). The app lifts an open sheet by exactly this much.
+     *
+     * The Keyboard plugin's own height was the wrong number twice over. It
+     * includes the navigation bar, which the WebView already sits above, so a
+     * lifted sheet floated that far over the keyboard. And where Android
+     * resizes the window for the keyboard (up to Android 15, where the
+     * edge-to-edge opt-out holds), the WebView has already shrunk, so lifting
+     * by it as well doubled the lift. This measures the overlap itself: where
+     * the WebView ends against where the keyboard begins.
+     */
+    @PluginMethod
+    public void keyboardOcclusion(PluginCall call) {
+        if (getActivity() == null || getBridge().getWebView() == null) {
+            call.reject("no activity");
+            return;
+        }
+        getActivity().runOnUiThread(() -> {
+            View web = getBridge().getWebView();
+            int px = 0;
+            WindowInsetsCompat insets = ViewCompat.getRootWindowInsets(web);
+            if (insets != null && insets.isVisible(WindowInsetsCompat.Type.ime())) {
+                int[] at = new int[2];
+                web.getLocationInWindow(at);
+                int webBottom = at[1] + web.getHeight();
+                int imeTop = web.getRootView().getHeight() - insets.getInsets(WindowInsetsCompat.Type.ime()).bottom;
+                px = Math.max(0, webBottom - imeTop);
+            }
+            JSObject res = new JSObject();
+            res.put("height", Math.round(px / getContext().getResources().getDisplayMetrics().density));
+            call.resolve(res);
         });
     }
 

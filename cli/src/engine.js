@@ -25,7 +25,7 @@ const BASE = 'https://api.supabase.com';
  * The schema_version that db/schema.sql stamps as its last statement.
  * Keep in step with that file; cli/test.mjs checks the two agree.
  */
-export const SCHEMA_VERSION = 19;
+export const SCHEMA_VERSION = 20;
 
 /** The Edge Functions every family server needs. */
 export const FUNCTIONS = ['notify-checkin', 'notify-places'];
@@ -273,12 +273,48 @@ export async function setProjectUrl(api, ref) {
  * the one setting with no SQL representation.
  */
 export async function configureAuth(api, ref) {
-  await api.updateAuthConfig(ref, { mailer_autoconfirm: true });
+  // One write: confirmations off, and the password rules (below).
+  const before = await api.getAuthConfig(ref);
+  await api.updateAuthConfig(ref, { mailer_autoconfirm: true, ...passwordRulesPatch(before) });
   const cfg = await api.getAuthConfig(ref);
   if (cfg && cfg.mailer_autoconfirm === false) {
     throw new Error('mailer_autoconfirm did not stick');
   }
   return true;
+}
+
+/**
+ * The server's password rules (4.11.3), run at setup (configureAuth) and on
+ * every update and repair (the signups step).
+ *
+ * - At least PASSWORD_MIN characters. Supabase's default is 6, which is what
+ *   the sign-up screen asked for, while every other way of setting a
+ *   password asked for 8. Only ever raised: an owner who chose more keeps
+ *   it. It applies when a password is set, so no existing one stops working.
+ * - Changing a password needs the current one
+ *   (security_update_password_require_current_password). Without it, an
+ *   unlocked phone or a copied session could change the password and lock
+ *   the person out. The app sends current_password since 4.11.3; an older
+ *   app gets "Current password required" and the member uses a reset code.
+ *   Not the reauthentication setting beside it: that sends an emailed code,
+ *   and a family's server sends no email.
+ *
+ * The common-password check is the app's (passwordProblem): Supabase's own
+ * leaked-password check needs a paid plan.
+ */
+export const PASSWORD_MIN = 8;
+function passwordRulesPatch(cfg) {
+  const patch = {};
+  if (!((Number(cfg && cfg.password_min_length) || 0) >= PASSWORD_MIN)) patch.password_min_length = PASSWORD_MIN;
+  if (!(cfg && cfg.security_update_password_require_current_password === true)) {
+    patch.security_update_password_require_current_password = true;
+  }
+  return patch;
+}
+export async function applyPasswordRules(api, ref) {
+  const patch = passwordRulesPatch(await api.getAuthConfig(ref));
+  if (Object.keys(patch).length) await api.updateAuthConfig(ref, patch);
+  return patch;
 }
 
 /**
@@ -307,7 +343,9 @@ export function webhookSql(schemaSql) {
   }
   const fn = schema.slice(start, end + '$fn$;'.length);
   return [
-    'create extension if not exists pg_net;',
+    // In extensions, as schema.sql does since v20: unnamed, it landed in
+    // public and Supabase's Security Advisor flagged it.
+    'create extension if not exists pg_net with schema extensions;',
     fn,
     // Trigger-only: never an RPC. Supabase's default privileges grant EXECUTE
     // on every new public function to anon and authenticated by name, so
@@ -615,7 +653,16 @@ export function upgradeSteps({ schemaSql, functions }) {
     },
     { id: 'functions', run: (api, ref) => deployFunctions(api, ref, functions) },
     { id: 'probe', run: (api, ref) => probeFunctions(api, ref) },
-    { id: 'signups', run: (api, ref) => handOverSignups(api, ref) },
+    {
+      // Who can create accounts, and with what: the password minimum rides
+      // here so the wizard's numbered steps (and --from) stay as they are.
+      id: 'signups',
+      run: async (api, ref) => {
+        const handed = await handOverSignups(api, ref);
+        await applyPasswordRules(api, ref);
+        return handed;
+      },
+    },
   ];
 }
 

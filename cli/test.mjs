@@ -472,7 +472,7 @@ const engine = await import('./src/engine.js');
     webhook: /steps\.setProjectUrl\([\s\S]*steps\.createWebhook\([\s\S]*steps\.verifyWebhook\(/,
     functions: /steps\.deployFunctions\(/,
     probe: /steps\.probeFunction\(/,
-    signups: /steps\.handOverSignups\(/,
+    signups: /steps\.handOverSignups\([\s\S]*steps\.applyPasswordRules\(/,
   };
   const upgrade = src.slice(src.indexOf('async function runUpgrade('), src.indexOf('async function main('));
   check('update steps: the wizard\'s --upgrade knows every step the phone runs',
@@ -500,6 +500,81 @@ const engine = await import('./src/engine.js');
   let threw = false;
   try { await engine.handOverSignups(failing, 'r'); } catch { threw = true; }
   check('hand-over: if closing the app\'s gate fails, GoTrue\'s is left shut', threw && seen.length === 0);
+}
+
+// The server's password rules (4.11.3): at least 8 characters, raised and
+// never lowered, and the current password needed to change it. Set at setup
+// and on every update, whose signups step runs them.
+{
+  const patches = [];
+  const api = (min, cur) => ({
+    getAuthConfig: async () => ({ password_min_length: min, mailer_autoconfirm: true,
+      security_update_password_require_current_password: cur }),
+    updateAuthConfig: async (ref, patch) => { patches.push(JSON.stringify(patch)); },
+  });
+  const both = '{"password_min_length":8,"security_update_password_require_current_password":true}';
+  await engine.applyPasswordRules(api(6, false), 'r');
+  check('passwords: Supabase\'s defaults (6, no current password) are tightened', patches.join() === both, patches.join());
+  patches.length = 0;
+  await engine.applyPasswordRules(api(12, false), 'r');
+  check('passwords: an owner\'s longer minimum is kept',
+    patches.join() === '{"security_update_password_require_current_password":true}', patches.join());
+  patches.length = 0;
+  await engine.applyPasswordRules(api(8, true), 'r');
+  check('passwords: nothing is written when the rules already hold', patches.length === 0, patches.join());
+  patches.length = 0;
+  await engine.configureAuth(api(6, false), 'r');
+  check('passwords: setup sets them, in the same write as confirmations off',
+    patches.join() === '{"mailer_autoconfirm":true,"password_min_length":8,"security_update_password_require_current_password":true}',
+    patches.join(' '));
+  patches.length = 0;
+  const signups = engine.upgradeSteps({ schemaSql: '', functions: {} }).find((s) => s.id === 'signups');
+  await signups.run({ ...api(6, false), query: async () => [] }, 'r');
+  check('passwords: an update sets them', patches.includes(both), patches.join(' '));
+}
+
+// The app's own rule (passwordProblem), its real source run against the
+// real list: every place that sets a password goes through it.
+{
+  const app = fs.readFileSync(path.join(HERE, '..', 'app.js'), 'utf8');
+  const start = app.indexOf('  async function passwordProblem(');
+  const end = app.indexOf('\n  }\n', start) + 4;
+  const list = new Set(fs.readFileSync(path.join(HERE, '..', 'data', 'common-passwords.txt'), 'utf8').split(/\r?\n/).filter(Boolean));
+  const loadBundle = async () => ({ isCommon: (p) => list.has(String(p).toLowerCase()) });
+  const passwordProblem = new Function('loadBundle', app.slice(start, end) + '\nreturn passwordProblem;')(loadBundle);
+  const ok = async (pw, email) => (await passwordProblem(pw, email)) === null;
+  check('passwords: 7 characters are refused', !(await ok('Xq7!pLm', 'a@b.c')));
+  check('passwords: a common one is refused, whatever its case', !(await ok('Password1', 'a@b.c')) && !(await ok('ILOVEYOU', 'a@b.c')));
+  check('passwords: one containing the email\'s name is refused', !(await ok('olivia-2026x', 'olivia@example.com')));
+  check('passwords: one containing the app\'s name is refused', !(await ok('MyRoamkeep!', 'a@b.c')));
+  check('passwords: an ordinary passphrase is accepted', await ok('purple tractor sandwich', 'olivia@example.com'));
+  check('passwords: no character-mixing rule (lower-case words are fine)', await ok('quietlantern', 'a@b.c'));
+  // The app logs a warning when the list can't load. Captured here and
+  // checked, rather than printed: a stack trace in the release log reads
+  // like a failure (4.11.3-rc3 build).
+  {
+    const noList = new Function('loadBundle', app.slice(start, end) + '\nreturn passwordProblem;')(
+      async () => { throw new Error('missing'); });
+    const warn = console.warn;
+    const warned = [];
+    console.warn = (...a) => { warned.push(a.map(String).join(' ')); };
+    let common, short;
+    try {
+      common = await noList('Password1', 'a@b.c');
+      short = await noList('short', 'a@b.c');
+    } finally {
+      console.warn = warn;
+    }
+    check('passwords: if the list fails to load, the other rules still hold, and it says so',
+      common === null && short !== null && warned.length === 1 && warned[0].startsWith('pwcheck'),
+      warned.join(' | '));
+  }
+  const calls = (app.match(/await passwordProblem\(/g) || []).length;
+  check('passwords: sign-up, Change password, a reset code and owner recovery all use it', calls === 4, `${calls} call sites`);
+  check('passwords: Change password sends the current password',
+    /updateUser\(\{ password: a, current_password: cur \}\)/.test(app));
+  check('passwords: the list holds the 5,000 most common, lower-cased, 8 or more characters',
+    list.size === 5000 && [...list].every((w) => w.length >= 8 && w === w.toLowerCase()));
 }
 
 // What an update refuses to touch.

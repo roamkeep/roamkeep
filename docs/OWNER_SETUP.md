@@ -389,15 +389,25 @@ select (select schema_version from roamkeep_meta)                    as version,
           from pg_proc
          where pronamespace = 'public'::regnamespace and prosecdef)  as pg_temp_last,
        (select bool_and(prosrc like '%_roamkeep_delete_member%') from pg_proc
-         where proname = 'decline_member')                           as v19_decline;
+         where proname = 'decline_member')                           as v19_decline,
+       (select count(*) = 1 from information_schema.tables
+         where table_name = 'checkin_notices')
+         and (select count(*) = 1 from pg_trigger
+               where tgname = 'trg_checkin_notices' and not tgisinternal)
+         and (select bool_and(definition like '%checkin_notices%') from pg_views
+               where viewname = 'my_checkin_feed')
+         and (select bool_and(prosrc like '%checkin_notices%') from pg_proc
+               where proname = 'checkin_recipients')                 as v20_notices;
 ```
 
-A finished v19 reads `version 19`, `url` set to **this** project,
+A finished v20 reads `version 20`, `url` set to **this** project,
 `checkin_cols 4`, `prefs_table 1`, `recipients_fn 1`, `feed_view 1`,
 `v16_fns 2`, `v17_cols 5`, `reset_table 1`, `v17_fns 12`, `triggers 8`,
-`sends_secret true`, `v18_fn 1`, `pg_temp_last true`, `v19_decline true`.
+`sends_secret true`, `v18_fn 1`, `pg_temp_last true`, `v19_decline true`,
+`v20_notices true`.
 
-(A finished v18 reads `v19_decline false` and the rest the same. A finished
+(A finished v19 reads `v20_notices false` and the rest the same. A finished
+v18 also reads `v19_decline false`. A finished
 v17 also reads `v18_fn 0`, `pg_temp_last false` and the rest the
 same. A finished v16 also reads `v17_cols 0`, `reset_table 0`, `v17_fns 0`,
 `triggers 4` and the rest the same. A finished v13–v15 also reads
@@ -411,6 +421,33 @@ number tells you which migration *last ran to completion*. It cannot
 tell you that the file which ran contained everything that version is
 supposed to contain. Re-running `db/schema.sql` fixes any shortfall; it
 is idempotent and touches no data.
+
+### What Supabase's Security Advisor shows
+
+Supabase's Security Advisor (in your project, under Advisors) checks every
+project against general rules. On a Roamkeep server it lists these, and they
+are expected:
+
+- **Info, "RLS Enabled No Policy"**, for `keep_join_attempts` and
+  `roamkeep_secrets`. On purpose: with no policy, nobody can read or write
+  them from the app. Only the server's own functions use them.
+- **Warning, "Public Can Execute SECURITY DEFINER Function"**, for
+  `roamkeep_schema_version` and `redeem_password_reset`. On purpose: a phone
+  checks the server's version, and a member uses a reset code, before
+  signing in.
+- **Warning, "Signed-In Users Can Execute SECURITY DEFINER Function"**, one
+  for each thing the app does on the server: joining, approving, removing,
+  pausing and so on. On purpose: each one checks who is asking before it does
+  anything.
+- **Warning, "Leaked Password Protection Disabled"**, on Supabase's free
+  plan, which doesn't offer it. Roamkeep asks for passwords of at least 8
+  characters instead, and refuses the 5,000 most common. On a paid plan you can turn it on in Supabase's
+  authentication settings.
+
+Before version 20, a server set up from the app or the wizard also showed
+**"Extension in Public"** for `pg_net`. That was harmless, and updating moves
+it. Anything else is worth a look: run the object query above, then Check
+and repair.
 
 ---
 

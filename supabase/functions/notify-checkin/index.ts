@@ -131,9 +131,9 @@ async function secretMatches(got: string | null, want: string): Promise<boolean>
 /**
  * Accept RELAY_URL with or without the endpoint path.
  *
- * `wrangler deploy` prints the worker's ORIGIN, so the natural thing to
- * paste into the secret is "https://…workers.dev" — which POSTs to the
- * relay's root and gets a 404. Push then fails silently, because the
+ * A relay deploy prints its ORIGIN, so the natural thing to paste into
+ * the secret is the bare origin, which POSTs to the relay's root and
+ * gets a 404. Push then fails silently, because the
  * whole path is best-effort by design. Normalising here means either
  * form works instead of one of them being a silent trap.
  */

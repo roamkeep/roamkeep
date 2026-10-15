@@ -13,13 +13,14 @@
 // AND the cleared hash) needs both weakened, or the other one hides it.
 //
 // Steps are named as each script names them: v17-verify's plainly ('2b'),
-// v18-verify's and v19-verify's with their prefix ('v18:2b', 'v19:1a'),
-// because they all number from 1.
+// the later ones with their prefix ('v18:2b', 'v19:1a', 'v20:1c'), because
+// they all number from 1.
 
 import { read, prep, project, addUser } from './supabase.mjs'
 
 const SCHEMA = read('db/schema.sql').replace(/\r\n/g, '\n')
-const VERIFY = [['db/tests/v17-verify.sql', ''], ['db/tests/v18-verify.sql', 'v18:'], ['db/tests/v19-verify.sql', 'v19:']]
+const VERIFY = [['db/tests/v17-verify.sql', ''], ['db/tests/v18-verify.sql', 'v18:'], ['db/tests/v19-verify.sql', 'v19:'],
+                ['db/tests/v20-verify.sql', 'v20:']]
 
 // [name, [[from, to, 'last'?], ...], steps that must fail]. 'last' replaces
 // the final occurrence — set_signups shares a clause with set_project_url,
@@ -36,7 +37,10 @@ const MUTATIONS = [
                                          "  IF false THEN\n    RAISE EXCEPTION 'not_pending';"]], ['1i']],
   ['sync wakes reach pending members', [['JOIN keep_members m ON m.id = p.member_id AND m.approved   -- v17',
                                          'JOIN keep_members m ON m.id = p.member_id']], ['1j']],
-  ['check-in pushes reach pending members', [['    AND m.approved                                  -- v17: never wake a pending member', '']], ['1j']],
+  // Two defences since v20: checkin_recipients' own check, and the notices
+  // trigger, which records nobody who is waiting.
+  ['check-in pushes reach pending members', [['    AND m.approved                                  -- v17: never wake a pending member', ''],
+                                             ['     AND m.approved                 -- a pending member is told nothing\n', '']], ['1j']],
   ['join wakes reach every member', [["     AND m.role = 'owner'\n     AND m.approved\n     AND p.fcm_token IS NOT NULL",
                                       '     AND p.fcm_token IS NOT NULL']], ['1k']],
   ['owners can reset owners', [["IF v_target.role = 'owner' THEN", 'IF false THEN']], ['2b']],
@@ -157,6 +161,27 @@ const MUTATIONS = [
                                            "role = 'owner'\n  ) THEN\n    RAISE EXCEPTION 'not_owner';\n  END IF;\n  SELECT approved INTO v_approved FROM keep_members WHERE id = p_member_id;\n  IF NOT FOUND THEN"],
                            ["  PERFORM _roamkeep_delete_member(p_member_id);\n  PERFORM rotate_keep_code(v_keep_id);\nEND;\n$$;\nREVOKE ALL ON FUNCTION decline_member",
                             "  PERFORM _roamkeep_delete_member(p_member_id);\nEND;\n$$;\nREVOKE ALL ON FUNCTION decline_member"]], ['v19:1e']],
+  // v20: who is told is decided when a check-in is written.
+  // The bug itself: the view applying today's mutes, as v13 to v19 did.
+  ['the feed applies mutes when read', [["      OR EXISTS (\n        SELECT 1 FROM checkin_notices n\n         WHERE n.checkin_id = c.id AND n.member_id = me.id\n      )\n    );",
+                                         "      OR (me.notify_on_checkin AND (c.place_id IS NULL OR NOT EXISTS (\n        SELECT 1 FROM keep_notify_prefs p WHERE p.member_id = me.id\n          AND p.subject_member_id = c.member_id AND p.place_id = c.place_id)))\n    );"]],
+   ['v20:1c', 'v20:1e']],
+  ['wake-ups apply mutes when sent', [["      OR EXISTS (\n        SELECT 1 FROM checkin_notices n\n         WHERE n.checkin_id = c.id AND n.member_id = m.id\n      )\n    )\n$$;",
+                                       "      OR m.notify_on_checkin\n    )\n$$;"]], ['v20:1c', 'v20:1f']],
+  ['notices ignore the global mute', [['     AND m.notify_on_checkin        -- the global mute\n', '']], ['v20:1b']],
+  ['notices ignore per-place mutes', [['       OR NOT EXISTS (              -- this person, at this place, muted\n',
+                                       '       OR true OR NOT EXISTS (\n']], ['v20:1e']],
+  ['nothing is recorded', [['CREATE TRIGGER trg_checkin_notices\n  AFTER INSERT ON checkins\n  FOR EACH ROW EXECUTE FUNCTION _roamkeep_record_notices();', '']],
+   ['v20:1a', 'v20:1d']],
+  ['a waiting member is recorded', [['     AND m.approved                 -- a pending member is told nothing\n', '']], ['v20:1a', 'v20:1f']],
+  ['a muted SOS is hidden', [["  WHERE c.member_id <> me.id\n    AND (\n      c.type = 'sos'\n      OR EXISTS",
+                              "  WHERE c.member_id <> me.id\n    AND (\n      false\n      OR EXISTS"]], ['v20:1h']],
+  // Two defences: no write grant, and no write policy. Both go.
+  ['clients may write notices', [['REVOKE INSERT, UPDATE, DELETE ON checkin_notices FROM authenticated;',
+                                  'CREATE POLICY "v20 mutation" ON checkin_notices FOR INSERT TO authenticated WITH CHECK (true);']], ['v20:1i']],
+  ['notices readable by the whole keep', [['  USING (member_id IN (SELECT id FROM keep_members WHERE user_id = auth.uid() AND approved));',
+                                           '  USING (true);']], ['v20:1i']],
+  ['anon may read notices', [['REVOKE ALL ON checkin_notices FROM anon;', 'GRANT SELECT ON checkin_notices TO anon;']], ['v20:1i']],
 ]
 
 function mutate(src, pairs) {

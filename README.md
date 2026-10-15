@@ -173,9 +173,9 @@ licence grants no rights in them; see [`LICENSE`](LICENSE).
 
 ## Support development
 
-Roamkeep is free, has no paid features, and runs no author-operated tier. The
-model is deliberately **self-host plus donations**. If it's useful to your
-family and you'd like to help cover the cost of the one shared piece (the push
+Running Roamkeep on your family's own server is free, with every feature, and
+always will be. There are no paid features, and development is funded by
+donations. If it's useful to your family and you'd like to help cover the cost of the one shared piece (the push
 relay) and continued development, you can chip in on
 [**Ko-fi**](https://ko-fi.com/roamkeep).
 [roamkeep.app/support](https://roamkeep.app/support/) shows what it takes to

@@ -2,8 +2,8 @@
 -- Roamkeep — consolidated schema (canonical)
 --
 -- This single file recreates the entire database from scratch and is
--- the source of truth for the schema. It folds together every numbered
--- migration in db/migrations/ (v2 → v5).
+-- the source of truth for the schema. It is also how every existing
+-- database is updated: there are no separate migration files.
 --
 -- Properties:
 --   • Idempotent. CREATE TABLE IF NOT EXISTS, ADD COLUMN IF NOT EXISTS,
@@ -14,17 +14,15 @@
 --     keep_members.fcm_token into keep_member_push and then drops the
 --     column. The data is copied first, so nothing is lost — but a client
 --     older than 4.8.3 can no longer register a new push token after this
---     runs. See the "RETIRE keep_members.fcm_token" section for why the
---     step cannot live only in the migration file.
+--     runs. See the "RETIRE keep_members.fcm_token" section.
 --   • Run it in: Supabase Dashboard → SQL Editor → New query → Run.
 --
 -- After running, in the Dashboard:
 --   Authentication → Settings → "Enable email confirmations" → OFF
 --   (lets family members sign up and use the app immediately).
 --
--- The numbered files in db/migrations/ remain the historical record and
--- the per-delta path for upgrading a database that's on an older version.
--- For a fresh setup you only need THIS file.
+-- Fresh setup or update, you only need THIS file. db/migrations/README.md
+-- lists the versions and what each changes.
 -- ============================================================
 
 
@@ -344,6 +342,20 @@ CREATE TABLE IF NOT EXISTS password_reset_codes (
   redeemed_at timestamptz
 );
 
+-- v20: who is to be told about each check-in, decided when it is written.
+-- One row per member to be told, written by _roamkeep_record_notices and
+-- read by my_checkin_feed and checkin_recipients. Until v20 both applied the
+-- mutes as they stood when a phone READ the feed. A muted phone isn't woken,
+-- so its watermark stood still, and turning the mute off let the next
+-- wake-up raise everything the mute had held back, days of it. A row here
+-- is what the mute said at the time; changing a mute later changes nothing
+-- that has already happened. Deleted with its check-in, so kept 7 days.
+CREATE TABLE IF NOT EXISTS checkin_notices (
+  checkin_id uuid NOT NULL REFERENCES checkins(id)     ON DELETE CASCADE,
+  member_id  uuid NOT NULL REFERENCES keep_members(id) ON DELETE CASCADE,
+  PRIMARY KEY (checkin_id, member_id)
+);
+
 
 -- ── INDEXES ───────────────────────────────────────────────
 
@@ -389,6 +401,11 @@ CREATE INDEX IF NOT EXISTS idx_checkins_keep_created
 -- memberships up by user_id, and the only index leads with keep_id.
 CREATE INDEX IF NOT EXISTS idx_keep_members_user
   ON keep_members(user_id);
+
+-- v20: deleting a member deletes their notices, found by member. The feed's
+-- own lookup (this check-in, this member) is the primary key.
+CREATE INDEX IF NOT EXISTS idx_checkin_notices_member
+  ON checkin_notices(member_id);
 
 
 -- ── REPLICA IDENTITY ──────────────────────────────────────
@@ -546,6 +563,7 @@ ALTER TABLE keep_member_push   ENABLE ROW LEVEL SECURITY;
 -- Functions' service-role key ever read it.
 ALTER TABLE roamkeep_secrets   ENABLE ROW LEVEL SECURITY;
 ALTER TABLE password_reset_codes ENABLE ROW LEVEL SECURITY;
+ALTER TABLE checkin_notices    ENABLE ROW LEVEL SECURITY;
 
 -- PASSWORD_RESET_CODES (v17) — a member may read the row about their OWN
 -- account, and nothing else: that is how the app tells them a reset was
@@ -625,6 +643,14 @@ CREATE POLICY "Members delete own notify prefs"
     keep_id IN (SELECT private_user_keep_ids())
     AND (member_id, keep_id) IN (SELECT id, keep_id FROM keep_members WHERE user_id = auth.uid())
   );
+
+-- CHECKIN_NOTICES (v20) — a member reads their own, which is all the feed
+-- view needs, and nobody else's, for the same reason as the prefs above.
+-- No write policy: only the trigger writes, and the grants below agree.
+DROP POLICY IF EXISTS "Members read own notices" ON checkin_notices;
+CREATE POLICY "Members read own notices"
+  ON checkin_notices FOR SELECT TO authenticated
+  USING (member_id IN (SELECT id FROM keep_members WHERE user_id = auth.uid() AND approved));
 
 -- ROAMKEEP_META — readable by everyone including anon, because the
 -- version check runs at connect time, BEFORE sign-in, and so cannot
@@ -760,11 +786,18 @@ CREATE POLICY "Members can delete own history"
 -- Re-run on every apply, so a table added later is covered too.
 REVOKE TRUNCATE, REFERENCES, TRIGGER
   ON keeps, keep_members, checkins, keep_places, location_history, keep_join_attempts,
-     roamkeep_meta, keep_notify_prefs, keep_member_push, roamkeep_secrets, password_reset_codes
+     roamkeep_meta, keep_notify_prefs, keep_member_push, roamkeep_secrets, password_reset_codes,
+     checkin_notices
   FROM anon, authenticated;
 -- Nothing on the client side touches these two at all: only the DEFINER
 -- functions (as the table owner) and the Edge Functions (service role) do.
 REVOKE ALL ON keep_join_attempts, roamkeep_secrets FROM anon, authenticated;
+-- v20: a member reads their own notices, through the feed view, which runs
+-- with the caller's rights and so needs SELECT stated, not assumed from
+-- Supabase's defaults. Nobody writes them but the trigger.
+GRANT SELECT ON checkin_notices TO authenticated;
+REVOKE INSERT, UPDATE, DELETE ON checkin_notices FROM authenticated;
+REVOKE ALL ON checkin_notices FROM anon;
 
 
 -- ── CODE GENERATOR ────────────────────────────────────────
@@ -1074,17 +1107,63 @@ REVOKE ALL ON FUNCTION public.set_project_url(text) FROM public, anon;
 GRANT EXECUTE ON FUNCTION public.set_project_url(text) TO authenticated;
 
 
--- ── v13: THE MUTE RULE, STATED ONCE, READ TWO WAYS ────────
+-- ── THE MUTE RULE, APPLIED ONCE, WHEN A CHECK-IN IS WRITTEN ──
 --
--- The two consumers ask opposite questions about the same rule:
+-- Two consumers ask opposite questions about the same rule:
 --   * The Edge Function: "given this check-in, who should be woken?"
---     — one row in, many members out.
+--     — one row in, many members out (checkin_recipients).
 --   * A device: "given me, which recent check-ins should I raise?"
---     — one member in, many rows out.
+--     — one member in, many rows out (my_checkin_feed).
 --
--- Both are written out below so neither can drift from the other. SOS
--- ignores every mute, and a check-in with no place_id (manual, or written
--- before v13) is never muted either.
+-- v13 wrote the rule out in both and applied it whenever they were asked.
+-- v20 applies it once, here, as the check-in is written, and both read the
+-- answer back from checkin_notices (see that table for why). SOS ignores
+-- every mute, so it is never recorded and both let it through by type. A
+-- check-in with no place_id (manual, or written before v13) ignores the
+-- per-place mutes but not the global one.
+--
+-- AFTER INSERT, so it sees the row _roamkeep_checkin_normalise corrected.
+-- The webhook's request leaves only once the insert commits, so the Edge
+-- Function always finds these rows. Nothing is backfilled: a check-in from
+-- before v20 has no notices and is raised by no later wake-up, which is
+-- what turning a mute off should have meant all along. Its own wake-up
+-- came and went when it was written.
+CREATE OR REPLACE FUNCTION _roamkeep_record_notices()
+RETURNS trigger
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public, pg_temp
+AS $$
+BEGIN
+  IF NEW.type = 'sos' THEN
+    RETURN NULL;
+  END IF;
+  INSERT INTO checkin_notices (checkin_id, member_id)
+  SELECT NEW.id, m.id
+    FROM keep_members m
+   WHERE m.keep_id = NEW.keep_id
+     AND m.id <> NEW.member_id
+     AND m.approved                 -- a pending member is told nothing
+     AND m.notify_on_checkin        -- the global mute
+     AND (
+       NEW.place_id IS NULL
+       OR NOT EXISTS (              -- this person, at this place, muted
+         SELECT 1 FROM keep_notify_prefs k
+          WHERE k.member_id = m.id
+            AND k.subject_member_id = NEW.member_id
+            AND k.place_id = NEW.place_id
+       )
+     )
+  ON CONFLICT DO NOTHING;
+  RETURN NULL;
+END;
+$$;
+REVOKE ALL ON FUNCTION _roamkeep_record_notices() FROM PUBLIC, anon, authenticated;
+
+DROP TRIGGER IF EXISTS trg_checkin_notices ON checkins;
+CREATE TRIGGER trg_checkin_notices
+  AFTER INSERT ON checkins
+  FOR EACH ROW EXECUTE FUNCTION _roamkeep_record_notices();
 
 CREATE OR REPLACE FUNCTION checkin_recipients(p_checkin uuid)
 RETURNS TABLE (member_id uuid, fcm_token text)
@@ -1103,20 +1182,10 @@ AS $$
     AND p.fcm_token IS NOT NULL
     AND (
       c.type = 'sos'
-      OR (
-        m.notify_on_checkin
-        AND (
-          c.place_id IS NULL
-          -- `k`, not `p`: since v14 the outer query binds `p` to
-          -- keep_member_push, and an inner `p` here would shadow it. Legal,
-          -- but it would read as if the two were the same table.
-          OR NOT EXISTS (
-            SELECT 1 FROM keep_notify_prefs k
-            WHERE k.member_id = m.id
-              AND k.subject_member_id = c.member_id
-              AND k.place_id = c.place_id
-          )
-        )
+      -- v20: everyone else as decided when the check-in was written.
+      OR EXISTS (
+        SELECT 1 FROM checkin_notices n
+         WHERE n.checkin_id = c.id AND n.member_id = m.id
       )
     )
 $$;
@@ -1244,6 +1313,10 @@ ALTER TABLE keep_members DROP COLUMN IF EXISTS fcm_token;
 -- v16 appends inserted_at — the server receipt time devices page by (see
 -- _roamkeep_checkin_normalise). Appended LAST, so a client selecting the
 -- older column list is unaffected.
+--
+-- v20 reads the mute decision made when each check-in was written
+-- (checkin_notices) instead of applying today's mutes. Same columns, so
+-- every app version that reads this view gets the fix with the server.
 DROP VIEW IF EXISTS my_checkin_feed;
 CREATE VIEW my_checkin_feed
 WITH (security_invoker = true) AS
@@ -1257,17 +1330,9 @@ WITH (security_invoker = true) AS
   WHERE c.member_id <> me.id
     AND (
       c.type = 'sos'
-      OR (
-        me.notify_on_checkin
-        AND (
-          c.place_id IS NULL
-          OR NOT EXISTS (
-            SELECT 1 FROM keep_notify_prefs p
-            WHERE p.member_id = me.id
-              AND p.subject_member_id = c.member_id
-              AND p.place_id = c.place_id
-          )
-        )
+      OR EXISTS (
+        SELECT 1 FROM checkin_notices n
+         WHERE n.checkin_id = c.id AND n.member_id = me.id
       )
     );
 
@@ -1289,8 +1354,34 @@ GRANT SELECT ON my_checkin_feed TO authenticated;
 -- Both read the project URL from roamkeep_meta and do nothing while it is
 -- NULL, so a partly configured database degrades to "no push" instead of
 -- erroring on every write.
-
-CREATE EXTENSION IF NOT EXISTS pg_net;
+--
+-- v20: in the extensions schema, where Supabase's dashboard puts it. Until
+-- v20 this line and the setup engine named no schema, so on every project
+-- they set up pg_net was registered in public, and Supabase's Security
+-- Advisor warned "Extension in Public". Nothing of pg_net's was ever in
+-- public (its functions and tables live in its own net schema, and the API
+-- exposes neither), but an owner can't be expected to know that.
+--
+-- pg_net can't be moved (it isn't relocatable), so where it is in public it
+-- is dropped and created again. Nothing outside pg_net depends on it: the
+-- roamkeep_notify_* functions are PL/pgSQL and look net.http_post up when
+-- they run. Requests queued at that instant, and the short-lived response
+-- log, are lost. One subtransaction, so if the CREATE fails the DROP is
+-- undone and a project is never left without push.
+CREATE SCHEMA IF NOT EXISTS extensions;
+DO $$
+BEGIN
+  IF EXISTS (SELECT 1 FROM pg_extension e JOIN pg_namespace n ON n.oid = e.extnamespace
+              WHERE e.extname = 'pg_net' AND n.nspname = 'public') THEN
+    BEGIN
+      DROP EXTENSION pg_net;
+      CREATE EXTENSION pg_net WITH SCHEMA extensions;
+    EXCEPTION WHEN OTHERS THEN
+      RAISE NOTICE 'pg_net left in public (%). Harmless: nothing of it is in public.', SQLERRM;
+    END;
+  END IF;
+END$$;
+CREATE EXTENSION IF NOT EXISTS pg_net WITH SCHEMA extensions;
 
 -- keep_places → notify-places. INSERT, UPDATE and DELETE: a device needs
 -- to re-arm for a new place, re-arm for a moved or renamed one, and prune
@@ -3023,9 +3114,9 @@ END$$;
 -- upgrade path, and it must never walk a database BACKWARDS if someone
 -- runs an older checkout of it against a newer database.
 
-INSERT INTO roamkeep_meta (id, schema_version) VALUES (true, 19)
+INSERT INTO roamkeep_meta (id, schema_version) VALUES (true, 20)
   ON CONFLICT (id) DO UPDATE
-    SET schema_version = GREATEST(roamkeep_meta.schema_version, 19),
+    SET schema_version = GREATEST(roamkeep_meta.schema_version, 20),
         updated_at = now();
 
 

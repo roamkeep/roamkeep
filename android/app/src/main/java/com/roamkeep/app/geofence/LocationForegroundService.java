@@ -20,6 +20,7 @@ import android.util.Log;
 
 import androidx.core.app.NotificationCompat;
 import androidx.core.app.NotificationManagerCompat;
+import androidx.core.app.ServiceCompat;
 import androidx.core.content.ContextCompat;
 
 import com.google.android.gms.location.FusedLocationProviderClient;
@@ -507,7 +508,7 @@ public class LocationForegroundService extends Service {
         final PrefsStore gate = new PrefsStore(this);
         if (gate.isPaused() || gate.isServerRejected()) {
             gate.journal("fgs: start skipped (" + (gate.isPaused() ? "paused" : "server rejected this member") + ")");
-            stopForeground(true);
+            ServiceCompat.stopForeground(this, ServiceCompat.STOP_FOREGROUND_REMOVE);
             stopSelf();
             return START_NOT_STICKY;
         }
@@ -523,7 +524,7 @@ public class LocationForegroundService extends Service {
         }
         if (!canDisclose(this)) {
             stopForDisclosure(this, "service start: " + why);
-            stopForeground(true);
+            ServiceCompat.stopForeground(this, ServiceCompat.STOP_FOREGROUND_REMOVE);
             stopSelf();
             return START_NOT_STICKY;
         }

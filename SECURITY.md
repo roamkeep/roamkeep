@@ -41,6 +41,11 @@ not after.
 We will credit you by name or handle in the release notes and the advisory
 unless you ask us not to.
 
+Every family runs their own server and updates it on their own schedule,
+so when we fix a security problem the release notes say plainly that it
+is a security fix and what is now enforced. The full details follow once
+servers have had time to update.
+
 ## Scope
 
 **In scope**
@@ -88,11 +93,13 @@ or by a `SECURITY DEFINER` function, so a modified client gets no further
 than the real one.
 
 **The relay accepts device tokens without authenticating the caller.** It
-sends a fixed, content-free wake-up and is rate-limited by a single global
-counter. It holds no per-caller state on purpose (see `relay/README.md`),
-because a counter about a caller is a record about a caller. Abuse of it costs
-quota, not privacy. If you can make it reveal anything about who called it or
-what event occurred, that is a real finding.
+sends a fixed, content-free wake-up, and is rate-limited by a counter keyed
+on a fixed constant and by a per-address rule at the network edge, whose
+thresholds are not published. It holds no per-caller state on purpose (see
+`relay/README.md`), because a counter about a caller is a record about a
+caller. Abuse of it costs quota, not privacy. If you can make it reveal
+anything about who called it or what event occurred, that is a real
+finding.
 
 **Invite codes are short.** They expire in 72 hours, `join_keep_by_code` is
 rate-limited per user, and failed attempts are logged to enforce that.

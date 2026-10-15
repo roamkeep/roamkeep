@@ -463,7 +463,7 @@
         <input id="su-e" type="email" placeholder="you@example.com" autocomplete="email" inputmode="email">
       </div>
       <div class="field">
-        <label for="su-p">Password (min 6 chars)</label>
+        <label for="su-p">Password (min 8 chars)</label>
         <input id="su-p" type="password" placeholder="Choose a password" autocomplete="new-password">
       </div>
       <button class="btn btn-g" id="su-btn" data-action="sign-up">Create Account →</button>
@@ -795,6 +795,10 @@
   <button class="sheet-x" data-action="close-change-password" aria-label="Close"><span class="ic" data-icon="x"></span></button>
   <div class="sheet-body">
     <div class="sec-h" id="pw-title">Change password</div>
+    <div class="field">
+      <label for="pw-cur">Current password</label>
+      <input id="pw-cur" type="password" autocomplete="current-password">
+    </div>
     <div class="field">
       <label for="pw-new">New password (min 8 chars)</label>
       <input id="pw-new" type="password" autocomplete="new-password">

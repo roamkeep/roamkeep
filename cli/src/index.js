@@ -209,7 +209,12 @@ async function runUpgrade(api, ref) {
   // The app's Settings → New accounts cannot open a door the dashboard has
   // shut (GoTrue refuses before the v17 trigger runs). Hand the switch over,
   // still closed — see engine.handOverSignups.
-  const handed = await step(8, 'Handing the sign-up switch to the app', () => steps.handOverSignups(api, ref),
+  // The password rules too, as the phone's update does (engine.upgradeSteps).
+  const handed = await step(8, 'Handing the sign-up switch to the app', async () => {
+    const out = await steps.handOverSignups(api, ref);
+    await steps.applyPasswordRules(api, ref);
+    return out;
+  },
     'If "Allow new users to sign up" is off in the Supabase dashboard, the app\n' +
     'cannot open sign-ups. Run this in the SQL editor, THEN turn that switch on:\n\n' +
     color.cyan('  update roamkeep_meta set signups_closed = true, signups_open_until = null;'));
@@ -547,7 +552,7 @@ async function main() {
   // and left literal line breaks inside string literals, which stopped the
   // whole wizard from parsing. Nothing here needs an escape sequence now.
   note([
-    'Roamkeep is free, has no paid features and no hosted tier. If it is',
+    'Roamkeep is free and has no paid features. If it is',
     'useful to your family, you can help cover the push relay and keep',
     'development going:',
     '',

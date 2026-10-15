@@ -53,6 +53,7 @@ export const checkFunction = engine.checkFunction;
 export const probeFunction = engine.probeFunction;
 export const openSignupWindow = engine.openSignupWindow;
 export const handOverSignups = engine.handOverSignups;
+export const applyPasswordRules = engine.applyPasswordRules;
 export const checkUpgradeable = engine.checkUpgradeable;
 export const getClientKey = engine.getClientKey;
 /** The old name, kept for existing callers: it now also accepts sb_publishable_. */

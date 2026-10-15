@@ -2,7 +2,8 @@
 # sidebar of every issue and pull request — the only placement that follows
 # a reader around instead of waiting to be scrolled to.
 #
-# Roamkeep is free, has no paid tier and sells nothing. Donations cover the
-# push relay and development; they unlock no features, because there are
-# none to unlock, and they grant no commercial licence (see LICENSE).
+# Roamkeep is free on your own server, has no paid features and never sells
+# data. Donations cover the push relay and development; they unlock no
+# features, because there are none to unlock, and they grant no commercial
+# licence (see LICENSE).
 ko_fi: roamkeep

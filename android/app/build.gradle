@@ -1,19 +1,19 @@
 apply plugin: 'com.android.application'
 
 android {
-    namespace "com.roamkeep.app"
-    compileSdk rootProject.ext.compileSdkVersion
+    namespace = "com.roamkeep.app"
+    compileSdk = rootProject.ext.compileSdkVersion
     defaultConfig {
-        applicationId "com.roamkeep.app"
+        applicationId = "com.roamkeep.app"
         minSdkVersion rootProject.ext.minSdkVersion
         targetSdkVersion rootProject.ext.targetSdkVersion
-        versionCode 78
-        versionName "4.11.2"
-        testInstrumentationRunner "androidx.test.runner.AndroidJUnitRunner"
+        versionCode 79
+        versionName "4.11.3"
+        testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         aaptOptions {
              // Files and dirs to omit from the packaged assets dir, modified to accommodate modern web apps.
              // Default: https://android.googlesource.com/platform/frameworks/base/+/282e181b58cf72b6ca770dc7ca5f91f135444502/tools/aapt/AaptAssets.cpp#61
-            ignoreAssetsPattern '!.svn:!.git:!.ds_store:!*.scc:.*:!CVS:!thumbs.db:!picasa.ini:!*~'
+            ignoreAssetsPattern = '!.svn:!.git:!.ds_store:!*.scc:.*:!CVS:!thumbs.db:!picasa.ini:!*~'
         }
     }
 def ksProps = new Properties()
@@ -23,30 +23,24 @@ if (ksFile.exists()) { ksProps.load(new FileInputStream(ksFile)) }
 signingConfigs {
   release {
     if (ksProps['storeFile']) {
-      storeFile     file(ksProps['storeFile'])
-      storePassword ksProps['storePassword']
-      keyAlias      ksProps['keyAlias']
-      keyPassword   ksProps['keyPassword']
+      storeFile     = file(ksProps['storeFile'])
+      storePassword = ksProps['storePassword']
+      keyAlias      = ksProps['keyAlias']
+      keyPassword   = ksProps['keyPassword']
     }
   }
  }
 
 buildTypes {
   release {
-    signingConfig signingConfigs.release
+    signingConfig = signingConfigs.release
     // R8: shrink + obfuscate the Java side so a decompiled APK yields
     // mangled names instead of a readable codebase. The Capacitor
     // bridge and our plugin survive via keep rules in proguard-rules.pro.
-    minifyEnabled true
+    minifyEnabled = true
     proguardFiles getDefaultProguardFile('proguard-android.txt'), 'proguard-rules.pro'
   }
  }
-}
-
-repositories {
-    flatDir{
-        dirs '../capacitor-cordova-android-plugins/src/main/libs', 'libs'
-    }
 }
 
 dependencies {

@@ -124,8 +124,13 @@ for (const page of pages) {
 copy(path.join(SRC, 'style.css'), path.join(OUT, 'style.css'));
 copy(path.join(SRC, 'robots.txt'), path.join(OUT, 'robots.txt'));
 copy(path.join(ROOT, 'brand-tile.png'), path.join(OUT, 'assets', 'brand-tile.png'));
-for (const shot of ['map.jpg', 'places.jpg', 'history.jpg']) {
-  copy(path.join(ROOT, 'docs', 'screenshots', shot), path.join(OUT, 'assets', shot));
+// Each screenshot comes at 540 wide (1x screens, and the README) and at the
+// grab's native 1080, which srcset gives to 2x screens and up: shown ~280
+// CSS px wide, a 540 image was being enlarged there, and looked soft.
+for (const shot of ['map', 'places', 'history']) {
+  for (const f of [shot + '.jpg', shot + '-1080.jpg']) {
+    copy(path.join(ROOT, 'docs', 'screenshots', f), path.join(OUT, 'assets', f));
+  }
 }
 
 // Every internal link must land on a page this build made, and every asset
@@ -135,7 +140,11 @@ const made = new Set(pages.map((p) => p.meta.path));
 let broken = 0;
 for (const { meta } of pages) {
   const html = read(path.join(OUT, meta.path, 'index.html'));
-  for (const [, ref] of html.matchAll(/(?:href|src)="(\/[^"#?]*)/g)) {
+  const refs = [...html.matchAll(/(?:href|src)="(\/[^"#?]*)/g)].map((m) => m[1]);
+  for (const [, set] of html.matchAll(/srcset="([^"]*)"/g)) {
+    for (const cand of set.split(',')) refs.push(cand.trim().split(/\s+/)[0]);
+  }
+  for (const ref of refs) {
     const ok = ref.endsWith('/') ? made.has(ref) : fs.existsSync(path.join(OUT, ref));
     if (!ok) { broken++; console.error('  BROKEN ' + meta.path + ' → ' + ref); }
   }

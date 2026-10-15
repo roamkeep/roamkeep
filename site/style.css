@@ -206,3 +206,6 @@ th { color: var(--muted); font-weight: 700; font-size: .85rem; text-transform: u
   .shots { grid-template-columns: 1fr; gap: 36px; }
   .cards-3 { grid-template-columns: 1fr; }
 }
+@media (max-width: 400px) {
+  .nav { gap: 14px; }
+}

@@ -44,6 +44,13 @@ say-so, because each is a public promise:
   table names what the money pays for, with **no figures**, and there is
   **no periodic report** of donations.
 - **`faq`**, "How was Roamkeep built?": the disclosure wording.
+- **`faq`**, "Will Roamkeep ever cost money?" (signed off 2026-10-12): free
+  on your own server, with every feature, always. Any paid service, if one
+  ever exists, has no features the free version lacks and is built so that
+  we can't see a family's locations, which means end-to-end encryption.
+  The home page, the `faq` "What does it cost?", the invite page, the README
+  and the Play listing say "no paid features", never "no subscriptions" or
+  "no hosted tier", so this stays possible without breaking a promise.
 - **`faq`**, "Someone has an old invite link. Can they get in?" (signed
   off 2026-10-07): a link without a current code reaches the server, not the
   family; codes stop after 72 hours or when rotated; declining or removing

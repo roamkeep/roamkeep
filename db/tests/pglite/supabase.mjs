@@ -63,7 +63,8 @@ CREATE PUBLICATION supabase_realtime;
 `
 
 /** pg_net is not a PGlite extension; the stand-in above replaces it. */
-export const prep = (sql) => sql.replace(/^CREATE EXTENSION IF NOT EXISTS pg_net;/m, '-- (pg_net: stand-in)')
+// Both forms: v20 names the extensions schema, the older tags don't.
+export const prep = (sql) => sql.replace(/^CREATE EXTENSION IF NOT EXISTS pg_net( WITH SCHEMA extensions)?;/m, '-- (pg_net: stand-in)')
 
 /** The version a schema file stamps as its last statement. */
 export const stampOf = (sql) => Number((sql.match(/GREATEST\(roamkeep_meta\.schema_version,\s*(\d+)\)/) || [])[1])

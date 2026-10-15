@@ -142,7 +142,7 @@
   // which provision.js carries (cli/test.mjs checks the two agree). Not a
   // requirement — NEEDS_SCHEMA is that — but what Settings measures a
   // family's server against when it offers an owner the update.
-  const SHIPPED_SCHEMA = 19;
+  const SHIPPED_SCHEMA = 20;
 
   // 4.7.0 shipped this equal to SCHEMA_PRE_META, so the gate was INERT on
   // arrival — a gate that demanded its own migration would have locked
@@ -628,6 +628,30 @@
     setErr('auth-err', '');
   }
 
+  // One rule wherever a password is set (4.11.3): sign-up, Change password, a
+  // reset code and owner recovery. At least 8 characters, as the server also
+  // enforces once updated; not the email's name or the app's; and not one of
+  // the 5,000 most common passwords (data/common-passwords.txt, from the UK
+  // NCSC's list), which are the guesses an attacker makes first. No rules
+  // about mixing character types: current guidance (NIST SP 800-63B-4) says
+  // not to impose them. The list loads only here, from the app itself; if it
+  // is missing, the other rules still hold. A null answer means acceptable.
+  async function passwordProblem(pw, email) {
+    if (pw.length < 8) return 'Use at least 8 characters.';
+    const low = pw.toLowerCase();
+    const name = String(email || '').split('@')[0].toLowerCase();
+    if ((name.length >= 3 && low.includes(name)) || low.includes('roamkeep')) {
+      return 'Don’t use your email or the app’s name in your password.';
+    }
+    try {
+      const P = await loadBundle('pwcheck.js', 'RoamkeepPasswords');
+      if (P.isCommon(pw)) {
+        return 'That’s one of the most common passwords, and among the first anyone would guess. Choose another.';
+      }
+    } catch (e) { console.warn('pwcheck', e); }
+    return null;
+  }
+
   // Redeeming an owner's reset code, signed out (redeem_password_reset is
   // the one v17 function anon may call). Every failure but a short
   // password answers the same "invalid", so the message cannot say which.
@@ -640,7 +664,8 @@
     const code = ($('rs-c')?.value || '').trim();
     const pass = $('rs-p')?.value || '';
     if (!email || !code) { setErr('auth-err', 'Enter your email and the reset code.'); return; }
-    if (pass.length < 8) { setErr('auth-err', 'Choose a new password of at least 8 characters.'); return; }
+    const weak = await passwordProblem(pass, email);
+    if (weak) { setErr('auth-err', weak); return; }
     btnLoad('rs-btn', true, 'Set new password →');
     setErr('auth-err', '');
     const { data, error } = await S.sb.rpc('redeem_password_reset',
@@ -729,7 +754,8 @@
     const email = $('su-e').value.trim();
     const pass = $('su-p').value;
     if (!email) { setErr('auth-err', 'Please enter an email.'); return; }
-    if (pass.length < 6) { setErr('auth-err', 'Password must be at least 6 characters.'); return; }
+    const weak = await passwordProblem(pass, email);
+    if (weak) { setErr('auth-err', weak); return; }
     btnLoad('su-btn', true, 'Create Account →');
     setErr('auth-err', '');
     const { data, error } = await S.sb.auth.signUp({ email, password: pass });
@@ -3354,7 +3380,7 @@
     closeDrawer();
     const sheet = $('pn-sheet');
     const scrim = $('pn-scrim');
-    if (sheet) { sheet.classList.remove('full'); sheet.classList.add('half', 'open'); }
+    showSheet(sheet);
     if (scrim) scrim.classList.add('on');
     document.body.classList.add('sheet-open');
   }
@@ -3507,8 +3533,8 @@
     if (rLbl) rLbl.textContent = String(S.placeRadius);
     const coord = $('pe-coord');
     if (coord) coord.textContent = '📍 ' + lat.toFixed(5) + ', ' + lng.toFixed(5);
-    // Directly under the title, not in pe-coord: that sits below the fold of
-    // the half-height sheet, and this is the line that says what just happened.
+    // Directly under the title, not in pe-coord, which sits low in the sheet:
+    // this is the line that says what just happened.
     const who = $('pe-who');
     if (who) {
       const m = !editing && opts && opts.member;
@@ -3527,19 +3553,34 @@
     // Close the drawer so the map (and preview ring) is visible behind the sheet.
     closeDrawer();
 
-    // Open the bottom sheet at half height; user can drag to full.
+    // At full height, like every sheet, so Save is never below the fold.
     const sheet = $('place-sheet');
     const scrim = $('place-sheet-scrim');
-    if (sheet) {
-      sheet.classList.remove('full', 'dragging');
-      sheet.classList.add('half', 'open');
-    }
+    showSheet(sheet);
     if (scrim) scrim.classList.add('on');
     document.body.classList.add('sheet-open');
 
-    // Centre the map on the place so the preview ring is visible.
-    S.mLat = lat; S.mLng = lng; S.mZoom = Math.max(S.mZoom, 15);
+    // Put the place, and its preview ring, in the middle of the map that
+    // still shows above the sheet. Centred on the screen, a full-height
+    // sheet would cover it.
+    S.mZoom = Math.max(S.mZoom, 15);
+    const c = aboveSheet(sheet, lat, lng);
+    S.mLat = c.lat; S.mLng = c.lng;
     drawMap();
+  }
+
+  // The map centre that puts (lat, lng) halfway down the strip of map left
+  // above an open sheet. The sheet is measured, not its keyboard lift: the
+  // keyboard comes and goes, and the place should sit where it will be seen
+  // once it has gone. Too thin a strip, and it stays centred.
+  function aboveSheet(sheet, lat, lng) {
+    const wrap = $('map-wrap');
+    if (!sheet || !wrap) return { lat, lng };
+    const m = wrap.getBoundingClientRect();
+    const top = window.innerHeight - sheet.getBoundingClientRect().height;
+    const strip = Math.min(m.bottom, top) - m.top;
+    if (strip < 120 || top >= m.bottom) return { lat, lng };
+    return panFrom(lat, lng, 0, strip / 2 - m.height / 2);
   }
 
   function cancelPlaceEdit() {
@@ -3559,6 +3600,30 @@
   // action button (e.g. "Update place") stayed unreachable. On release we snap
   // to full / half / close; a tap toggles half<->full. Gated to touch: on
   // desktop the sheet is a centered modal and the X is the control.
+  // Every sheet opens at its full height (4.11.3): the content's own height,
+  // up to near the top of the screen. Eight of them used to open at the
+  // 380px peek, which hid whatever sat lower, Save and Update included,
+  // behind a drag that people didn't know to make. Dragging down to the peek
+  // is still there for anyone who wants more of the map. One opener, so no
+  // sheet can be left behind on the old rule.
+  function showSheet(sheet) {
+    if (!sheet) return;
+    sheet.classList.remove('half', 'dragging');
+    sheet.style.transform = '';
+    sheet.classList.add('full', 'open');
+  }
+
+  // With the keyboard up, a sheet at the peek shows only its top 380px above
+  // the keyboard, and the field being typed into can be under it. It goes to
+  // full and stays there: dropping back when the keyboard closes is what
+  // hid the Update button.
+  function expandOpenSheets() {
+    document.querySelectorAll('.sheet.open.half').forEach((s) => {
+      s.classList.remove('half');
+      s.classList.add('full');
+    });
+  }
+
   const SHEET_PEEK = 380; // must match .sheet.half translateY(calc(100% - 380px))
   function initSheets() {
     const sheets = Array.from(document.querySelectorAll('.sheet'))
@@ -3637,13 +3702,17 @@
   }
 
   function initKeyboardInsets() {
-    // The WebView is NOT resized for the IME (Keyboard resize:none) — that
-    // doesn't shrink under this app's edge-to-edge layout, so the keyboard
-    // just overlaps. Instead we set --kb (the occluded height) and float the
-    // open sheet / login card above it. The native Keyboard event is a
-    // reliable "keyboard is up" signal + height on the app; visualViewport
-    // refines it to the EXACT occlusion (native keyboardHeight over-lifts on
-    // some devices) and is the sole driver on the PWA.
+    // --kb is how much of the page the keyboard covers, and the open sheet
+    // and the login card sit that far up. What decides it on Android is the
+    // window, not the Keyboard plugin's resize setting (that one is iOS
+    // only): up to Android 15, where the edge-to-edge opt-out holds, Android
+    // shrinks the WebView for the keyboard, and on 16 it doesn't, so the
+    // keyboard overlaps. 4.8.2 lifted by the plugin's keyboardHeight either
+    // way. That double-counted where the WebView had already shrunk, and
+    // over-lifted by the navigation bar where it hadn't: the gap owners saw
+    // between the keyboard and a sheet. Since 4.11.3 the native side measures
+    // the overlap itself (NativeGeofence.keyboardOcclusion), which is 0 where
+    // the WebView shrank. visualViewport drives it on the PWA.
     const root = document.documentElement;
     let kb = -1, kbOpen = false;
     const setKb = (px) => {
@@ -3655,12 +3724,35 @@
     setKb(0);
     const KB = window.Capacitor?.Plugins?.Keyboard;
     const native = KB && typeof KB.addListener === 'function';
+    const NG = nativeGeo();
+    const measured = native && NG && typeof NG.keyboardOcclusion === 'function';
+    const measure = async (fallback) => {
+      let h = fallback;
+      if (measured) {
+        try {
+          const r = await NG.keyboardOcclusion();
+          if (r && typeof r.height === 'number') h = r.height;
+        } catch (_) {}
+      }
+      if (!kbOpen) return;    // the keyboard may have gone while we asked
+      const was = kb;
+      setKb(h);
+      if (kb !== was) setTimeout(keepFocusVisible, 220);   // after the sheet's move
+    };
     if (native) {
-      KB.addListener('keyboardWillShow', (info) => { kbOpen = true; setKb(info && info.keyboardHeight); });
+      KB.addListener('keyboardWillShow', (info) => {
+        kbOpen = true;
+        expandOpenSheets();
+        measure(info && info.keyboardHeight);
+      });
+      // The end of the keyboard's animation, when the layout has settled.
+      KB.addListener('keyboardDidShow', (info) => { if (kbOpen) measure(info && info.keyboardHeight); });
       KB.addListener('keyboardWillHide', () => { kbOpen = false; setKb(0); });
+      // Turning the phone with the keyboard up changes both.
+      window.addEventListener('resize', () => { if (kbOpen) measure(kb); });
     }
     const vv = window.visualViewport;
-    if (vv) {
+    if (vv && !measured) {
       const onVV = () => {
         const occluded = window.innerHeight - (vv.height + vv.offsetTop);
         const val = occluded > 80 ? occluded : 0; // ignore small browser-UI shifts
@@ -3675,14 +3767,20 @@
       vv.addEventListener('resize', onVV);
       vv.addEventListener('scroll', onVV);
     }
-    // Keep the focused field visible within a tall sheet or the login card.
+    // Keep the focused field visible within a tall sheet or the login card:
+    // when it is focused, and again once the sheet has settled at its new
+    // height above the keyboard.
     document.addEventListener('focusin', (e) => {
       const el = e.target;
       if (!el || !el.matches || !el.matches('input, textarea')) return;
-      setTimeout(() => {
-        try { el.scrollIntoView({ block: 'center', behavior: 'smooth' }); } catch (_) {}
-      }, 250);
+      setTimeout(keepFocusVisible, 250);
     });
+  }
+
+  function keepFocusVisible() {
+    const el = document.activeElement;
+    if (!el || !el.matches || !el.matches('input, textarea')) return;
+    try { el.scrollIntoView({ block: 'center', behavior: 'smooth' }); } catch (_) {}
   }
 
   async function savePlaceFromForm() {
@@ -4195,7 +4293,7 @@
     closeDrawer();
     const sheet = $('profile-sheet');
     const scrim = $('profile-scrim');
-    if (sheet) { sheet.classList.remove('full'); sheet.classList.add('half', 'open'); }
+    showSheet(sheet);
     if (scrim) scrim.classList.add('on');
     document.body.classList.add('sheet-open');
   }
@@ -5062,7 +5160,7 @@
     const sheet = $('invite-sheet');
     const scrim = $('invite-scrim');
     // Full height: at the half-sheet peek the QR code was cut in two.
-    if (sheet) { sheet.classList.remove('half'); sheet.classList.add('full', 'open'); }
+    showSheet(sheet);
     if (scrim) scrim.classList.add('on');
     document.body.classList.add('sheet-open');
   }
@@ -5241,7 +5339,7 @@
     await renderSetup();
     const sheet = $('setup-sheet');
     const scrim = $('setup-scrim');
-    if (sheet) { sheet.classList.remove('half'); sheet.classList.add('full', 'open'); }
+    showSheet(sheet);
     if (scrim) scrim.classList.add('on');
     document.body.classList.add('sheet-open');
   }
@@ -5829,7 +5927,7 @@
     if (b) b.textContent = body;
     const sheet = $('role-sheet');
     const scrim = $('role-scrim');
-    if (sheet) { sheet.classList.remove('full'); sheet.classList.add('half', 'open'); }
+    showSheet(sheet);
     if (scrim) scrim.classList.add('on');
     document.body.classList.add('sheet-open');
   }
@@ -5942,7 +6040,7 @@
     _rcodeTimer = setInterval(paint, 15000);
     const sheet = $('rcode-sheet');
     const scrim = $('rcode-scrim');
-    if (sheet) { sheet.classList.remove('full'); sheet.classList.add('half', 'open'); }
+    showSheet(sheet);
     if (scrim) scrim.classList.add('on');
     document.body.classList.add('sheet-open');
   }
@@ -5972,17 +6070,17 @@
   // Anyone signed in. GoTrue's own updateUser: no v17 needed.
   function openChangePassword() {
     closeSettings();
-    ['pw-new', 'pw-again'].forEach((id) => { const e = $(id); if (e) e.value = ''; });
+    ['pw-cur', 'pw-new', 'pw-again'].forEach((id) => { const e = $(id); if (e) e.value = ''; });
     setErr('pw-err', '');
     const sheet = $('pw-sheet');
     const scrim = $('pw-scrim');
-    if (sheet) { sheet.classList.remove('full'); sheet.classList.add('half', 'open'); }
+    showSheet(sheet);
     if (scrim) scrim.classList.add('on');
     document.body.classList.add('sheet-open');
   }
 
   function closeChangePassword() {
-    ['pw-new', 'pw-again'].forEach((id) => { const e = $(id); if (e) e.value = ''; });
+    ['pw-cur', 'pw-new', 'pw-again'].forEach((id) => { const e = $(id); if (e) e.value = ''; });
     const sheet = $('pw-sheet');
     const scrim = $('pw-scrim');
     if (sheet) sheet.classList.remove('open', 'half', 'full');
@@ -5990,19 +6088,32 @@
     document.body.classList.remove('sheet-open');
   }
 
+  // The current password goes with the new one (4.11.3), and the family's
+  // server checks it once updated (engine.applyPasswordRules turns on
+  // security_update_password_require_current_password): someone holding an
+  // unlocked phone, or a copied session, can't change the password without
+  // knowing it. Before the update the server ignores the field.
   async function changePasswordGo() {
+    const cur = $('pw-cur')?.value || '';
     const a = $('pw-new')?.value || '';
     const b = $('pw-again')?.value || '';
-    if (a.length < 8) { setErr('pw-err', 'Use at least 8 characters.'); return; }
+    if (!cur) { setErr('pw-err', 'Enter your current password.'); return; }
+    const weak = await passwordProblem(a, S.user && S.user.email);
+    if (weak) { setErr('pw-err', weak); return; }
     if (a !== b) { setErr('pw-err', 'The two passwords don’t match.'); return; }
+    setErr('pw-err', '');
     const btn = $('pw-go');
     if (btn) btn.disabled = true;
-    const { error } = await S.sb.auth.updateUser({ password: a });
+    const { error } = await S.sb.auth.updateUser({ password: a, current_password: cur });
     if (btn) btn.disabled = false;
     if (error) {
-      setErr('pw-err', /reauth|nonce/i.test(error.message || '')
-        ? 'Your family’s server wants you to sign in again first. Sign out, sign back in, then try again.'
-        : error.message);
+      const code = error.code || '';
+      setErr('pw-err', code === 'current_password_mismatch' || code === 'current_password_required'
+        || /current password/i.test(error.message || '')
+        ? 'That isn’t your current password.'
+        : /reauth|nonce/i.test(error.message || '')
+          ? 'Your family’s server wants you to sign in again first. Sign out, sign back in, then try again.'
+          : error.message);
       return;
     }
     closeChangePassword();
@@ -6502,7 +6613,7 @@
     closeDrawer();
     const sheet = $('settings-sheet');
     const scrim = $('settings-scrim');
-    if (sheet) { sheet.classList.remove('half'); sheet.classList.add('full', 'open'); }
+    showSheet(sheet);
     if (scrim) scrim.classList.add('on');
     document.body.classList.add('sheet-open');
   }
@@ -7310,7 +7421,8 @@
     const email = ($('rs-e')?.value || '').trim();
     const password = $('rs-p')?.value || '';
     if (!email) { setErr('auth-err', 'Enter your email first.'); return; }
-    if (password.length < 8) { setErr('auth-err', 'Choose your new password (at least 8 characters) first.'); return; }
+    const weak = await passwordProblem(password, email);
+    if (weak) { setErr('auth-err', weak); return; }
     const pre = await pvServerPrereqs((m) => setErr('auth-err', m), 'Resetting an owner’s password');
     if (!pre) return;
     $('rs-p').value = '';
@@ -7966,7 +8078,7 @@
     closeSettings();
     const sheet = $('del-sheet');
     const scrim = $('del-scrim');
-    if (sheet) { sheet.classList.remove('full'); sheet.classList.add('half', 'open'); }
+    showSheet(sheet);
     if (scrim) scrim.classList.add('on');
     document.body.classList.add('sheet-open');
   }
@@ -8575,7 +8687,7 @@
 
     const sheet = $('disc-sheet');
     const scrim = $('disc-scrim');
-    if (sheet) { sheet.classList.remove('full'); sheet.classList.add('half', 'open'); }
+    showSheet(sheet);
     if (scrim) scrim.classList.add('on');
     document.body.classList.add('sheet-open');
   }
