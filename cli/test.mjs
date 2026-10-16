@@ -786,6 +786,32 @@ console.log('\napp: signing out on this device');
 
 console.log('\nwizard: every source file parses');
 
+// security.txt (RFC 9116), published on both sites from one file. Its Expires
+// date is the trap: a lapsed file tells a researcher the contact may be dead,
+// and nothing else would notice. So this starts failing a month before it
+// lapses, which is the reminder to renew it (and to keep it under a year,
+// as the RFC asks).
+{
+  const file = path.join(REPO, 'site', '.well-known', 'security.txt');
+  const text = fs.existsSync(file) ? fs.readFileSync(file, 'utf8') : '';
+  const lines = text.split(/\r?\n/).filter((l) => l.trim());
+  const field = (name) => lines.filter((l) => l.toLowerCase().startsWith(name.toLowerCase() + ':'))
+    .map((l) => l.slice(name.length + 1).trim());
+  check('security.txt: every line is a field (no comments: published files carry none)',
+    lines.length > 0 && lines.every((l) => /^[A-Za-z-]+: \S/.test(l)), lines.find((l) => !/^[A-Za-z-]+: \S/.test(l)) || 'empty');
+  check('security.txt: contacts are the security address and private reporting',
+    field('Contact').includes('mailto:security@roamkeep.app')
+      && field('Contact').includes('https://github.com/roamkeep/roamkeep/security/advisories/new'),
+    field('Contact').join(', '));
+  check('security.txt: both sites are Canonical',
+    ['https://roamkeep.app/.well-known/security.txt', 'https://get.roamkeep.app/.well-known/security.txt']
+      .every((u) => field('Canonical').includes(u)), field('Canonical').join(', '));
+  check('security.txt: one Expires, and a Policy', field('Expires').length === 1 && field('Policy').length === 1);
+  const days = (Date.parse(field('Expires')[0]) - Date.now()) / 864e5;
+  check('security.txt: Expires is between 30 and 366 days away (renew it when this fails)',
+    days > 30 && days <= 366, Number.isFinite(days) ? `${Math.round(days)} days` : 'unreadable date');
+}
+
 // The suite read src/index.js as TEXT for the --from checks above and never
 // asked Node whether it was valid JavaScript. So it reported 39/39 on a
 // wizard that would not start: a patch had left literal newlines inside

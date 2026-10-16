@@ -10,6 +10,7 @@ should stay with the family should not be collecting its visitors'.
 | `pages/*.html` | one fragment per page, starting with a `<!-- {json} -->` header (title, description, path) |
 | `style.css` | everything visual |
 | `robots.txt` | indexing allowed |
+| `.well-known/security.txt` | the security contact (RFC 9116), published on this site and on get.roamkeep.app; `cli/test.mjs` fails a month before its `Expires` date, which is the reminder to renew it |
 
 ```bash
 npm run build:site       # → site-dist/ (gitignored); fails on any broken internal link

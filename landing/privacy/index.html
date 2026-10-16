@@ -78,7 +78,7 @@
 </svg>
 
 <h1>Privacy Policy</h1>
-<p class="sub">Roamkeep · <code>com.roamkeep.app</code> · last updated 11 October 2026</p>
+<p class="sub">Roamkeep · <code>com.roamkeep.app</code> · last updated 17 October 2026</p>
 
 <div class="lede">
   <p><strong>No server of ours holds your family's data.</strong> Every family
@@ -125,14 +125,43 @@ then reminds you to delete it in Supabase.</p>
     <td>Your family's own database, <strong>automatically deleted after 7 days</strong></td>
   </tr>
   <tr>
-    <td><strong>Email address</strong></td>
+    <td><strong>Who is told about each check-in</strong>: which members are to be notified
+        of it, worked out when it happens from everyone's notification choices</td>
+    <td>So turning alerts back on later doesn't bring back ones you chose not to get</td>
+    <td>Your family's own database, <strong>deleted with the check-in after 7 days</strong></td>
+  </tr>
+  <tr>
+    <td><strong>Saved places</strong>: each place's name, icon, position and size, and who
+        added it</td>
+    <td>For arrive/leave alerts, and to show the places on the family map</td>
+    <td>Your family's own database, until someone in the family deletes the place. Each
+        member's phone keeps a copy, so alerts work while the app is closed.</td>
+  </tr>
+  <tr>
+    <td><strong>Email address and password</strong></td>
     <td>To sign in</td>
-    <td>Your family's own database</td>
+    <td>Your family's own database. The password is kept only as a one-way hash, which
+        can't be turned back into the password.</td>
   </tr>
   <tr>
     <td><strong>Display name and avatar</strong></td>
     <td>So your family can tell members apart</td>
     <td>Your family's own database</td>
+  </tr>
+  <tr>
+    <td><strong>Your place in the family</strong>: whether you are an owner, an adult or a
+        child, whether your sharing is paused, your status (for example "Not sharing:
+        notifications are off"), the saved place you are at, and when your phone last
+        reported in</td>
+    <td>So your family knows who can do what, and whether you are sharing right now</td>
+    <td>Your family's own database, until you leave</td>
+  </tr>
+  <tr>
+    <td><strong>Notification choices</strong>: whether you get arrival and departure alerts
+        at all, and anyone whose arrivals and departures at a particular place you've
+        chosen not to hear about</td>
+    <td>So you are told only what you want to know. An SOS always comes through.</td>
+    <td>Your family's own database, until you change them or leave</td>
   </tr>
   <tr>
     <td><strong>Battery level</strong></td>
@@ -290,7 +319,8 @@ request to send to us. Deleting it is in your family's hands.</p>
 <h2>Security</h2>
 <p>All traffic between the app and your database is encrypted in transit
 (HTTPS). Access is controlled by row-level security enforced by the database.
-Setup links carry your family's server address in the part of a URL that
+Passwords must be at least 8 characters and can't be one of the most commonly
+used, and changing a password needs the current one. Setup links carry your family's server address in the part of a URL that
 browsers never transmit to a web server, so it does not appear in anyone's
 access logs.</p>
 

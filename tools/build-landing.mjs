@@ -45,6 +45,15 @@ function walk(dir) {
 }
 walk(SRC);
 
+// security.txt (RFC 9116) is the same file on both sites, so it has one
+// source, in site/; both name each other as Canonical.
+{
+  const to = path.join(OUT, '.well-known', 'security.txt');
+  fs.mkdirSync(path.dirname(to), { recursive: true });
+  fs.copyFileSync(path.join(ROOT, 'site', '.well-known', 'security.txt'), to);
+  console.log('  .well-known/security.txt (from site/)');
+}
+
 // Nothing that was a comment may survive into what is published.
 let leaks = 0;
 for (const f of ['index.html', 'privacy/index.html', 'terms/index.html', 's/index.html']) {

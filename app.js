@@ -51,7 +51,7 @@
   // Tracked separately because the two documents move independently — v14
   // changed only the privacy policy, and showing one date for both on the
   // very screen asking people to agree again would be its own small lie.
-  const PRIVACY_DATE = '11 October 2026';     // matches landing/privacy
+  const PRIVACY_DATE = '17 October 2026';     // matches landing/privacy
   const TERMS_URL = 'https://get.roamkeep.app/terms';
   const PRIVACY_URL = 'https://get.roamkeep.app/privacy';
   const TERMS_STORE_KEY = 'rk_terms';

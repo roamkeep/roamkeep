@@ -6,10 +6,9 @@
   "description": "Content-free push relay for Roamkeep. Forwards FCM wake-ups; never sees message content.",
   "scripts": {
     "dev": "wrangler dev",
-    "deploy": "wrangler deploy",
-    "tail": "wrangler tail"
+    "deploy": "wrangler deploy"
   },
   "devDependencies": {
-    "wrangler": "^4.118.0"
+    "wrangler": "^4.149.0"
   }
 }

@@ -123,6 +123,9 @@ for (const page of pages) {
 
 copy(path.join(SRC, 'style.css'), path.join(OUT, 'style.css'));
 copy(path.join(SRC, 'robots.txt'), path.join(OUT, 'robots.txt'));
+// RFC 9116. The one source for both sites: build-landing.mjs copies this
+// same file, and cli/test.mjs fails as its Expires date nears.
+copy(path.join(SRC, '.well-known', 'security.txt'), path.join(OUT, '.well-known', 'security.txt'));
 copy(path.join(ROOT, 'brand-tile.png'), path.join(OUT, 'assets', 'brand-tile.png'));
 // Each screenshot comes at 540 wide (1x screens, and the README) and at the
 // grab's native 1080, which srcset gives to 2x screens and up: shown ~280
