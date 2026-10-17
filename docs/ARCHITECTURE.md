@@ -122,7 +122,7 @@ arrived and left pairs) and trips (from the trail), and the only test a trip
 must pass to be shown is the distance it covered: a filter applied at that
 point cannot tell a short real trip from noise.
 
-### Held arrivals
+### Held arrivals and departures
 
 A crossing reported with a fuzzy fix near the boundary is not announced at
 once, because it may be drift. It is not thrown away either. The phone
@@ -134,9 +134,20 @@ travel and stayed. It is discarded at the matching departure, which is then
 not announced either, so the family is never told someone left a place they
 were never told they had reached.
 
+Departures are held the same way. Play services reports a crossing once, so
+a fuzzy departure that turns out to be real will not be reported again, and
+dropping it would leave the person "at" the place for the whole trip. While
+a departure is held the phone still counts itself inside, which keeps a
+phone parked near the edge from flapping between arrived and left all night.
+The departure is announced when precise fixes have placed the phone clearly
+outside for a few minutes, and dated by the last fix that still put it
+there. Only Play services' next arrival for the place discards it: a fix
+inside shows the person has not left yet, not that they never will.
+
 The general rule: before suppressing an announcement, ask what will announce
 it once the doubt is resolved, and before discarding an event, ask what will
-send it again. Every path that files a check-in goes through one function.
+send it again. Every path that files a check-in goes through one function,
+and every accepted departure through another.
 
 ### Delivery
 
@@ -185,6 +196,18 @@ needs a reconcile against the authoritative list:
   services has accepted it, so a refused registration is retried. A list
   with one malformed row is refused as a whole, because arming the rest as
   "complete" would prune that place as if it had been deleted.
+
+The same holds in the other direction, from the phone to the database. The
+member row says which place the person is at (`last_place_id`), and the
+phone writes it after each arrival and departure. That single request is
+the one most likely to fail, since leaving home is when a phone hands over
+from Wi-Fi to mobile data. So the phone also compares the row with its own
+state on every regular update of the live pin, and sends the place again
+whenever they differ. On screen, a recorded place never outranks a position
+clearly outside it, and the app does not seed the phone's own state from a
+place its position contradicts. A status the phone owes the family, such as
+"not sharing" when notifications are off, is kept until it lands, for the
+same reason.
 
 The same reflex applies in the web code: **a failed read never overwrites
 good state.** The app checks the error, keeps the last known value, and says

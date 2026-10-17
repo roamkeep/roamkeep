@@ -94,6 +94,46 @@ public class GeofenceReceiver extends BroadcastReceiver {
     // arrival is announced with its ORIGINAL time, not the confirmation's.
     static final long CONFIRM_DWELL_MS = 3 * 60_000;
 
+    // ── Held departures (4.11.4) ───────────────────────────────────
+    //
+    // The same lesson from the other side. A gated EXIT used to be dropped,
+    // on the belief that "a genuine later departure still announces". It
+    // does not: Play Services fires ONE exit per crossing, and once it has
+    // fired it believes we are outside, so if the fuzzy one WAS the
+    // departure nothing ever sends another. The family got no "left", the
+    // member row went on saying they were there, their return was dropped as
+    // a duplicate ENTER, and History showed one unbroken stay.
+    //
+    // So a gated EXIT for a place we are inside is HELD. State still says
+    // inside, which is what keeps the drift gate absorbing the follow-up
+    // ENTER on a phone parked by a boundary. A held departure leaves the
+    // hold one of two ways:
+    //   - CONFIRMED by precise fixes outside it by their whole error radius,
+    //     holding for EXIT_SETTLE_MS with no fix in between that puts us
+    //     back (judgeHeldExit), then announced through settleDeparture with
+    //     a time from the hold's evidence (departureTime);
+    //   - DISCARDED by Play Services' next ENTER for the place, which says
+    //     it was drift and puts Play Services back in step with our state.
+    //
+    // Not discarded by a precise fix inside. That fix shows only that we
+    // have not gone YET: Play Services still has us outside and will not
+    // fire again when we do, so the hold is all that is left to announce
+    // it. A fix inside restarts the wait and moves the departure time on.
+
+    // How long precise fixes must keep us outside before a held departure is
+    // believed. Holds will be made every night on phones parked near an
+    // edge, so one confident wrong fix must never be enough. Same scale as
+    // REPAIR_SETTLE_MS and CONFIRM_DWELL_MS; the departure itself is dated
+    // from the evidence, not from the confirmation.
+    static final long EXIT_SETTLE_MS = 3 * 60_000;
+
+    // judgeHeldExit verdicts.
+    static final int EXIT_WAIT = 0;      // nothing to change
+    static final int EXIT_THERE = 1;     // this fix puts us at the place: stamp it, restart the wait
+    static final int EXIT_UNSURE = 2;    // precise, but too near the edge to tell: restart the wait
+    static final int EXIT_OUT = 3;       // precise and clearly outside: start the wait
+    static final int EXIT_CONFIRM = 4;   // ...and it has held for EXIT_SETTLE_MS
+
     // ── One POST per check-in at a time ────────────────────────────
     //
     // Ids of check-ins whose POST is under way in this process right now.
@@ -319,15 +359,22 @@ public class GeofenceReceiver extends BroadcastReceiver {
                     //
                     // Leaving state alone restores the absorption — the
                     // follow-up ENTER lands on state that already says
-                    // inside and is dropped as a duplicate. Nothing is
-                    // stranded by that, because stranding needs state to say
-                    // OUTSIDE while we are inside, which this can no longer
-                    // produce. A genuine later departure still announces.
+                    // inside and is dropped as a duplicate.
+                    //
+                    // But the EXIT must not simply be dropped either (4.11.4).
+                    // This comment used to end "a genuine later departure
+                    // still announces", and it does not: Play Services fires
+                    // one EXIT per crossing, so a fuzzy one that WAS the
+                    // departure is never sent again. It is HELD, with state
+                    // unchanged, until fixes settle it; see the held-departure
+                    // notes at the top of this class.
                     //
                     // A gated ENTER that newly puts us inside is HELD. One
                     // for a place we were already inside is not: that
                     // arrival was either announced long ago or is already
-                    // held, and holding it again would announce it twice.
+                    // held, and holding it again would announce it twice. It
+                    // does end a held departure, though: Play Services has
+                    // us back inside, so that EXIT was drift.
                     String outcome;
                     if ("arrived".equals(type)) {
                         if (prefs.claimInsidePlace(placeId)) {
@@ -338,10 +385,16 @@ public class GeofenceReceiver extends BroadcastReceiver {
                             outcome = "held until confirmed ("
                                     + (travel ? "arriving from travel" : "no recent travel") + ")";
                         } else {
-                            outcome = "not announced (already inside)";
+                            PrefsStore.HeldExit hx = prefs.claimHeldExit(placeId);
+                            outcome = hx == null ? "not announced (already inside)"
+                                    : "not announced (already inside); the departure held since "
+                                      + hhmm(hx.exitMs) + " was drift, discarded";
                         }
+                    } else if (prefs.isInsidePlace(placeId)) {
+                        prefs.holdExit(placeId, whenMs);
+                        outcome = "held until confirmed (state: inside)";
                     } else {
-                        outcome = "drift, not announced (state: unchanged)";
+                        outcome = "drift, not announced (not inside)";
                     }
                     prefs.journal("geo: " + type + " " + p.name + " fuzzy fix ±"
                             + Math.round(tAcc) + "m within " + Math.round(distFromEdge)
@@ -382,22 +435,29 @@ public class GeofenceReceiver extends BroadcastReceiver {
             // a hold can get, and each is the last chance to settle it.
             if ("arrived".equals(type)) {
                 if (!prefs.claimInsidePlace(placeId)) {
-                    // Already inside. If that is because the arrival is
-                    // held, this ENTER — one the drift gate let through, so
-                    // precise or clearly on the inside of the edge — is the
-                    // evidence it was waiting for: announce it, with its
-                    // original time.
+                    // Already inside. A departure held for this place ends
+                    // here: Play Services has us back inside, so that EXIT
+                    // was drift (4.11.4).
+                    PrefsStore.HeldExit hx = prefs.claimHeldExit(placeId);
+                    if (hx != null) {
+                        prefs.journal("geo: arrived " + p.name + " — already inside; the departure"
+                                + " held since " + hhmm(hx.exitMs) + " was drift, discarded");
+                    }
+                    // If that is because the arrival is held, this ENTER —
+                    // one the drift gate let through, so precise or clearly
+                    // on the inside of the edge — is the evidence it was
+                    // waiting for: announce it, with its original time.
                     PrefsStore.Held held = prefs.claimHeldArrival(placeId);
                     if (held == null) {
                         Log.i(TAG, "duplicate ENTER for " + p.name + " — already inside, skipping");
-                        prefs.journal("geo: duplicate ENTER " + p.name + " dropped");
+                        if (hx == null) prefs.journal("geo: duplicate ENTER " + p.name + " dropped");
                         continue;
                     }
                     prefs.journal("geo: arrived " + p.name + " — held arrival confirmed by an"
                             + " unambiguous enter, announced for " + hhmm(held.enterMs));
                     fileCheckin(prefs, rest, p, "arrived", held.enterMs);
                     anyAccepted = true;
-                    updateMemberAfter(ctx, rest, memberId, placeId, "arrived", isoTime, tLat, tLng);
+                    updateMemberAfter(ctx, prefs, rest, memberId, p, "arrived", isoTime, tLat, tLng);
                     continue;
                 }
             } else {
@@ -409,29 +469,20 @@ public class GeofenceReceiver extends BroadcastReceiver {
                     spurious.add(p.name);   // journalled once, after the loop
                     continue;
                 }
-                // An arrival still held at its own departure. Either the
-                // stay itself proves it — arriving from travel and staying
-                // past the dwell, which the breadcrumb path would normally
-                // have confirmed already — or nothing ever did, and then
-                // this departure is not announced either. The family must
-                // never get a "left" without its "arrived".
-                PrefsStore.Held held = prefs.claimHeldArrival(placeId);
-                if (held != null) {
-                    if (!confirmsAtExit(held.enterMs, held.travel, whenMs)) {
-                        prefs.journal("geo: left " + p.name + " — its arrival ("
-                                + hhmm(held.enterMs) + ") was never confirmed; neither announced");
-                        continue;
-                    }
-                    prefs.journal("geo: arrived " + p.name + " — confirmed at departure (stayed "
-                            + ((whenMs - held.enterMs) / 60_000) + "m after arriving from travel),"
-                            + " announced for " + hhmm(held.enterMs));
-                    fileCheckin(prefs, rest, p, "arrived", held.enterMs);
+                // A departure already held for this place (4.11.4): with no
+                // ENTER since, Play Services has had us outside from then,
+                // so it is dated from the hold's evidence, no later than now.
+                long depMs = whenMs;
+                String note = "";
+                PrefsStore.HeldExit hx = prefs.claimHeldExit(placeId);
+                if (hx != null) {
+                    depMs = departureTime(hx.exitMs, hx.thereMs, whenMs);
+                    note = " — held since " + hhmm(hx.exitMs) + ", announced for " + hhmm(depMs);
                 }
-                // An ANNOUNCED departure — and only that — counts as recent
-                // travel for the next place's held arrival. A discarded one
-                // must not: at night that is a drift EXIT, and letting it
-                // vouch for the next drift ENTER would confirm it on dwell.
-                prefs.setLastExitMs(whenMs);
+                if (!settleDeparture(prefs, rest, p, depMs, note)) continue;
+                anyAccepted = true;
+                updateMemberAfter(ctx, prefs, rest, memberId, p, "left", isoTime, tLat, tLng);
+                continue;
             }
             prefs.journal("geo: " + type + " " + p.name);
             anyAccepted = true;
@@ -441,7 +492,7 @@ public class GeofenceReceiver extends BroadcastReceiver {
             // POST is already queued, so carry on to the member update: the
             // avatar should still move.
             fileCheckin(prefs, rest, p, type, whenMs);
-            updateMemberAfter(ctx, rest, memberId, placeId, type, isoTime, tLat, tLng);
+            updateMemberAfter(ctx, prefs, rest, memberId, p, type, isoTime, tLat, tLng);
         }
 
         if (!spurious.isEmpty()) {
@@ -472,14 +523,23 @@ public class GeofenceReceiver extends BroadcastReceiver {
 
     /**
      * Mirror the JS path after an announced transition: on arrival set
-     * last_place_id, on departure clear it. Also push the triggering lat/lng
-     * and last_seen so the live map pin tracks the user, and piggyback the
-     * battery level so it stays current in the background between location
-     * fires.
+     * last_place_id, on departure clear it (or move it to another place we
+     * are still inside). Also push the triggering lat/lng and last_seen so
+     * the live map pin tracks the user, and piggyback the battery level so
+     * it stays current in the background between location fires.
+     *
+     * One request, and until 4.11.4 its result was ignored. The check-in
+     * beside it is queued and retried; this was not, so when it failed (a
+     * departure from home is exactly the Wi-Fi to cellular handoff) the
+     * family saw "left Home" in Activity and "At Home" on the Family tab for
+     * as long as the member was out. It is now journalled, and the pin write
+     * re-sends last_place_id whenever it differs from what last landed
+     * (LocationUpdateReceiver): a delta handler is an optimisation, never
+     * the only path.
      */
-    private static void updateMemberAfter(Context ctx, SupabaseRest rest, String memberId,
-                                          String placeId, String type, String isoTime,
-                                          Double tLat, Double tLng) {
+    private static void updateMemberAfter(Context ctx, PrefsStore prefs, SupabaseRest rest,
+                                          String memberId, PrefsStore.Place p, String type,
+                                          String isoTime, Double tLat, Double tLng) {
         try {
             JSONObject upd = new JSONObject();
             if (tLat != null && tLng != null) {
@@ -489,11 +549,58 @@ public class GeofenceReceiver extends BroadcastReceiver {
             }
             int batt = SupabaseRest.currentBatteryLevel(ctx);
             if (batt >= 0) upd.put("battery", batt);
-            upd.put("last_place_id", "arrived".equals(type) ? placeId : JSONObject.NULL);
-            rest.updateMember(memberId, upd);
+            String place = lastPlaceNow(prefs, "arrived".equals(type) ? p.id : prefs.getLastPlaceSent());
+            upd.put("last_place_id", place.isEmpty() ? JSONObject.NULL : place);
+            if (rest.updateMember(memberId, upd)) {
+                prefs.setLastPlaceSent(place);
+            } else {
+                prefs.journal("geo: member update after " + type + " " + p.name
+                        + " failed; the next pin write repairs it");
+            }
         } catch (JSONException e) {
             Log.w(TAG, "member update payload build failed", e);
         }
+    }
+
+    /**
+     * Everything an accepted departure does once its caller has claimed it
+     * (claimExitPlace): settle an arrival still held for the place, then
+     * announce. Shared by the transition and the held-departure
+     * confirmation, so the two cannot drift apart in what they tell the
+     * family (4.11.4); the 4.8.5 shape is one rule kept on one path only.
+     *
+     * An arrival still held at its own departure: either the stay itself
+     * proves it (arriving from travel and staying past the dwell, which the
+     * breadcrumb path would normally have confirmed already), or nothing
+     * ever did, and then this departure is not announced either. The family
+     * must never get a "left" without its "arrived".
+     *
+     * @param depMs when it happened, which becomes created_at
+     * @param note  appended to the journal line; "" for a plain transition
+     * @return false if nothing was announced
+     */
+    static boolean settleDeparture(PrefsStore prefs, SupabaseRest rest, PrefsStore.Place p,
+                                   long depMs, String note) {
+        PrefsStore.Held held = prefs.claimHeldArrival(p.id);
+        if (held != null) {
+            if (!confirmsAtExit(held.enterMs, held.travel, depMs)) {
+                prefs.journal("geo: left " + p.name + " — its arrival ("
+                        + hhmm(held.enterMs) + ") was never confirmed; neither announced");
+                return false;
+            }
+            prefs.journal("geo: arrived " + p.name + " — confirmed at departure (stayed "
+                    + ((depMs - held.enterMs) / 60_000) + "m after arriving from travel),"
+                    + " announced for " + hhmm(held.enterMs));
+            fileCheckin(prefs, rest, p, "arrived", held.enterMs);
+        }
+        // An ANNOUNCED departure — and only that — counts as recent travel
+        // for the next place's held arrival. A discarded one must not: at
+        // night that is a drift EXIT, and letting it vouch for the next drift
+        // ENTER would confirm it on dwell.
+        prefs.setLastExitMs(depMs);
+        prefs.journal("geo: left " + p.name + note);
+        fileCheckin(prefs, rest, p, "left", depMs);
+        return true;
     }
 
     /**
@@ -778,7 +885,7 @@ public class GeofenceReceiver extends BroadcastReceiver {
                     + " (±" + Math.round(acc) + "m, " + Math.round(d[0]) + "m from centre)");
 
             fileCheckin(prefs, rest, p, "arrived", whenMs);
-            markLastPlace(rest, memberId, p.id);
+            writeLastPlace(prefs, rest, memberId, p.id);
         }
         if (watchChanged) prefs.setRepairWatch(watch);
     }
@@ -820,6 +927,11 @@ public class GeofenceReceiver extends BroadcastReceiver {
             }
             Location.distanceBetween(lat, lng, p.lat, p.lng, d);
             int verdict = judgeHeld(h.enterMs, h.travel, nowMs, d[0], p.radius, acc);
+            // "Without an EXIT" includes one that is held (4.11.4): Play
+            // Services has said we left, and until that is settled the stay
+            // is not proven. settleDeparture applies the dwell instead, up to
+            // the departure, if it is confirmed.
+            if (verdict == HOLD_CONFIRM_DWELL && prefs.hasHeldExit(id)) verdict = HOLD_WAIT;
             if (verdict == HOLD_WAIT) continue;
             if (verdict == HOLD_DEMOTE) {
                 prefs.demoteHeldArrival(id);
@@ -837,7 +949,7 @@ public class GeofenceReceiver extends BroadcastReceiver {
                         : "after " + ((nowMs - c.enterMs) / 60_000) + "m with no exit (arriving from travel)")
                     + ", announced for " + hhmm(c.enterMs));
             fileCheckin(prefs, rest, p, "arrived", c.enterMs);
-            markLastPlace(rest, memberId, p.id);
+            writeLastPlace(prefs, rest, memberId, p.id);
         }
     }
 
@@ -903,11 +1015,174 @@ public class GeofenceReceiver extends BroadcastReceiver {
         return travel && exitMs - enterMs >= CONFIRM_DWELL_MS;
     }
 
-    private static void markLastPlace(SupabaseRest rest, String memberId, String placeId) {
+    /**
+     * Settle held departures against a fresh position: the breadcrumb
+     * pipeline's half of the held-departure rules (an ENTER settles the
+     * rest, in handleTransitions). See judgeHeldExit.
+     *
+     * @param lat,lng,acc the batch's most PRECISE fix, as for the held
+     *                    arrivals; acc negative when none has an accuracy
+     * @param fixMs       that fix's own time: the wait and the departure
+     *                    time are both about when the fixes were taken
+     */
+    static void confirmHeldExits(PrefsStore prefs, SupabaseRest rest,
+                                 double lat, double lng, float acc, long fixMs) {
+        Map<String, PrefsStore.HeldExit> held = prefs.getHeldExits();
+        if (held.isEmpty()) return;
+        String memberId = prefs.getMemberId();
+        if (prefs.getKeepId() == null || memberId == null) return;
+
+        float[] d = new float[1];
+        for (Map.Entry<String, PrefsStore.HeldExit> e : held.entrySet()) {
+            String id = e.getKey();
+            PrefsStore.HeldExit h = e.getValue();
+            PrefsStore.Place p = prefs.findPlace(id);
+            if (p == null) {
+                if (prefs.claimHeldExit(id) != null) {
+                    prefs.journal("geo: held departure dropped — its place no longer exists");
+                }
+                continue;
+            }
+            Location.distanceBetween(lat, lng, p.lat, p.lng, d);
+            int verdict = judgeHeldExit(h.exitMs, h.outSinceMs, fixMs, d[0], p.radius, acc);
+            if (verdict == EXIT_WAIT) continue;
+            if (verdict == EXIT_THERE) {
+                if (h.outSinceMs != 0L || h.thereMs < fixMs) {
+                    prefs.touchHeldExit(id, 0L, Math.max(h.thereMs, fixMs));
+                }
+                continue;
+            }
+            if (verdict == EXIT_UNSURE) {
+                if (h.outSinceMs != 0L) prefs.touchHeldExit(id, 0L, h.thereMs);
+                continue;
+            }
+            if (verdict == EXIT_OUT) {
+                prefs.touchHeldExit(id, fixMs, h.thereMs);
+                continue;
+            }
+            // EXIT_CONFIRM. Claim it before acting: an ENTER on the geofence
+            // worker may be discarding this same hold right now.
+            PrefsStore.HeldExit c = prefs.claimHeldExit(id);
+            if (c == null) continue;
+            // And flip state as an accepted EXIT does. A hold exists only
+            // while state says inside; losing this claim means another path
+            // has already settled the place, and it is not ours to announce.
+            if (!prefs.claimExitPlace(id)) continue;
+            long depMs = departureTime(c.exitMs, c.thereMs, c.outSinceMs);
+            boolean announced = settleDeparture(prefs, rest, p, depMs,
+                    " — held departure confirmed by precise fixes outside for "
+                    + ((fixMs - c.outSinceMs) / 60_000) + "m (±" + Math.round(acc) + "m, "
+                    + Math.round(d[0] - p.radius) + "m out), announced for " + hhmm(depMs));
+            if (announced) writeLastPlace(prefs, rest, memberId, prefs.getLastPlaceSent());
+        }
+    }
+
+    /**
+     * What a fresh fix says about one held departure. Pure, so the rules can
+     * be tested without a device (HeldDepartureTest).
+     *
+     *   - A fix taken before the EXIT says nothing about it: WAIT.
+     *   - PRECISE (the drift gate's own bar) and outside by its whole error
+     *     radius: the first starts the wait (OUT), and one at least
+     *     EXIT_SETTLE_MS later CONFIRMS. A single confident fix never does:
+     *     holds are made nightly by phones parked near an edge.
+     *   - Centre inside the place, at any accuracy: we cannot rule out still
+     *     being there, so THERE (restart the wait, and the departure, when
+     *     it comes, is no earlier than this fix). Not a discard; see the
+     *     held-departure notes at the top of this class.
+     *   - Precise, but within its error of the edge: UNSURE, restart the wait.
+     *   - Imprecise and outside: proves nothing either way, WAIT.
+     *
+     * @param outSinceMs the running wait's start, 0 for none. One in the
+     *                   future (a clock change) restarts it, as the repair
+     *                   watch does, rather than parking it beyond reach.
+     * @param accM       negative means unknown, which is not precise.
+     */
+    static int judgeHeldExit(long exitMs, long outSinceMs, long fixMs,
+                             float distM, float radiusM, float accM) {
+        if (fixMs < exitMs) return EXIT_WAIT;
+        boolean precise = accM >= 0 && accM <= DRIFT_MIN_ACC_M;
+        if (precise && distM > radiusM + accM) {
+            if (outSinceMs <= 0L || outSinceMs > fixMs) return EXIT_OUT;
+            return fixMs - outSinceMs >= EXIT_SETTLE_MS ? EXIT_CONFIRM : EXIT_WAIT;
+        }
+        if (distM <= radiusM) return EXIT_THERE;
+        return precise ? EXIT_UNSURE : EXIT_WAIT;
+    }
+
+    /**
+     * When a held departure happened: the last we knew of the member there
+     * (the EXIT itself, or a later fix that still put them there), but never
+     * after the first fix that proved them gone.
+     *
+     * Unless that knowledge is old. A hold can sit for hours on a phone with
+     * no fixes worth the name, and then a morning departure would be filed
+     * at 03:12, the time of a drift EXIT in the night. When the last we knew
+     * is more than TRAVEL_WINDOW_MS before the proof, we know when they were
+     * gone and not when they went, and the proof's own time is the honest
+     * answer.
+     *
+     * @param outMs the first fix (or EXIT) that proved them outside; 0 none
+     */
+    static long departureTime(long exitMs, long thereMs, long outMs) {
+        long last = Math.max(exitMs, thereMs);
+        if (outMs <= 0L) return last;
+        if (last >= outMs) return outMs;
+        return outMs - last > TRAVEL_WINDOW_MS ? outMs : last;
+    }
+
+    /**
+     * The place the family has been told this member is at, which is what
+     * keep_members.last_place_id should say: one the inside-set holds whose
+     * arrival was announced, not held. `prefer` when it qualifies, so a value
+     * already written is kept rather than swapped for another place we are
+     * also inside; otherwise the smallest such place, the most specific
+     * answer (a home inside a neighbourhood says home), ties broken by id so
+     * every caller agrees. Null for none.
+     *
+     * A place with no metadata here is skipped: it is not one of ours any
+     * more, and last_place_id is a foreign key that would refuse it.
+     *
+     * A held DEPARTURE still counts as there: the family has not been told
+     * "left", and the row moves with the announcement, not before it. Pure,
+     * for LastPlaceTest.
+     */
+    static String placeToShow(Set<String> inside, Set<String> heldArrivals,
+                              List<PrefsStore.Place> places, String prefer) {
+        PrefsStore.Place best = null;
+        for (PrefsStore.Place p : places) {
+            if (!inside.contains(p.id) || heldArrivals.contains(p.id)) continue;
+            if (p.id.equals(prefer)) return p.id;
+            if (best == null || p.radius < best.radius
+                    || (p.radius == best.radius && p.id.compareTo(best.id) < 0)) best = p;
+        }
+        return best == null ? null : best.id;
+    }
+
+    /** placeToShow from this device's state, "" for none. */
+    static String lastPlaceNow(PrefsStore prefs, String prefer) {
+        String id = placeToShow(prefs.getInsidePlaceIds(), prefs.getHeldArrivals().keySet(),
+                prefs.getPlaces(), prefer);
+        return id == null ? "" : id;
+    }
+
+    /**
+     * Bring last_place_id up to date after an announcement made away from a
+     * transition: a repaired or confirmed arrival, a confirmed departure.
+     * A failure is left to the pin write, which re-sends whatever differs
+     * from what last landed.
+     */
+    private static void writeLastPlace(PrefsStore prefs, SupabaseRest rest, String memberId,
+                                       String prefer) {
+        String place = lastPlaceNow(prefs, prefer);
         try {
             JSONObject upd = new JSONObject();
-            upd.put("last_place_id", placeId);
-            rest.updateMember(memberId, upd);
+            upd.put("last_place_id", place.isEmpty() ? JSONObject.NULL : place);
+            if (rest.updateMember(memberId, upd)) {
+                prefs.setLastPlaceSent(place);
+            } else {
+                prefs.journal("geo: last_place_id update failed; the next pin write repairs it");
+            }
         } catch (JSONException e) {
             Log.w(TAG, "last_place_id payload build failed", e);
         }

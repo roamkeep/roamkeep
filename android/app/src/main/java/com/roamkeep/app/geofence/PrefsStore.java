@@ -195,6 +195,23 @@ public class PrefsStore {
     // two "arriving from travel" signals a held arrival is judged by.
     private static final String K_LAST_EXIT_MS = "last_exit_ms";
 
+    // {placeId: {t, out, there}} — departures the drift gate did not announce,
+    // waiting for evidence (4.11.4). See GeofenceReceiver.confirmHeldExits.
+    // Like the held arrivals, bookkeeping about what WE have said.
+    private static final String K_HELD_EXITS = "held_exits";
+
+    // The last_place_id this device last wrote and saw land: a place id, ""
+    // for none, absent for not since sign-in. The pin write compares it with
+    // what the inside-place set says now and re-sends on a difference, which
+    // is what heals a member update lost at a boundary (4.11.4).
+    private static final String K_LAST_PLACE_SENT = "last_place_sent";
+
+    // A status this member still owes the family (4.11.4): the "not sharing"
+    // notice, or the one that takes it back. Written before the request and
+    // cleared when it lands, so a request lost to a bad link is retried.
+    private static final String K_STATUS_OWED        = "status_owed";
+    private static final String K_STATUS_OWED_FAILED = "status_owed_failed";
+
     // Black-box event journal: JSON array of { t: epochMs, e: text },
     // capped at JOURNAL_CAP (oldest dropped). Written by the service,
     // receivers and plugin at lifecycle-significant moments (doze
@@ -765,9 +782,10 @@ public class PrefsStore {
         // it — the geofence no longer exists, so we should not
         // expect a matching EXIT to clear the state later.
         removeInsidePlace(id);
-        // Likewise an arrival still held for it: a deleted place must
-        // never be announced later from stale metadata.
+        // Likewise an arrival or a departure still held for it: a deleted
+        // place must never be announced later from stale metadata.
         claimHeldArrival(id);
+        claimHeldExit(id);
     } }
 
     public void clearPlaces() { synchronized (LOCK) {
@@ -1022,6 +1040,154 @@ public class PrefsStore {
 
     public void setLastExitMs(long ms) { synchronized (LOCK) {
         sp.edit().putLong(K_LAST_EXIT_MS, ms).apply();
+    } }
+
+    // ── Held departures (4.11.4) ───────────────────────────────────
+    //
+    // The EXIT side of the held arrivals above. A drift-gated EXIT leaves
+    // the inside-set alone (see GeofenceReceiver), and used to be dropped
+    // outright; but Play Services fires one EXIT per crossing, so a fuzzy
+    // one that WAS the departure was never sent again. It is held here
+    // instead, and leaves exactly once: confirmed by precise fixes outside,
+    // or discarded by Play Services' next ENTER for the place.
+
+    public static final class HeldExit {
+        public final long exitMs;       // when the gated EXIT happened
+        public final long outSinceMs;   // first precise fix outside, of the current run; 0 none
+        public final long thereMs;      // newest fix that still put us there; 0 none
+        HeldExit(long exitMs, long outSinceMs, long thereMs) {
+            this.exitMs = exitMs;
+            this.outSinceMs = outSinceMs;
+            this.thereMs = thereMs;
+        }
+    }
+
+    private JSONObject readHeldExits() {
+        try {
+            return new JSONObject(sp.getString(K_HELD_EXITS, "{}"));
+        } catch (JSONException e) {
+            return new JSONObject();
+        }
+    }
+
+    private static HeldExit parseHeldExit(JSONObject o) {
+        if (o == null) return null;
+        long t = o.optLong("t", 0L);
+        return t > 0L ? new HeldExit(t, o.optLong("out", 0L), o.optLong("there", 0L)) : null;
+    }
+
+    /**
+     * Hold a departure. If one is already held for this place, keep its
+     * EARLIER time and its evidence: without an ENTER between them, Play
+     * Services has had us outside since the first.
+     */
+    public void holdExit(String id, long exitMs) {
+        if (id == null) return;
+        synchronized (LOCK) {
+            JSONObject all = readHeldExits();
+            HeldExit prev = parseHeldExit(all.optJSONObject(id));
+            try {
+                JSONObject o = new JSONObject();
+                o.put("t", prev != null ? Math.min(prev.exitMs, exitMs) : exitMs);
+                o.put("out", prev != null ? prev.outSinceMs : 0L);
+                o.put("there", prev != null ? prev.thereMs : 0L);
+                all.put(id, o);
+            } catch (JSONException e) {
+                return;
+            }
+            sp.edit().putString(K_HELD_EXITS, all.toString()).commit();
+        }
+    }
+
+    /** Record new evidence on a held departure, if it is still held: another
+     *  thread may have claimed it since the caller's snapshot. */
+    public void touchHeldExit(String id, long outSinceMs, long thereMs) {
+        if (id == null) return;
+        synchronized (LOCK) {
+            JSONObject all = readHeldExits();
+            JSONObject o = all.optJSONObject(id);
+            if (o == null) return;
+            try {
+                o.put("out", outSinceMs);
+                o.put("there", thereMs);
+            } catch (JSONException e) {
+                return;
+            }
+            sp.edit().putString(K_HELD_EXITS, all.toString()).commit();
+        }
+    }
+
+    /** Take a held departure and hand it to THIS caller, or null if there is
+     *  none. Compare-and-set under LOCK, as claimHeldArrival: the geofence
+     *  worker (an ENTER) and the location worker (a batch) can both settle
+     *  one hold, and only one of them may act on it. */
+    public HeldExit claimHeldExit(String id) {
+        if (id == null) return null;
+        synchronized (LOCK) {
+            JSONObject all = readHeldExits();
+            if (!all.has(id)) return null;
+            HeldExit h = parseHeldExit(all.optJSONObject(id));   // null if malformed: removed all the same
+            all.remove(id);
+            sp.edit().putString(K_HELD_EXITS, all.toString()).commit();
+            return h;
+        }
+    }
+
+    public boolean hasHeldExit(String id) { synchronized (LOCK) {
+        return id != null && readHeldExits().has(id);
+    } }
+
+    /** Snapshot of every held departure. Never null. */
+    public Map<String, HeldExit> getHeldExits() { synchronized (LOCK) {
+        Map<String, HeldExit> out = new HashMap<>();
+        JSONObject all = readHeldExits();
+        Iterator<String> it = all.keys();
+        while (it.hasNext()) {
+            String id = it.next();
+            HeldExit h = parseHeldExit(all.optJSONObject(id));
+            if (h != null) out.put(id, h);
+        }
+        return out;
+    } }
+
+    // ── What the member row says (4.11.4) ──────────────────────────
+
+    /** The last_place_id last written and landed: an id, "" for none, or
+     *  null when unknown (never, or not since sign-in). */
+    public String getLastPlaceSent() { return sp.getString(K_LAST_PLACE_SENT, null); }
+
+    public void setLastPlaceSent(String placeIdOrEmpty) {
+        sp.edit().putString(K_LAST_PLACE_SENT, placeIdOrEmpty == null ? "" : placeIdOrEmpty).apply();
+    }
+
+    /** The status still owed to the family, or null. */
+    public String getStatusOwed() { return sp.getString(K_STATUS_OWED, null); }
+
+    /** Owe a status. Replaces any older one: the newest decision is the one
+     *  the family should see. */
+    public void setStatusOwed(String status) { synchronized (LOCK) {
+        sp.edit().putString(K_STATUS_OWED, status)
+                 .putBoolean(K_STATUS_OWED_FAILED, false)
+                 .commit();
+    } }
+
+    /** Settle a status that landed. Only that one: a newer status owed since
+     *  the request went out stays owed.
+     *  @return true if it had failed before, so the caller can say so. */
+    public boolean settleStatusOwed(String status) { synchronized (LOCK) {
+        if (status == null || !status.equals(sp.getString(K_STATUS_OWED, null))) return false;
+        boolean failed = sp.getBoolean(K_STATUS_OWED_FAILED, false);
+        sp.edit().remove(K_STATUS_OWED).remove(K_STATUS_OWED_FAILED).commit();
+        return failed;
+    } }
+
+    /** Note a failed attempt. @return true the first time for this status,
+     *  so the journal says it once rather than at every retry. */
+    public boolean markStatusOwedFailed() { synchronized (LOCK) {
+        if (sp.getString(K_STATUS_OWED, null) == null) return false;
+        if (sp.getBoolean(K_STATUS_OWED_FAILED, false)) return false;
+        sp.edit().putBoolean(K_STATUS_OWED_FAILED, true).commit();
+        return true;
     } }
 
     // ── Pending check-in queue ─────────────────────────────────────

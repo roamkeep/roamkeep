@@ -1785,9 +1785,11 @@
     // rearmGeofencesFromPlaces).
     S._placesLoaded = true;
     // Seed insidePlaces from the current member row so reopening
-    // the app after being inside a place doesn't re-fire 'arrived'.
-    const me = S.members.find(m => m.id === S.myId);
-    if (me && me.last_place_id) S.insidePlaces.add(me.last_place_id);
+    // the app after being inside a place doesn't re-fire 'arrived'. Not
+    // from a last_place_id the member's own position contradicts (see
+    // checkedInPlace): this set is handed to the native side at launch.
+    const at = checkedInPlace(S.members.find(m => m.id === S.myId));
+    if (at) S.insidePlaces.add(at.id);
     renderPlaces();
     return true;
   }
@@ -4024,6 +4026,37 @@
     return (m / 1000).toFixed(m < 10000 ? 1 : 0) + ' km';
   }
 
+  // How far outside the place last_place_id names a member's position may
+  // be before the position wins. The live pin is written from fixes up to
+  // ±150 m wide when nothing better is to hand (BREADCRUMB_MAX_ACC_M on the
+  // native side), so a pin within that of the edge may just be a fuzzy fix
+  // of someone still there. Beyond it, it is not.
+  const CHECKED_IN_SLACK_M = 150;
+
+  /**
+   * The place a member is checked into, or null.
+   *
+   * last_place_id, written on arrive and cleared on leave, is the better
+   * answer at a boundary, where coordinates can disagree, but it is one
+   * write that can be lost: the departure's member update rides the Wi-Fi
+   * to cellular handoff at the front door, and its check-in is queued and
+   * retried while the update was not. A member then read "At Home" for as
+   * long as they were out, while Activity said they had left. So a
+   * position clearly outside the place wins.
+   *
+   * Used for the Family tab line AND for seeding this device's own
+   * inside-places at launch. The seed reaches the native geofence state, and
+   * a stale Home there swallowed the next homecoming as a duplicate ENTER.
+   */
+  function checkedInPlace(m) {
+    if (!m || !m.last_place_id) return null;
+    const p = (S.places || []).find(x => x.id === m.last_place_id);
+    if (!p) return null;
+    if (typeof m.lat === 'number' && typeof m.lng === 'number'
+        && distanceM(m.lat, m.lng, p.lat, p.lng) > p.radius_m + CHECKED_IN_SLACK_M) return null;
+    return p;
+  }
+
   /**
    * One line saying where a member is.
    *
@@ -4035,13 +4068,8 @@
   function whereIs(m) {
     if (!m || typeof m.lat !== 'number' || typeof m.lng !== 'number') return '';
 
-    // last_place_id is the authoritative "they are checked in here" —
-    // written on arrive, cleared on leave — so prefer it over recomputing
-    // from coordinates, which can disagree at a boundary.
-    if (m.last_place_id) {
-      const p = (S.places || []).find(x => x.id === m.last_place_id);
-      if (p) return 'At ' + p.icon + ' ' + p.name;
-    }
+    const at = checkedInPlace(m);
+    if (at) return 'At ' + at.icon + ' ' + at.name;
     // No check-in, but they may still be standing inside a place added
     // since — or one whose arrival was missed.
     const inside = placeContaining(m.lat, m.lng);

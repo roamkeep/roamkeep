@@ -565,10 +565,14 @@ public class LocationUpdateReceiver extends BroadcastReceiver {
                 // background (the JS battery listener only runs foreground).
                 int batt = SupabaseRest.currentBatteryLevel(ctx);
                 if (batt >= 0) upd.put("battery", batt);
-                if (rest.updateMember(memberId, upd)) prefs.setLastPinWriteMs(nowMs);
+                writePin(prefs, rest, memberId, upd, nowMs);
             } catch (JSONException e) {
                 Log.w(TAG, "pin update payload build failed", e);
             }
+            // A status the family is still owed (4.11.4), at the pin's
+            // cadence: often enough to land soon after the link is back,
+            // never once per fix.
+            if (prefs.getStatusOwed() != null) LocationForegroundService.sendOwedStatus(ctx);
         }
 
         // Reconcile the inside-place set against where we actually are.
@@ -607,6 +611,19 @@ public class LocationUpdateReceiver extends BroadcastReceiver {
             // but the dwell rule still can.
             GeofenceReceiver.confirmHeldArrivals(prefs, rest,
                     lats[last], lngs[last], -1f, newest);
+        }
+
+        // And departures the drift gate held (4.11.4). Play Services fires
+        // one EXIT per crossing, so for a held one this pipeline is the only
+        // thing left that can see the member has gone. Judged on the most
+        // precise fix and that fix's own time, since the wait is about how
+        // long the fixes have agreed.
+        if (best >= 0) {
+            GeofenceReceiver.confirmHeldExits(prefs, rest,
+                    lats[best], lngs[best], accs[best], times[best]);
+        } else {
+            GeofenceReceiver.confirmHeldExits(prefs, rest,
+                    lats[last], lngs[last], -1f, times[last]);
         }
 
         // Retry any check-ins parked by GeofenceReceiver. A queued entry
@@ -659,6 +676,62 @@ public class LocationUpdateReceiver extends BroadcastReceiver {
     /** Pure, for RetentionPruneTest. A clock that moved back counts as due. */
     static boolean pruneDue(long lastMs, long nowMs) {
         return lastMs <= 0 || nowMs < lastMs || nowMs - lastMs >= PRUNE_EVERY_MS;
+    }
+
+    /**
+     * Write the live pin, and with it last_place_id whenever that differs
+     * from what this device last saw land (4.11.4).
+     *
+     * last_place_id is mirrored from the inside-place set by one request at
+     * each announcement, and a mirror written once is the divergence bug
+     * again: that request failed at a departure from home, and the member
+     * read "At Home" on the Family tab for the rest of the trip while
+     * Activity said "left Home". The pin write is this device's regular
+     * heartbeat, so riding on it bounds any such divergence by one pin
+     * interval. A delta handler is an optimisation, never the only path.
+     *
+     * Only on a difference, not every time: the column is a foreign key, and
+     * a place deleted on another device but still held here would make
+     * every pin write fail until the place list caught up. For the same
+     * reason a value the server refuses is dropped from the write rather
+     * than allowed to hold the pin back, and not offered again until the
+     * answer changes.
+     */
+    private static void writePin(PrefsStore prefs, SupabaseRest rest, String memberId,
+                                 JSONObject upd, long nowMs) throws JSONException {
+        final String sent = prefs.getLastPlaceSent();
+        final String want = GeofenceReceiver.lastPlaceNow(prefs, sent);
+        final boolean withPlace = !want.equals(sent);
+        if (withPlace) upd.put("last_place_id", want.isEmpty() ? JSONObject.NULL : want);
+        int status = rest.updateMemberStatus(memberId, upd);
+        if (status / 100 == 2) {
+            prefs.setLastPinWriteMs(nowMs);
+            if (withPlace) {
+                prefs.setLastPlaceSent(want);
+                // Unknown before (a first write since sign-in or upgrade) is
+                // not a correction. Anything else is a change this device's
+                // own announcements did not land, or a place removed under
+                // it, and the journal is the only witness either way.
+                if (sent != null) {
+                    prefs.journal("pin: last_place_id brought up to date ("
+                            + placeLabel(prefs, sent) + " → " + placeLabel(prefs, want) + ")");
+                }
+            }
+        } else if (withPlace && (status == 400 || status == 409 || status == 422)) {
+            prefs.setLastPlaceSent(want);
+            prefs.journal("pin: last_place_id " + placeLabel(prefs, want) + " refused ("
+                    + rest.lastSqlState() + "); pin sent without it");
+            upd.remove("last_place_id");
+            if (rest.updateMember(memberId, upd)) prefs.setLastPinWriteMs(nowMs);
+        }
+    }
+
+    /** A last_place_id value for the journal: the place's name, "none", or
+     *  "a removed place" for one no longer in the list. */
+    private static String placeLabel(PrefsStore prefs, String id) {
+        if (id == null || id.isEmpty()) return "none";
+        PrefsStore.Place p = prefs.findPlace(id);
+        return p == null ? "a removed place" : p.name;
     }
 
     /** Pin cadence for a tracking mode. See PIN_EVERY_*. */

@@ -7,6 +7,33 @@ the app says so, and an owner updates it from **Settings → Family server**.
 An older server keeps working; it just goes without the new features that
 need it.
 
+## 4.11.4 (in testing)
+
+No server update is needed.
+
+- **"At Home" no longer sticks after someone leaves.** If a phone lost its
+  connection for a moment as its owner left (usually the switch from Wi-Fi to
+  mobile data at the front door), the Family tab could go on saying they were
+  at home for the whole trip, while Activity showed them leaving. The phone
+  now puts it right within a minute or two. Until then, the Family tab shows
+  where someone actually is once their position clearly says they have gone.
+  Opening the app while out no longer causes the next arrival home to be
+  missed.
+- **Leaving a place is no longer missed when the phone isn't sure where it
+  is.** A departure reported with only a rough position used to be dropped:
+  no "left" notification, the person still shown at the place, and History
+  showing one long stay. The phone now waits for a few minutes of clear
+  readings and then tells the family, with the time they left.
+- **"Not sharing" reaches the family.** If notifications were turned off
+  while the phone had no signal, the family could go on seeing "Location
+  sharing on". The phone now keeps trying until the family sees the right
+  status.
+- **The privacy policy now lists everything Roamkeep stores.** It adds saved
+  places, your notification choices, your role and status in the family, how
+  passwords are kept, and the record of who is told about each check-in, which
+  is deleted with the check-in after 7 days. This release collects nothing
+  new; the policy now covers all of it.
+
 ## 4.11.3 (in testing)
 
 Update your family's server (Settings → Family server). The fix is on the

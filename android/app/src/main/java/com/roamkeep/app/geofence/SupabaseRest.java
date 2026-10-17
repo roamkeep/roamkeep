@@ -112,12 +112,26 @@ public class SupabaseRest {
      * PATCH /rest/v1/keep_members?id=eq.<memberId> with the given body.
      */
     public boolean updateMember(String memberId, JSONObject body) {
+        int status = updateMemberStatus(memberId, body);
+        return status >= 200 && status < 300;
+    }
+
+    /** updateMember, with the raw HTTP status (-1 on an IO error), for a
+     *  caller that must tell a dead link from a body the server refuses. */
+    public int updateMemberStatus(String memberId, JSONObject body) {
         // Encoded like every other filter value (4.11.1). The id is checked to
         // be a UUID where it enters (NativeGeofencePlugin.initialize); this is
         // the second fence, so a stored value can never add a filter clause.
         String path = "/rest/v1/keep_members?id=eq." + enc(memberId);
-        int status = doJsonWithRefresh("PATCH", path, body.toString(), "return=minimal");
-        return status >= 200 && status < 300;
+        return doJsonWithRefresh("PATCH", path, body.toString(), "return=minimal");
+    }
+
+    /** updateMemberStatus, applied only while the row's status still reads
+     *  `ifStatus`. A row that has moved on matches nothing, which PostgREST
+     *  answers 204: there is then nothing to undo, so that is success too. */
+    public int updateMemberIfStatus(String memberId, String ifStatus, JSONObject body) {
+        String path = "/rest/v1/keep_members?id=eq." + enc(memberId) + "&status=eq." + enc(ifStatus);
+        return doJsonWithRefresh("PATCH", path, body.toString(), "return=minimal");
     }
 
     /** Run the family's 7-day retention (prune_keep_history, v16+). Returns

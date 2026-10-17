@@ -536,7 +536,9 @@ const engine = await import('./src/engine.js');
 // The app's own rule (passwordProblem), its real source run against the
 // real list: every place that sets a password goes through it.
 {
-  const app = fs.readFileSync(path.join(HERE, '..', 'app.js'), 'utf8');
+  // LF whatever the checkout: the end is found by a newline pattern, and a
+  // CRLF working copy (git's autocrlf on Windows) never matched it.
+  const app = fs.readFileSync(path.join(HERE, '..', 'app.js'), 'utf8').replace(/\r\n/g, '\n');
   const start = app.indexOf('  async function passwordProblem(');
   const end = app.indexOf('\n  }\n', start) + 4;
   const list = new Set(fs.readFileSync(path.join(HERE, '..', 'data', 'common-passwords.txt'), 'utf8').split(/\r?\n/).filter(Boolean));
@@ -781,6 +783,58 @@ console.log('\napp: signing out on this device');
         removed.includes('sb-abc-auth-token'), JSON.stringify(removed));
       check(`${label}: says whether the server heard`, confirmed === (label === 'online'), String(confirmed));
     }
+  }
+}
+
+// The Family tab's location line and the launch seed of this device's own
+// inside-places, cut out of app.js (4.11.4). A last_place_id is one write
+// that can be lost, and a member then read "At Home" while driving away;
+// the same stale value, seeded at launch, reached the native geofence
+// state and swallowed the next homecoming.
+console.log('\napp: where a member is');
+{
+  const app = fs.readFileSync(path.join(REPO, 'app.js'), 'utf8');
+  const slack = Number((app.match(/const CHECKED_IN_SLACK_M = (\d+);/) || [])[1]);
+  const nearMax = Number((app.match(/const NEAR_PLACE_MAX_M = (\d+);/) || [])[1]);
+  const heads = ['function distanceM(lat1, lng1, lat2, lng2)', 'function formatCoords(lat, lng)',
+    'function placeContaining(lat, lng)', 'function nearestPlace(lat, lng)', 'function formatDistance(m)',
+    'function checkedInPlace(m)', 'function whereIs(m)', 'async function loadPlaces()'];
+  const srcs = heads.map(cutFromApp);
+  if (srcs.some((s) => !s) || !slack || !nearMax) {
+    check('location-line functions found in app.js', false, 'moved or renamed');
+  } else {
+    const AsyncFunction = Object.getPrototypeOf(async () => {}).constructor;
+    const make = (S) => new AsyncFunction('S', `
+      const CHECKED_IN_SLACK_M = ${slack}, NEAR_PLACE_MAX_M = ${nearMax};
+      const renderPlaces = () => {};
+      const console = { warn() {} };
+      ${srcs.join('\n')}
+      return { whereIs, loadPlaces };`)(S);
+    // Home at the origin, 100 m radius. 0.001° of latitude is ~111 m.
+    const home = { id: 'h', name: 'Home', icon: '🏠', lat: 0, lng: 0, radius_m: 100 };
+    const at = (m) => ({ id: 'me', last_place_id: 'h', ...m });
+    const S = { places: [home], members: [], myId: 'me', insidePlaces: new Set() };
+    const { whereIs } = await make(S);
+
+    check('checked in and there: At Home', whereIs(at({ lat: 0, lng: 0 })) === 'At 🏠 Home');
+    check('a fuzzy pin just outside the edge still reads At Home',
+      whereIs(at({ lat: 0.002, lng: 0 })) === 'At 🏠 Home', whereIs(at({ lat: 0.002, lng: 0 })));
+    const away = whereIs(at({ lat: 0.02, lng: 0 }));
+    check('a stale last_place_id loses to a position clearly away (the 4.11.4 report)',
+      away.endsWith(' from 🏠 Home') && !away.startsWith('At'), away);
+    check('no check-in but inside: At Home', whereIs({ last_place_id: null, lat: 0, lng: 0 }) === 'At 🏠 Home');
+
+    // The launch seed: a stale Home is not handed to the native side.
+    const seed = async (me) => {
+      const s = { places: [], members: [me], myId: 'me', insidePlaces: new Set(), keepId: 'k',
+        sb: { from: () => ({ select: () => ({ eq: () => ({ order: async () => ({ data: [home], error: null }) }) }) }) } };
+      await (await make(s)).loadPlaces();
+      return [...s.insidePlaces];
+    };
+    let r = await seed(at({ lat: 0, lng: 0 }));
+    check('launch seeds the place the member is checked into', r.length === 1 && r[0] === 'h', JSON.stringify(r));
+    r = await seed(at({ lat: 0.05, lng: 0 }));
+    check('launch does not seed one their position contradicts', r.length === 0, JSON.stringify(r));
   }
 }
 

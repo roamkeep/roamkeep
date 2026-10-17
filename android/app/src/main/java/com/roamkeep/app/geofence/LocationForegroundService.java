@@ -353,22 +353,65 @@ public class LocationForegroundService extends Service {
             prefs.journal("sharing: STOPPED, the tracking notification can't be shown ("
                     + why + "); nothing is recorded until it can");
             postStatus(ctx, prefs, STATUS_NOTIFICATIONS_OFF);
+        } else if (prefs.getStatusOwed() != null) {
+            // Already stopped, and the family was never told: this is the
+            // retry. Every transition and start attempt while stopped comes
+            // through here, so it is tried again at each.
+            new Thread(() -> sendOwedStatus(ctx), "RoamkeepStatus").start();
         }
         stop(ctx);
     }
 
-    /** Best effort, off the calling thread (onStartCommand is on main). */
+    /**
+     * Owe the family a status, then send it, off the calling thread
+     * (onStartCommand is on main).
+     *
+     * It used to be one fire-and-forget PATCH with its result ignored, the
+     * same shape as the member update that left a departed member "At Home"
+     * (4.11.4). A "not sharing" notice lost that way left the family reading
+     * "Location sharing on" from a phone that had stopped. So the status is
+     * owed first, in PrefsStore, and stays owed until it lands: retried at
+     * the next stop call while stopped, and at the pin cadence while sharing.
+     */
     private static void postStatus(Context ctx, PrefsStore prefs, String status) {
         if (!prefs.hasContext()) return;
-        new Thread(() -> {
-            try {
-                org.json.JSONObject upd = new org.json.JSONObject();
-                upd.put("status", status);
-                new SupabaseRest(ctx).updateMember(prefs.getMemberId(), upd);
-            } catch (Exception e) {
-                Log.w(TAG, "status update failed", e);
+        prefs.setStatusOwed(status);
+        new Thread(() -> sendOwedStatus(ctx), "RoamkeepStatus").start();
+    }
+
+    /**
+     * Send the status this member still owes, if any. Blocking: call it off
+     * the main thread.
+     *
+     * Taking the notice back (STATUS_DEFAULT) is conditional on the row still
+     * carrying the notice, as the app's own restore is. A retry can land long
+     * after it was owed, and must not overwrite a status set since, an SOS's
+     * among them.
+     */
+    static void sendOwedStatus(Context context) {
+        final Context ctx = context.getApplicationContext();
+        final PrefsStore prefs = new PrefsStore(ctx);
+        final String owed = prefs.getStatusOwed();
+        if (owed == null || !prefs.hasContext()) return;
+        int st;
+        try {
+            org.json.JSONObject upd = new org.json.JSONObject();
+            upd.put("status", owed);
+            SupabaseRest rest = new SupabaseRest(ctx);
+            st = STATUS_DEFAULT.equals(owed)
+                    ? rest.updateMemberIfStatus(prefs.getMemberId(), STATUS_NOTIFICATIONS_OFF, upd)
+                    : rest.updateMemberStatus(prefs.getMemberId(), upd);
+        } catch (Exception e) {
+            Log.w(TAG, "status update failed", e);
+            st = -1;
+        }
+        if (st >= 200 && st < 300) {
+            if (prefs.settleStatusOwed(owed)) {
+                prefs.journal("sharing: the family's status was updated on a retry");
             }
-        }, "RoamkeepStatus").start();
+        } else if (prefs.markStatusOwedFailed()) {
+            prefs.journal("sharing: couldn't update the family's status (HTTP " + st + "); will retry");
+        }
     }
 
     @Override
