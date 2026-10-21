@@ -21,6 +21,13 @@ reach.
 | 18 | 4.11.1 | Leaving, removal and a completed child deletion request delete the sign-in too; reset codes are checked again when used; a pending member is refused by every function, not only by the policies. All server-side, so it protects every app version. Checked by `../tests/v18-verify.sql` |
 | 19 | 4.11.2 | An owner's Decline deletes the account made to ask and changes the join code. Checked by `../tests/v19-verify.sql` |
 | 20 | 4.11.3 | Who is told about a check-in is decided when it is written (`checkin_notices`), so turning a mute off no longer brings back what it held. pg_net moves out of `public` where setup put it there. Checked by `../tests/v20-verify.sql` |
+| 21 | 4.11.5 | Each table's API permissions are stated in the schema, role by role. From 30 October 2026 Supabase no longer grants a new table to the API by itself, so a server set up after that date from an older version refused every request the app made. Changes nothing on a server made before then. Checked by `../tests/v21-verify.sql` |
+
+**On 21,** a server set up after 30 October 2026 by an app or wizard older
+than 4.11.5 needs this update before anyone can use it: the app signs in
+but cannot load the family. The wizard's `--upgrade`, or pasting
+[`../schema.sql`](../schema.sql) into the SQL editor, fixes it. A table added
+in a later version needs its grants in the same version.
 
 What each version adds is listed in [`../../CHANGELOG.md`](../../CHANGELOG.md).
 

@@ -777,13 +777,47 @@ CREATE POLICY "Members can delete own history"
   ON location_history FOR DELETE TO authenticated
   USING (member_id IN (SELECT id FROM keep_members WHERE user_id = auth.uid()));
 
--- v18: the table privileges RLS does not govern. Supabase's default
--- privileges grant every client role ALL on a new table, and RLS filters
--- rows for SELECT, INSERT, UPDATE and DELETE only. TRUNCATE ignores it
--- entirely: a role holding it empties a table whatever the policies say.
--- PostgREST never issues one, so the anon key could not, but nothing a
--- client does needs TRUNCATE, REFERENCES or TRIGGER on any of these.
--- Re-run on every apply, so a table added later is covered too.
+-- v21: what each role may do to each table, stated rather than assumed.
+-- Until 30 October 2026 Supabase granted every new table in public to anon,
+-- authenticated and service_role by itself (default privileges), and this
+-- file only took back what they should not have. From that date it grants
+-- a new table to nobody, on every project. Every table on a new family's
+-- server is new, so without these lines the API refused every request the
+-- app made. RLS was no help: it filters the rows of a grant, and with no
+-- grant there was nothing to filter.
+--
+-- Each line is what the app and the phones' background code actually do,
+-- within what the policies above allow. A server made before that date keeps
+-- the wider grants Supabase gave it, which the policies have always fenced,
+-- and this changes nothing there. A table added later needs its line here.
+GRANT SELECT                         ON keeps             TO authenticated;
+GRANT SELECT, UPDATE                 ON keep_members      TO authenticated;
+GRANT SELECT, INSERT                 ON checkins          TO authenticated;
+GRANT SELECT, INSERT, UPDATE, DELETE ON keep_places       TO authenticated;
+GRANT SELECT, INSERT, DELETE         ON location_history  TO authenticated;
+GRANT SELECT, INSERT, UPDATE         ON keep_member_push  TO authenticated;
+GRANT SELECT, INSERT, DELETE         ON keep_notify_prefs TO authenticated;
+-- Signed out too: after a refused sign-up the app asks whether new accounts
+-- are closed, before anyone has a session.
+GRANT SELECT                         ON roamkeep_meta     TO anon, authenticated;
+-- The Edge Functions hold the service role key. They read the webhook
+-- secret and clear dead push tokens; the key skips RLS, never grants. Every
+-- table, as Supabase's own guidance has it, so anything an owner runs with
+-- that key sees the same server however old it is.
+GRANT SELECT, INSERT, UPDATE, DELETE
+  ON keeps, keep_members, checkins, keep_places, location_history, keep_join_attempts,
+     roamkeep_meta, keep_notify_prefs, keep_member_push, roamkeep_secrets, password_reset_codes,
+     checkin_notices
+  TO service_role;
+
+-- v18: the table privileges RLS does not govern. RLS filters rows for
+-- SELECT, INSERT, UPDATE and DELETE only. TRUNCATE ignores it entirely: a
+-- role holding it empties a table whatever the policies say. Supabase's
+-- default privileges gave the client roles ALL on a new table, and its 30
+-- October change takes back only those four, so a table made afterwards may
+-- still come with TRUNCATE, REFERENCES and TRIGGER. PostgREST never issues one, so
+-- the anon key could not, but nothing a client does needs them on any of
+-- these. Re-run on every apply, so a table added later is covered too.
 REVOKE TRUNCATE, REFERENCES, TRIGGER
   ON keeps, keep_members, checkins, keep_places, location_history, keep_join_attempts,
      roamkeep_meta, keep_notify_prefs, keep_member_push, roamkeep_secrets, password_reset_codes,
@@ -3114,9 +3148,9 @@ END$$;
 -- upgrade path, and it must never walk a database BACKWARDS if someone
 -- runs an older checkout of it against a newer database.
 
-INSERT INTO roamkeep_meta (id, schema_version) VALUES (true, 20)
+INSERT INTO roamkeep_meta (id, schema_version) VALUES (true, 21)
   ON CONFLICT (id) DO UPDATE
-    SET schema_version = GREATEST(roamkeep_meta.schema_version, 20),
+    SET schema_version = GREATEST(roamkeep_meta.schema_version, 21),
         updated_at = now();
 
 

@@ -838,6 +838,125 @@ console.log('\napp: where a member is');
   }
 }
 
+// The Places tab's "who notifies me here" line, cut out of app.js (4.11.5).
+// It was drawn by loadPlaces, before the mutes had loaded, and never again
+// for a member change. Owner report 2026-10-19: a muted member was removed
+// and rejoined under the same name, and the row went on saying "🔕 Not
+// person1" while the sheet showed the new person1 ON.
+console.log('\napp: the place rows follow the mutes and the family');
+{
+  const app = fs.readFileSync(path.join(REPO, 'app.js'), 'utf8');
+  const lines = [app.match(/const prefKey = [^;]*;/), app.match(/const isMuted = [^;]*;/)].map((m) => m && m[0]);
+  const srcs = ['function myMember()', 'async function loadNotifyPrefs()', 'function placesMemberSig()',
+    'function renderPlacesIfMembersChanged()', 'function renderPlaces()',
+    'function placeNotifySummary(p, others, mutedHere)'].map(cutFromApp);
+  if (srcs.some((s) => !s) || lines.some((s) => !s)) {
+    check('place-row functions found in app.js', false, 'moved or renamed');
+  } else {
+    const t = (S) => new Function('S', `
+      const notes = [];
+      let renders = 0, sheets = 0;
+      const $ = () => ({ appendChild() {} });
+      const clear = () => { renders++; };
+      const el = (tag, attrs) => { if (attrs && attrs.class === 'pl-note') notes.push(attrs.text); return {}; };
+      const iconSvg = () => '';
+      const renderPlaceNotifySheet = () => { sheets++; };
+      const console = { warn() {} };
+      ${lines.join('\n')}
+      ${srcs.join('\n')}
+      return { loadNotifyPrefs, renderPlaces, memberRender: renderPlacesIfMembersChanged,
+        renders: () => renders, sheets: () => sheets, note: () => notes[notes.length - 1] };`)(S);
+    const prefsRead = (answer) => ({ from: () => ({ select: () => ({ eq: async () => answer }) }) });
+    const member = (id, name, extra) => ({ id, name, notify_on_checkin: true, ...extra });
+    const S = {
+      myId: 'me', places: [{ id: 'h', name: 'Home', icon: '🏠', radius_m: 100 }], insidePlaces: new Set(),
+      members: [member('me', 'Owner'), member('p1', 'person1'), member('max', 'Max')],
+      notifyPrefs: new Set(), sb: prefsRead({ data: [{ subject_member_id: 'p1', place_id: 'h' }], error: null }),
+    };
+    const rows = t(S);
+
+    // Launch order: members, then places, then the mutes.
+    rows.memberRender();
+    check('nothing is drawn from a place list not read yet', rows.renders() === 0, String(rows.renders()));
+    S._placesLoaded = true;
+    rows.renderPlaces();
+    await rows.loadNotifyPrefs();
+    check('the mutes loading redraw the row', rows.note() === '🔕 Not person1', rows.note());
+    let n = rows.renders();
+    S.sb = prefsRead({ data: null, error: { message: 'offline' } });
+    await rows.loadNotifyPrefs();
+    check('a failed read keeps the mutes and redraws nothing',
+      rows.renders() === n && S.notifyPrefs.has('p1|h'), String(rows.renders() - n));
+
+    S.members = S.members.map((m) => (m.id === 'max' ? { ...m, lat: 1, lng: 2, battery: 50 } : m));
+    rows.memberRender();
+    check('a pin update does not rebuild the rows', rows.renders() === n, String(rows.renders() - n));
+
+    // Removed: the server drops their mutes by cascade, and this phone may
+    // still hold the key (the realtime DELETE carries only the row id).
+    S.members = S.members.filter((m) => m.id !== 'p1');
+    rows.memberRender();
+    check('a removed member leaves the row', rows.note() === '🔔 Everyone', rows.note());
+    S.members.push(member('p1-new', 'person1'));
+    rows.memberRender();
+    check('the same name rejoining is a new member, not muted', rows.note() === '🔔 Everyone', rows.note());
+
+    S.notifyPrefs.add('p1-new|h');
+    rows.renderPlaces();
+    S.members = S.members.map((m) => (m.id === 'p1-new' ? { ...m, name: 'Pat' } : m));
+    rows.memberRender();
+    check('a rename redraws the row', rows.note() === '🔕 Not Pat', rows.note());
+    S.members = S.members.map((m) => (m.id === 'me' ? { ...m, notify_on_checkin: false } : m));
+    rows.memberRender();
+    check('my own notifications off redraws the row', rows.note() === '🔕 All notifications are off', rows.note());
+
+    S.placeNotifyFor = 'h';
+    const sheets = rows.sheets();
+    S.members.push(member('nan', 'Nan'));
+    rows.memberRender();
+    check('an open place sheet is redrawn with the family', rows.sheets() === sheets + 1, String(rows.sheets() - sheets));
+  }
+}
+
+// The location service's own starts and stops (4.11.5). A stop that lands
+// while another startForegroundService() is still pending kills the app
+// (ForegroundServiceDidNotStartInTimeException), and the race lives in
+// Android's ActivityManager, where no JVM test can reach it. Device log
+// 2026-10-21: the first tap of Allow on Location fired two starts 25 ms
+// apart, the first stopped the service (notifications not allowed yet), and
+// the second crashed the app. So this reads the real source for the shape
+// that caused it.
+console.log('\nnative: the location service never stops under a pending start');
+{
+  const java = fs.readFileSync(path.join(REPO,
+    'android/app/src/main/java/com/roamkeep/app/geofence/LocationForegroundService.java'), 'utf8');
+  const body = (head) => {
+    const at = java.indexOf(head);
+    if (at < 0) return null;
+    let depth = 0, i = java.indexOf('{', at);
+    for (; i < java.length; i++) {
+      if (java[i] === '{') depth++;
+      else if (java[i] === '}' && --depth === 0) break;
+    }
+    // Code only: a comment may name what the code must not do.
+    return java.slice(at, i + 1).replace(/\/\*[\s\S]*?\*\//g, '').replace(/\/\/.*$/gm, '');
+  };
+  const start = body('public static void start(Context ctx, String why)');
+  const onStart = body('public int onStartCommand(Intent intent, int flags, int startId)');
+  if (!start || !onStart) {
+    check('LocationForegroundService.start and onStartCommand found', false, 'moved or renamed');
+  } else {
+    const gate = start.indexOf('canDisclose(');
+    check('start() asks canDisclose before startForegroundService',
+      gate >= 0 && gate < start.indexOf('startForegroundService('));
+    const stops = onStart.match(/\bstopSelf\([^)]*\)/g) || [];
+    check('onStartCommand stops only with stopSelf(startId)',
+      stops.length > 0 && stops.every((s) => s === 'stopSelf(startId)'), JSON.stringify(stops));
+    const hard = onStart.match(/\b(stopService|stopForDisclosure|stop)\(/g) || [];
+    check('onStartCommand never calls stopService, directly or through stop()', hard.length === 0, JSON.stringify(hard));
+  }
+}
+
 console.log('\nwizard: every source file parses');
 
 // security.txt (RFC 9116), published on both sites from one file. Its Expires

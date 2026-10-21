@@ -20,11 +20,19 @@ import { read, prep, project, addUser } from './supabase.mjs'
 
 const SCHEMA = read('db/schema.sql').replace(/\r\n/g, '\n')
 const VERIFY = [['db/tests/v17-verify.sql', ''], ['db/tests/v18-verify.sql', 'v18:'], ['db/tests/v19-verify.sql', 'v19:'],
-                ['db/tests/v20-verify.sql', 'v20:']]
+                ['db/tests/v20-verify.sql', 'v20:'], ['db/tests/v21-verify.sql', 'v21:']]
 
-// [name, [[from, to, 'last'?], ...], steps that must fail]. 'last' replaces
-// the final occurrence — set_signups shares a clause with set_project_url,
-// which comes first. Applied by slicing, so "$$" in a replacement is literal.
+// [name, [[from, to, 'last'?], ...], steps that must fail, BEFORE?]. 'last'
+// replaces the final occurrence: set_signups shares a clause with
+// set_project_url, which comes first. Applied by slicing, so "$$" in a
+// replacement is literal.
+//
+// Each runs on a project made after 30 October 2026, which grants a new
+// table to nobody, unless it ends BEFORE: then on one made before, which
+// Supabase gave wide grants. A REVOKE that takes back one of those grants
+// guards only such a server (every family's until then), and only there
+// can its mutation be caught.
+const BEFORE = { before: true }
 const MUTATIONS = [
   ['pending members see the keep', [['WHERE user_id = auth.uid() AND approved $$', 'WHERE user_id = auth.uid() $$']], ['1c', '1d']],
   ['guard ignores approved', [['      OR NEW.approved     IS DISTINCT FROM OLD.approved\n', '']], ['1g']],
@@ -80,7 +88,7 @@ const MUTATIONS = [
   // v17 self-review fixes (2026-10-06): each rule, weakened, must be caught.
   ['pending members may edit their own row', [['  USING      (user_id = auth.uid() AND keep_id IN (SELECT private_user_keep_ids()))\n  WITH CHECK (user_id = auth.uid() AND keep_id IN (SELECT private_user_keep_ids()));',
                                                '  USING (user_id = auth.uid()) WITH CHECK (user_id = auth.uid());']], ['1m']],
-  ['reset hashes readable by their member', [['REVOKE ALL ON password_reset_codes FROM anon, authenticated;\n', '']], ['2j']],
+  ['reset hashes readable by their member', [['REVOKE ALL ON password_reset_codes FROM anon, authenticated;\n', '']], ['2j'], BEFORE],
   // 'account deletable right after a reset' (2k) was retired with its rule in
   // v18 (owner decision 2026-10-09): removing a member now deletes them, so
   // the day-long block protected nothing. 2k now checks the opposite.
@@ -178,10 +186,28 @@ const MUTATIONS = [
                               "  WHERE c.member_id <> me.id\n    AND (\n      false\n      OR EXISTS"]], ['v20:1h']],
   // Two defences: no write grant, and no write policy. Both go.
   ['clients may write notices', [['REVOKE INSERT, UPDATE, DELETE ON checkin_notices FROM authenticated;',
-                                  'CREATE POLICY "v20 mutation" ON checkin_notices FOR INSERT TO authenticated WITH CHECK (true);']], ['v20:1i']],
+                                  'CREATE POLICY "v20 mutation" ON checkin_notices FOR INSERT TO authenticated WITH CHECK (true);']], ['v20:1i'], BEFORE],
   ['notices readable by the whole keep', [['  USING (member_id IN (SELECT id FROM keep_members WHERE user_id = auth.uid() AND approved));',
                                            '  USING (true);']], ['v20:1i']],
   ['anon may read notices', [['REVOKE ALL ON checkin_notices FROM anon;', 'GRANT SELECT ON checkin_notices TO anon;']], ['v20:1i']],
+  // v21: each table's grants are stated, because from 30 October 2026 a new
+  // project grants a table to nobody (the stand-in's project() is one). One
+  // line taken away at a time, as a new table missing its line would be.
+  ['the keep cannot be read', [['GRANT SELECT                         ON keeps             TO authenticated;\n', '']], ['v21:1a', 'v21:1b']],
+  ['members cannot update their own row', [['GRANT SELECT, UPDATE                 ON keep_members      TO authenticated;',
+                                            'GRANT SELECT                         ON keep_members      TO authenticated;']], ['v21:1a', 'v21:1b']],
+  ['check-ins cannot be filed', [['GRANT SELECT, INSERT                 ON checkins          TO authenticated;',
+                                  'GRANT SELECT                         ON checkins          TO authenticated;']], ['v21:1a', 'v21:1b']],
+  ['places cannot be edited', [['GRANT SELECT, INSERT, UPDATE, DELETE ON keep_places       TO authenticated;',
+                                'GRANT SELECT, INSERT                 ON keep_places       TO authenticated;']], ['v21:1a', 'v21:1b']],
+  ['breadcrumbs cannot be recorded', [['GRANT SELECT, INSERT, DELETE         ON location_history  TO authenticated;',
+                                       'GRANT SELECT, DELETE                 ON location_history  TO authenticated;']], ['v21:1a', 'v21:1b']],
+  ['push tokens cannot be saved', [['GRANT SELECT, INSERT, UPDATE         ON keep_member_push  TO authenticated;\n', '']], ['v21:1a', 'v21:1b']],
+  ['notification choices cannot be saved', [['GRANT SELECT, INSERT, DELETE         ON keep_notify_prefs TO authenticated;',
+                                             'GRANT SELECT                         ON keep_notify_prefs TO authenticated;']], ['v21:1a', 'v21:1b']],
+  ['signed out, the sign-up state cannot be read', [['GRANT SELECT                         ON roamkeep_meta     TO anon, authenticated;',
+                                                     'GRANT SELECT                         ON roamkeep_meta     TO authenticated;']], ['v21:1a', 'v21:1c']],
+  ['the Edge Functions cannot read the webhook secret', [['     checkin_notices\n  TO service_role;', '     checkin_notices\n  TO postgres;']], ['v21:1a', 'v21:1d']],
 ]
 
 function mutate(src, pairs) {
@@ -194,10 +220,10 @@ function mutate(src, pairs) {
 }
 
 let missed = 0
-for (const [name, pairs, expect] of MUTATIONS) {
+for (const [name, pairs, expect, made = {}] of MUTATIONS) {
   const schema = mutate(SCHEMA, pairs)
   if (!schema) { missed++; console.log(`STALE   ${name}: pattern not found in db/schema.sql`); continue }
-  const db = await project()
+  const db = await project(made)
   try {
     await db.exec(prep(schema))
     const failed = []
@@ -212,7 +238,8 @@ for (const [name, pairs, expect] of MUTATIONS) {
     }
     const caught = expect.every((e) => failed.includes(e))
     if (!caught) missed++
-    console.log(`${caught ? 'caught' : 'MISSED'}  ${name} → failed ${failed.join(', ') || 'nothing'} (needs ${expect.join(', ')})`)
+    console.log(`${caught ? 'caught' : 'MISSED'}  ${name}${made.before ? ' [server made before 30 Oct]' : ''}` +
+      ` → failed ${failed.join(', ') || 'nothing'} (needs ${expect.join(', ')})`)
   } catch (e) {
     // An abort hides every other result on staging, so it is not a clean catch.
     missed++

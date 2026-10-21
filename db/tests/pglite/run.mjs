@@ -7,7 +7,8 @@
 //      script — once alone, once with an older keep in the project, which
 //      is the case staging has and the oldest-keep rules turn on;
 //   B  upgrade from the last release tag's schema with a family already in
-//      it: nothing an existing family relies on may change (expand-only);
+//      it, on a project made before 30 October 2026 that the date then
+//      reaches: nothing an existing family relies on may change (expand-only);
 //   C  a join request wakes the owners through notify-places, with the
 //      webhook secret, and an ordinary join wakes nobody;
 //   D  the "Checking it actually took" query in docs/OWNER_SETUP.md finds
@@ -18,7 +19,10 @@
 //   F  the SQL the engine writes itself (sign-up window, hand-over, upgrade
 //      check, setUserPassword with hostile input) against the real schema;
 //   G  re-pasting the schema repairs a deleted check-in trigger and a
-//      loosened grant, and the same test fails without the repair block.
+//      loosened grant, and the same test fails without the repair block;
+//   H  a server set up after 30 October 2026 from the last release's schema
+//      (an older app's setup) refuses its own members, and updating it with
+//      this one lets them in. It is also what proves A can fail.
 //
 // Options: --from <git ref>  the schema to upgrade from (default: the latest
 //                            v* tag that is not an -rc).
@@ -26,7 +30,7 @@
 // Proving the verify scripts can fail is a separate job: npm run test:db:mutate.
 
 import fs from 'node:fs'
-import { ROOT, read, prep, stampOf, project, addUser, actAs, signOut, previousSchema, verify } from './supabase.mjs'
+import { ROOT, read, prep, stampOf, project, oct30, addUser, actAs, signOut, previousSchema, verify } from './supabase.mjs'
 
 const SCHEMA = read('db/schema.sql')
 const VERSION = stampOf(SCHEMA)
@@ -74,12 +78,17 @@ async function family(db, prefix) {
   await signOut(db)
   return { o, k, keep }
 }
-/** What a member can see as a client, through RLS. */
+/** What a member can see as a client, through RLS (or the error, as text). */
 async function sees(db, uid) {
   await actAs(db, uid)
   await db.exec('SET ROLE authenticated')
   const n = async (t) => (await db.query(`SELECT count(*)::int n FROM ${t}`)).rows[0].n
-  const out = { members: await n('keep_members'), places: await n('keep_places') }
+  let out
+  try {
+    out = { members: await n('keep_members'), places: await n('keep_places') }
+  } catch (e) {
+    out = e.message.split('\n')[0]
+  }
   await db.exec('RESET ROLE')
   await signOut(db)
   return out
@@ -103,10 +112,11 @@ if (!from.sql) {
   console.log(`\n-- B skipped: no previous schema at ${from.ref} (no release tags in this clone?)`)
 } else {
   await section('B upgrade', async () => {
-    const db = await project()
+    const db = await project({ before: true })
     await db.exec(prep(from.sql))
     const f = await family(db, 'live')
     const before = await sees(db, f.k)
+    await oct30(db)
     await db.exec(prep(SCHEMA))
     const after = await sees(db, f.k)
     const ver = (await db.query('SELECT schema_version FROM roamkeep_meta')).rows[0].schema_version
@@ -267,6 +277,31 @@ await section('G repair', async () => {
     `without the repair block it would not: ${withoutRepair === false})`)
   if (!ok) fail('G: re-pasting schema.sql does not repair the check-in trigger, or the test cannot tell')
 })
+
+// v21: from 30 October 2026 Supabase grants a new table to nobody. A family
+// that set up a server in the gap, from an app carrying the last release's
+// schema, has one its members cannot read; updating it is the repair. Run
+// against that schema, this must find the refusal, or the test of the fix
+// (sections A and B, and v21-verify) could pass on a stand-in that still
+// grants tables by default.
+if (!from.sql) {
+  console.log(`\n-- H skipped: no previous schema at ${from.ref}`)
+} else {
+  await section('H set up in the gap', async () => {
+    const db = await project()
+    await db.exec(prep(from.sql))
+    const f = await family(db, 'gap')
+    const broken = await sees(db, f.k)
+    await db.exec(prep(SCHEMA))
+    const repaired = await sees(db, f.k)
+    const ok = typeof broken === 'string' && /permission denied/.test(broken) &&
+      JSON.stringify(repaired) === JSON.stringify({ members: 2, places: 1 })
+    console.log(`\n== set up in the gap: ${ok ? 'ok' : 'WRONG'} (${from.ref}'s schema: ${JSON.stringify(broken)}; ` +
+      `updated: ${JSON.stringify(repaired)})`)
+    if (!ok) fail('H: the gap is not reproduced, or updating does not repair it')
+    await db.close()
+  })
+}
 
 console.log(`\n${failures === 0 ? 'ALL OK' : failures + ' FAILURE(S)'}`)
 process.exitCode = failures ? 1 : 0

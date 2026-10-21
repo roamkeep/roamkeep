@@ -285,6 +285,13 @@ lists the versions and what each one changes.
 The anon key is public by design; every table is protected by row-level
 security, and the client is not trusted.
 
+- What each role may do to each table is granted in the schema, line by
+  line, and matches what the app does: a phone can add a check-in but has no
+  right to change one. Row-level security then picks the rows. Supabase used
+  to grant every new table to the API by itself; from 30 October 2026 it
+  grants nothing, so a table the schema does not grant cannot be reached at
+  all, whatever its policies say.
+
 - Membership is answered by one function that returns **approved**
   memberships only, so a person waiting for approval can read or write
   nothing, their own row included.

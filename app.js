@@ -142,7 +142,7 @@
   // which provision.js carries (cli/test.mjs checks the two agree). Not a
   // requirement — NEEDS_SCHEMA is that — but what Settings measures a
   // family's server against when it offers an owner the update.
-  const SHIPPED_SCHEMA = 20;
+  const SHIPPED_SCHEMA = 21;
 
   // 4.7.0 shipped this equal to SCHEMA_PRE_META, so the gate was INERT on
   // arrival — a gate that demanded its own migration would have locked
@@ -1820,6 +1820,12 @@
     // Here the equivalent would be silently un-muting everything.
     if (error) { console.warn('loadNotifyPrefs', error); return false; }
     S.notifyPrefs = new Set((data || []).map(r => prefKey(r.subject_member_id, r.place_id)));
+    // 4.11.5: the place rows are drawn by loadPlaces, which runs first, so
+    // they said "🔔 Everyone" over a mute the sheet showed, until something
+    // else redrew them. Redraw from the Set, as the realtime handler does,
+    // once there is a list to draw (renderPlacesIfMembersChanged).
+    if (S._placesLoaded) renderPlaces();
+    if (S.placeNotifyFor) renderPlaceNotifySheet();
     return true;
   }
 
@@ -3311,9 +3317,33 @@
   }
 
   // ── PLACES UI ──────────────────────────────────────────────────
+  // What the place rows read from the member list: everyone else, by name,
+  // and my own notify switch (placeNotifySummary).
+  function placesMemberSig() {
+    const me = myMember();
+    return (me && me.notify_on_checkin === false ? 'off' : 'on') + '|' +
+      S.members.filter(m => m.id !== S.myId).map(m => m.id + ':' + m.name).join('|');
+  }
+
+  // Called by renderMembers. A member removed, approved or renamed left the
+  // place rows as they were, so a row went on saying "🔕 Not person1" about
+  // someone deleted, while the sheet showed the person who rejoined under
+  // that name as ON (4.11.5). Only when the signature moves, though:
+  // renderMembers runs on every pin update, and a list rebuilt every few
+  // seconds can swallow a tap.
+  function renderPlacesIfMembersChanged() {
+    // At launch the members land first. Drawn then, an unread list would say
+    // "No saved places yet", and go on saying it if the read failed.
+    if (!S._placesLoaded) return;
+    if (placesMemberSig() === S._placesMemberSig) return;
+    renderPlaces();
+    if (S.placeNotifyFor) renderPlaceNotifySheet();
+  }
+
   function renderPlaces() {
     const host = $('places-list');
     if (!host) return;
+    S._placesMemberSig = placesMemberSig();
     clear(host);
     if (!S.places.length) {
       host.appendChild(el('div', { class: 'empty' }, [
@@ -4086,6 +4116,7 @@
     // First, and on every render: whether the waiting list shows depends on
     // being an owner, which can change under any member update.
     renderPending();
+    renderPlacesIfMembersChanged();
     const host = $('members-list');
     if (!host) return;
     clear(host);
@@ -4404,6 +4435,8 @@
       // an UPDATE, but we don't want a visual flicker waiting for it.
       const me = S.members.find(x => x.id === S.myId);
       if (me) me.notify_on_checkin = next;
+      // The place rows say "All notifications are off" from this switch.
+      renderPlacesIfMembersChanged();
       toast(next ? '🔔 Notifications on' : '🔕 Notifications muted', 'ok');
     } catch (e) {
       toast('Could not update notifications: ' + e.message, 'err');

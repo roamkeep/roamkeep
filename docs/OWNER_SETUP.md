@@ -397,16 +397,34 @@ select (select schema_version from roamkeep_meta)                    as version,
          and (select bool_and(definition like '%checkin_notices%') from pg_views
                where viewname = 'my_checkin_feed')
          and (select bool_and(prosrc like '%checkin_notices%') from pg_proc
-               where proname = 'checkin_recipients')                 as v20_notices;
+               where proname = 'checkin_recipients')                 as v20_notices,
+       (select bool_and(has_table_privilege(r, 'public.' || t, p))
+          from (values ('authenticated', 'keeps', 'select'),
+                       ('authenticated', 'keep_members', 'update'),
+                       ('authenticated', 'checkins', 'insert'),
+                       ('authenticated', 'keep_places', 'delete'),
+                       ('authenticated', 'location_history', 'insert'),
+                       ('authenticated', 'keep_member_push', 'update'),
+                       ('authenticated', 'keep_notify_prefs', 'insert'),
+                       ('anon', 'roamkeep_meta', 'select'),
+                       ('service_role', 'roamkeep_secrets', 'select')) g(r, t, p)) as data_api;
 ```
 
-A finished v20 reads `version 20`, `url` set to **this** project,
+A finished v21 reads `version 21`, `url` set to **this** project,
 `checkin_cols 4`, `prefs_table 1`, `recipients_fn 1`, `feed_view 1`,
 `v16_fns 2`, `v17_cols 5`, `reset_table 1`, `v17_fns 12`, `triggers 8`,
 `sends_secret true`, `v18_fn 1`, `pg_temp_last true`, `v19_decline true`,
-`v20_notices true`.
+`v20_notices true`, `data_api true`.
 
-(A finished v19 reads `v20_notices false` and the rest the same. A finished
+`data_api` asks whether the app can reach the tables at all. A server made
+before 30 October 2026 reads `true` on any version, because Supabase granted
+its tables to the app by itself until then. One set up after that date from
+an app or wizard older than 4.11.5 reads `false`, and the app cannot load
+the family: update it with the wizard's `--upgrade`, or paste
+`db/schema.sql` into the SQL editor.
+
+(A finished v20 reads `version 20` and the rest the same. A finished v19
+also reads `v20_notices false`. A finished
 v18 also reads `v19_decline false`. A finished
 v17 also reads `v18_fn 0`, `pg_temp_last false` and the rest the
 same. A finished v16 also reads `v17_cols 0`, `reset_table 0`, `v17_fns 0`,

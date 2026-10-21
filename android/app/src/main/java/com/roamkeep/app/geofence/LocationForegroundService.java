@@ -288,6 +288,17 @@ public class LocationForegroundService extends Service {
     public static void start(Context ctx) { start(ctx, "unknown"); }
 
     public static void start(Context ctx, String why) {
+        // 4.11.5: not at all while the notification can't be shown. Started,
+        // the service could only stop itself again, and a stop that lands
+        // while another startForegroundService() is still pending kills the
+        // app (ForegroundServiceDidNotStartInTimeException). On a new install
+        // that was the first tap of Allow on Location: notifications come
+        // later in the setup sheet, and the grant fires two starts (the
+        // resume self-heal and restartGPS), 25 ms apart on the device log.
+        if (!canDisclose(ctx)) {
+            noteSharingStopped(ctx, "service start: " + why);
+            return;
+        }
         Intent i = new Intent(ctx.getApplicationContext(), LocationForegroundService.class);
         i.putExtra(EXTRA_WHY, why);
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
@@ -347,6 +358,15 @@ public class LocationForegroundService extends Service {
      * status the family sees are written once per stop, not per call.
      */
     static void stopForDisclosure(Context context, String why) {
+        noteSharingStopped(context, why);
+        stop(context.getApplicationContext());
+    }
+
+    /**
+     * stopForDisclosure without stopping the service: for start() and
+     * onStartCommand, which must not call stopService (see start()).
+     */
+    static void noteSharingStopped(Context context, String why) {
         final Context ctx = context.getApplicationContext();
         final PrefsStore prefs = new PrefsStore(ctx);
         if (prefs.markSharingStopped()) {
@@ -359,7 +379,6 @@ public class LocationForegroundService extends Service {
             // through here, so it is tried again at each.
             new Thread(() -> sendOwedStatus(ctx), "RoamkeepStatus").start();
         }
-        stop(ctx);
     }
 
     /**
@@ -548,11 +567,17 @@ public class LocationForegroundService extends Service {
         // drop the notification on the way out.
         // The same for a device the server has stopped accepting writes from
         // (see LocationUpdateReceiver.stopForServerRejection).
+        //
+        // Every way out below is stopSelf(startId), never stopSelf() or
+        // stopService (4.11.5). Those stop the service whatever is queued, and
+        // a stop while a later startForegroundService() is still pending is a
+        // crash (see start()). stopSelf(startId) does nothing if a newer start
+        // is on its way, and that start calls startForeground and decides again.
         final PrefsStore gate = new PrefsStore(this);
         if (gate.isPaused() || gate.isServerRejected()) {
             gate.journal("fgs: start skipped (" + (gate.isPaused() ? "paused" : "server rejected this member") + ")");
             ServiceCompat.stopForeground(this, ServiceCompat.STOP_FOREGROUND_REMOVE);
-            stopSelf();
+            stopSelf(startId);
             return START_NOT_STICKY;
         }
 
@@ -562,13 +587,13 @@ public class LocationForegroundService extends Service {
         // geofence kick starts it again, promoted.
         if (!promoted) {
             gate.journal("fgs: stopped, not foreground so no notification (" + why + "); nothing recorded");
-            stopSelf();
+            stopSelf(startId);
             return START_NOT_STICKY;
         }
         if (!canDisclose(this)) {
-            stopForDisclosure(this, "service start: " + why);
+            noteSharingStopped(this, "service start: " + why);
             ServiceCompat.stopForeground(this, ServiceCompat.STOP_FOREGROUND_REMOVE);
-            stopSelf();
+            stopSelf(startId);
             return START_NOT_STICKY;
         }
         // Back after a stop: say so, once, and put the family's view back.

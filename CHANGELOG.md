@@ -7,6 +7,34 @@ the app says so, and an owner updates it from **Settings → Family server**.
 An older server keeps working; it just goes without the new features that
 need it.
 
+## 4.11.5 (in testing)
+
+Update your family's server (Settings → Family server). A server made before
+30 October 2026 keeps working without it; one set up after that date needs
+it.
+
+- **New family servers work after 30 October 2026.** From that date
+  Supabase no longer lets the app reach a new table unless the database
+  says so, and a new family's server is all new tables. Setting one up with
+  an older version of the app gave a server that refused everything the app
+  asked of it. The server now grants each table exactly what the app uses,
+  nothing more. On a server you already have this changes nothing you will
+  notice. If you set up a server after 30 October with an older version and
+  the app cannot load your family, update the server with the desktop
+  wizard's `--upgrade`, or paste `db/schema.sql` into Supabase's SQL editor.
+- **Setting up a new phone no longer closes the app.** On Android 13 and
+  later, tapping Allow on Location in the setup steps, before notifications
+  had been allowed, could close the app. Sharing still starts only once
+  notifications are allowed, as before.
+- **The Places tab now shows who you have muted, as soon as it opens.** Each
+  saved place has a line saying who it tells you about ("🔔 Everyone", "🔕
+  Not Max"). That line was drawn before your choices had loaded, so it could
+  say "Everyone" while someone was muted there. It also stayed as it was when
+  someone joined, was removed or was renamed, or when you turned all
+  notifications off, so it could name a person who was no longer in the
+  family. It now keeps up with all of these. The switches themselves were
+  always right.
+
 ## 4.11.4 (in testing)
 
 No server update is needed.

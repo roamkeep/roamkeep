@@ -3,10 +3,16 @@
 // (Postgres compiled to WebAssembly, in-process, no server):
 //
 //   * the anon / authenticated / service_role roles, and Supabase's DEFAULT
-//     PRIVILEGES, which grant every new public table and function to anon
-//     and authenticated BY NAME. That is the trap REVOKE ... FROM PUBLIC
-//     does not close, so the stand-in has to reproduce it or a missing
+//     PRIVILEGES, which grant every new public function to anon and
+//     authenticated BY NAME. That is the trap REVOKE ... FROM PUBLIC does
+//     not close, so the stand-in has to reproduce it or a missing
 //     REVOKE ... FROM anon would pass here and leak there;
+//   * the same for tables, as it was until 30 October 2026, and then the
+//     statements Supabase ran on every project that day (OCT_30), which stop
+//     a new table being granted to anyone. A project() is made after it, as
+//     every new family's is: a table the schema does not grant is refused to
+//     the app, whatever its policies say. project({ before: true }) is one
+//     made before, which keeps its grants until oct30() is run on it;
 //   * auth.users plus auth.uid() / auth.jwt(), which read request.jwt.claims
 //     exactly as the real ones do;
 //   * pgcrypto in the `extensions` schema, on the search path;
@@ -62,6 +68,17 @@ CREATE FUNCTION net.http_post(url text, body jsonb DEFAULT '{}', params jsonb DE
 CREATE PUBLICATION supabase_realtime;
 `
 
+// Supabase's own statements (github.com/orgs/supabase/discussions/45329),
+// which leave TRUNCATE, REFERENCES and TRIGGER granted: the v18 REVOKE of
+// those still matters on a new project.
+const OCT_30 = `
+ALTER DEFAULT PRIVILEGES IN SCHEMA public REVOKE SELECT, INSERT, UPDATE, DELETE ON TABLES FROM anon, authenticated, service_role;
+ALTER DEFAULT PRIVILEGES IN SCHEMA public REVOKE USAGE, SELECT ON SEQUENCES FROM anon, authenticated, service_role;
+`
+
+/** 30 October 2026 arriving on a project made before it. */
+export const oct30 = (db) => db.exec(OCT_30)
+
 /** pg_net is not a PGlite extension; the stand-in above replaces it. */
 // Both forms: v20 names the extensions schema, the older tags don't.
 export const prep = (sql) => sql.replace(/^CREATE EXTENSION IF NOT EXISTS pg_net( WITH SCHEMA extensions)?;/m, '-- (pg_net: stand-in)')
@@ -69,10 +86,12 @@ export const prep = (sql) => sql.replace(/^CREATE EXTENSION IF NOT EXISTS pg_net
 /** The version a schema file stamps as its last statement. */
 export const stampOf = (sql) => Number((sql.match(/GREATEST\(roamkeep_meta\.schema_version,\s*(\d+)\)/) || [])[1])
 
-/** A fresh "project": an empty database with the Supabase stand-in. */
-export async function project() {
+/** A fresh "project": an empty database with the Supabase stand-in, made
+ *  after 30 October 2026 unless `before`. */
+export async function project({ before = false } = {}) {
   const db = await PGlite.create({ extensions: { pgcrypto } })
   await db.exec(SHIM)
+  if (!before) await oct30(db)
   // Supabase's own search_path for the postgres role.
   await db.exec(`SET search_path TO "$user", public, extensions`)
   return db
