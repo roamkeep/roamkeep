@@ -68,15 +68,25 @@ public class RoamkeepMessagingService extends MessagingService {
     // happened. They stay in Activity. SOS has no limit: a late one is still
     // raised.
     static final long ALERT_MAX_AGE_MS = 60 * 60 * 1000L;
-    // First wake-up after an install has no watermark; only look back
-    // this far so we don't replay old history as fresh notifications.
-    private static final long COLD_START_LOOKBACK_MS = 10 * 60 * 1000L;
+    // First wake-up after an install has no watermark; only raise what is
+    // this recent, so we don't replay old history as fresh notifications.
+    static final long COLD_START_LOOKBACK_MS = 10 * 60 * 1000L;
     // How far BEHIND the watermark each fetch re-reads. A check-in can land
     // after a newer one — a crossing queued through a Wi-Fi→cellular
     // handoff, or Play Services delivering one phone's ENTER a minute late —
     // and a strict "newer than the newest I've seen" query skipped it for
     // good. The seen-ID set stops the overlap raising anything twice.
-    private static final long OVERLAP_MS = 30 * 60 * 1000L;
+    static final long OVERLAP_MS = 30 * 60 * 1000L;
+    // A cold wake reads this far back, the whole of the next wake's overlap,
+    // and records all of it as seen (isHistory). It read only
+    // COLD_START_LOOKBACK_MS until 4.12.0, so the next wake's overlap found
+    // twenty minutes nobody had looked at and raised them as new.
+    static final long COLD_FETCH_MS = OVERLAP_MS;
+    // The push floor is set this far before the moment the app first opens:
+    // it is compared with the server's clock, and a phone running fast must
+    // not lose the first alerts after sign-in. Raising one early check-in is
+    // the lesser mistake.
+    static final long FLOOR_SLACK_MS = 60 * 1000L;
     // Pre-v16 databases only (paging by the device-supplied created_at):
     // ignore rows dated further ahead than this. One row dated tomorrow used
     // to pin the watermark to tomorrow and silence every alert until then.
@@ -353,9 +363,10 @@ public class RoamkeepMessagingService extends MessagingService {
         if (!serverClock && markMs > nowMs + FUTURE_SLACK_MS) { mark = null; markMs = -1; }
 
         final Set<String> seen = prefs.getPushSeenIds();
+        final boolean cold = mark == null || markMs < 0;
         final String from;
-        if (mark == null || markMs < 0) {
-            from = SupabaseRest.toIso8601Utc(nowMs - COLD_START_LOOKBACK_MS);
+        if (cold) {
+            from = SupabaseRest.toIso8601Utc(nowMs - COLD_FETCH_MS);
         } else if (seen.isEmpty()) {
             // Nothing recorded as seen yet (first run of this logic): no
             // overlap this once, or everything in the window would be raised
@@ -445,6 +456,30 @@ public class RoamkeepMessagingService extends MessagingService {
             } catch (Exception ignored) {}
         }
 
+        // History, not news (4.12.0): what this phone was not listening for.
+        // Recorded as seen so the next wake's overlap does not raise it
+        // either. An SOS ignores the floor, as it ignores every other limit,
+        // but not the cold-start lookback, which has always applied to it.
+        List<String> history = new ArrayList<>();
+        final long floorMs = prefs.getPushFloorMs();
+        for (Iterator<JSONObject> it = sos.iterator(); it.hasNext(); ) {
+            JSONObject r = it.next();
+            if (isHistory(parseIsoMs(r.optString(col, null)), nowMs, cold, -1)) {
+                history.add(r.optString("id", null));
+                it.remove();
+            }
+        }
+        for (Iterator<JSONObject> it = others.iterator(); it.hasNext(); ) {
+            JSONObject r = it.next();
+            if (isHistory(parseIsoMs(r.optString(col, null)), nowMs, cold, floorMs)) {
+                history.add(r.optString("id", null));
+                it.remove();
+            }
+        }
+        if (!history.isEmpty()) prefs.addPushSeenIds(history);
+        final String historyNote = history.isEmpty() ? ""
+                : "; " + history.size() + " from before this phone was listening not raised";
+
         // Too old to be news (4.11.3). Taken out of the notifications only:
         // the watermark has already moved past them, and they stay in
         // Activity. Not added to the seen set either, which is capped: an
@@ -457,7 +492,7 @@ public class RoamkeepMessagingService extends MessagingService {
 
         if (sos.isEmpty() && others.isEmpty()) {
             if (newest != null) saveMark(prefs, serverClock, newest);
-            prefs.journal("push: wake-up → 0 new" + staleNote);
+            prefs.journal("push: wake-up → 0 new" + historyNote + staleNote);
             return;
         }
 
@@ -492,7 +527,7 @@ public class RoamkeepMessagingService extends MessagingService {
         if (newest != null) saveMark(prefs, serverClock, newest);
         prefs.journal("push: wake-up → " + (sos.size() + shown) + " notification(s)"
                 + (others.size() > shown ? " + " + (others.size() - shown) + " summarised" : "")
-                + staleNote);
+                + historyNote + staleNote);
     }
 
     /**
@@ -505,6 +540,26 @@ public class RoamkeepMessagingService extends MessagingService {
      */
     static boolean tooOldToRaise(long atMs, long nowMs) {
         return atMs >= 0 && nowMs - atMs > ALERT_MAX_AGE_MS;
+    }
+
+    /**
+     * Whether a fetched check-in is history to this phone rather than news
+     * (4.12.0). Owner report 2026-11-01: after a reinstall, a new arrival
+     * came with older ones. Two causes, both on a phone with no watermark:
+     * the first wake raised everything in COLD_START_LOOKBACK_MS, including
+     * what happened before the phone was signed in; and it recorded as seen
+     * only what it raised, so the next wake's OVERLAP_MS re-read found the
+     * twenty minutes before that and raised them too.
+     *
+     * History is anything the server had before this phone started listening
+     * (floorMs, -1 for none), and on a cold wake anything older than
+     * COLD_START_LOOKBACK_MS. Same clocks as tooOldToRaise, and an unreadable
+     * time is news: dropping a real one is the worse mistake.
+     */
+    static boolean isHistory(long atMs, long nowMs, boolean cold, long floorMs) {
+        if (atMs < 0) return false;
+        if (floorMs >= 0 && atMs < floorMs) return true;
+        return cold && nowMs - atMs > COLD_START_LOOKBACK_MS;
     }
 
     /**

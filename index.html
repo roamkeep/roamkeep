@@ -271,6 +271,13 @@
         creates the database, installs Roamkeep on it, then forgets the key,
         and at the end you delete it.
       </div>
+      <div class="terms-pt">
+        <strong>When you sign up</strong>
+        Supabase asks you to create an organization, then a project. Create
+        the organization (any name, on the free plan), but not the project:
+        come back here instead. Roamkeep makes the project for you, and an
+        extra one would only take up one of your free projects.
+      </div>
       <button class="btn btn-g" data-action="pv-signup">Create a free Supabase account</button>
       <button class="btn btn-ghost" data-action="pv-have-account" style="margin-top:10px">I have an account →</button>
       <button class="lnk-btn" data-action="pv-cancel">Back</button>
@@ -294,7 +301,9 @@
           <li>Tap <b>Review access</b>, generate the token, and copy it.</li>
         </ul>
         <span class="pv-token-hint" id="pv-org-hint">Only just signed up? Supabase asks you
-          to create an organization first. Any name will do, on the free plan.</span>
+          to create an organization first. Any name will do, on the free plan. You don't
+          need the project it offers next, because Roamkeep makes its own. If you made
+          one already, you can delete it in Supabase.</span>
       </div>
       <button class="btn btn-ghost" data-action="pv-open-tokens">Open the token page</button>
       <div class="terms-pt" style="margin-top:12px">
@@ -735,7 +744,8 @@
     <div class="av-row" id="pe-icons"></div>
     <div class="field">
       <label for="pe-radius">Radius: <span id="pe-radius-lbl">100</span>m</label>
-      <input id="pe-radius" type="range" min="25" max="500" step="5" value="100">
+      <input id="pe-radius" type="range" min="100" max="500" step="5" value="100">
+      <p class="pe-radius-note" id="pe-radius-note" hidden></p>
     </div>
     <div class="pe-coord" id="pe-coord"></div>
     <button class="btn btn-g" id="pe-save" data-action="save-place"><span class="ic" data-icon="save"></span> Save place</button>  </div>

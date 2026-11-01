@@ -122,6 +122,13 @@ arrived and left pairs) and trips (from the trail), and the only test a trip
 must pass to be shown is the distance it covered: a filter applied at that
 point cannot tell a short real trip from noise.
 
+Each trip is called a walk, ride or drive from its speeds. When someone
+walks to the car or on from it, the walking part at either end of a drive
+is shown as a trip of its own. That changes a label, never what is shown:
+both parts must count as trips by themselves, they share the point where
+they meet, and a slow part in the middle of a drive is left alone, since
+speed cannot tell traffic from walking.
+
 ### Held arrivals and departures
 
 A crossing reported with a fuzzy fix near the boundary is not announced at

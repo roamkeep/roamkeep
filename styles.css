@@ -753,6 +753,13 @@ body {
 .pe-who[hidden] { display: none; }
 /* That position is old enough that they may have moved (PIN_STALE_MS). */
 .pe-who.stale { background: rgba(255, 184, 77, .22); color: #6b4500; }
+/* An older place under PLACE_MIN_RADIUS_M: saving it will make it bigger. */
+.pe-radius-note {
+  font-size: 12px; line-height: 1.5; color: #6b4500;
+  margin: 8px 0 0; padding: 7px 10px;
+  background: rgba(255, 184, 77, .22); border-radius: 8px;
+}
+.pe-radius-note[hidden] { display: none; }
 
 input[type=range] {
   width: 100%; -webkit-appearance: none; appearance: none;

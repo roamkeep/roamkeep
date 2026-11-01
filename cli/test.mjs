@@ -985,6 +985,113 @@ console.log('\nwizard: every source file parses');
     days > 30 && days <= 366, Number.isFinite(days) ? `${Math.round(days)} days` : 'unreadable date');
 }
 
+// The smallest place, cut out of app.js (4.12.0). New places start at
+// 100 m, and an older, smaller one becomes 100 m when it is next saved, even
+// for a rename; the editor says so before Save.
+console.log('\napp: places are saved at 100 m or more');
+{
+  const app = fs.readFileSync(path.join(REPO, 'app.js'), 'utf8');
+  const min = (app.match(/const PLACE_MIN_RADIUS_M = \d+;/) || [])[0];
+  const srcs = ['async function addPlace(fields)', 'async function updatePlace(id, fields)'].map(cutFromApp);
+  if (!min || srcs.some((s) => !s)) {
+    check('place save functions found in app.js', false, 'moved or renamed');
+  } else {
+    const AsyncFunction = Object.getPrototypeOf(async () => {}).constructor;
+    const sent = [];
+    const S = { keepId: 'k', user: { id: 'u' }, sb: { from: () => ({
+      insert: async (row) => { sent.push(row.radius_m); return { error: null }; },
+      update: (patch) => ({ eq: async () => { sent.push(patch.radius_m); return { error: null }; } }),
+    }) } };
+    const { addPlace, updatePlace } = await new AsyncFunction('S', `
+      const toast = () => {}, mapRpcError = (e) => e.message;
+      ${min}
+      ${srcs.join('\n')}
+      return { addPlace, updatePlace };`)(S);
+    await addPlace({ name: 'Gate', radius_m: 25, lat: 0, lng: 0 });
+    check('a new place asked for at 25 m is saved at 100 m', sent.pop() === 100);
+    await updatePlace('p', { name: 'Corner shop renamed', radius_m: 50 });
+    check('an older 50 m place saved again becomes 100 m', sent.pop() === 100);
+    await updatePlace('p', { name: 'School', radius_m: 150 });
+    check('a bigger place keeps its size', sent.pop() === 150);
+  }
+}
+
+// Trips, cut out of app.js (4.12.0). A drive that ended in a walk was one
+// "Drive" in History (owner report 2026-11-01); the walk at either end of a
+// drive is now a trip of its own, and nothing else is split or hidden.
+console.log('\napp: a drive and a walk are two trips');
+{
+  const app = fs.readFileSync(path.join(REPO, 'app.js'), 'utf8');
+  const names = ['TRIP_GAP_MS', 'TRIP_MIN_M', 'MAX_LEG_SPEED_MS', 'MIN_LEG_DT_S', 'SPEED_CORROB_MULT',
+    'DRIVE_AVG_MS', 'DRIVE_MAX_MS', 'RIDE_AVG_MS', 'WALK_MAX_MS', 'WALK_LEG_MIN_MS'];
+  const consts = names.map((n) => (app.match(new RegExp('const ' + n + ' += [^;]+;')) || [])[0]);
+  const srcs = ['function distanceM(lat1, lng1, lat2, lng2)', 'function segmentTrips(pts)',
+    'function isRealTrip(t)', 'function legSpeeds(trip)', 'function trustedSpeed(trip, i, legMs, legOk)',
+    'function tripStats(trip)', 'function splitWalkLegs(trip)', 'function tripsFrom(pts)'].map(cutFromApp);
+  const memo = (app.match(/const _tripsMemo = [^;]+;/) || [])[0];
+  if (srcs.some((s) => !s) || consts.some((s) => !s) || !memo) {
+    check('trip functions found in app.js', false, 'moved or renamed');
+  } else {
+    const tripsFrom = new Function(`
+      const placesSignature = () => '';
+      ${consts.join('\n')}
+      ${memo}
+      ${srcs.join('\n')}
+      return tripsFrom;`)();
+    // A route north from the equator: each stretch is [seconds, m/s, a point
+    // every N seconds], and a point carries its speed unless noSpeed.
+    const route = (stretches, noSpeed) => {
+      const pts = [];
+      let t = Date.UTC(2026, 10, 1, 9), lat = 0;
+      const push = (sp) => pts.push({ lat, lng: 0, recorded_at: new Date(t).toISOString(),
+        speed: noSpeed ? null : sp });
+      push(stretches[0][1]);
+      for (const [secs, mps, every] of stretches) {
+        for (let s = every; s <= secs; s += every) {
+          t += every * 1000; lat += (mps * every) / 111195; push(mps);
+        }
+      }
+      return pts;
+    };
+    const DRIVE = [600, 14, 5], PARK = [20, 3, 5], WALK = [360, 1.3, 15];
+    const modes = (trips) => trips.map((x) => x.mode).join('+');
+    const total = (trips) => trips.reduce((a, x) => a + x.distM, 0);
+
+    const out = tripsFrom(route([DRIVE, PARK, WALK]));
+    check('a drive that ends in a walk is a drive and a walk', modes(out) === 'drive+walk', modes(out));
+    check('the drive keeps its top speed', out[0].maxSp === 14, String(out[0].maxSp));
+    check('the two join at one point, so no distance is lost', out.length === 2
+      && out[0].pts[out[0].pts.length - 1] === out[1].pts[0]
+      && Math.abs(total(out) - (600 * 14 + 20 * 3 + 360 * 1.3)) < 1, String(total(out)));
+
+    let trips = tripsFrom(route([[240, 1.4, 15], [20, 3, 5], DRIVE, PARK, WALK]));
+    check('a walk, a drive and a walk are three trips', modes(trips) === 'walk+drive+walk', modes(trips));
+
+    trips = tripsFrom(route([DRIVE, [240, 1, 10], DRIVE]));
+    check('a crawl in the middle of a drive stays part of it', modes(trips) === 'drive', modes(trips));
+
+    // 145 m: far enough to be a trip, too short in time to be a walk.
+    trips = tripsFrom(route([DRIVE, PARK, [100, 1.45, 10]]));
+    check('under two minutes on foot is getting out of the car, not a walk',
+      modes(trips) === 'drive', modes(trips));
+
+    trips = tripsFrom(route([DRIVE, PARK, WALK], true));
+    check('it splits from the path alone when no point carries a speed',
+      modes(trips) === 'drive+walk', modes(trips));
+
+    trips = tripsFrom(route([[1200, 1.3, 15]]));
+    check('a walk on its own is one walk', modes(trips) === 'walk', modes(trips));
+
+    trips = tripsFrom(route([[600, 5, 5], WALK]));
+    check('a ride that ends in a walk is not split (their speeds overlap)', modes(trips) === 'ride', modes(trips));
+
+    // Tapping a trip in History draws it on its own, through tripsFrom again.
+    const legs = tripsFrom(route([DRIVE, PARK, WALK]));
+    check('a drive or walk drawn on its own stays one trip', legs.length === 2
+      && legs.every((x) => tripsFrom(x.pts.slice()).length === 1));
+  }
+}
+
 // The suite read src/index.js as TEXT for the --from checks above and never
 // asked Node whether it was valid JavaScript. So it reported 39/39 on a
 // wizard that would not start: a patch had left literal newlines inside

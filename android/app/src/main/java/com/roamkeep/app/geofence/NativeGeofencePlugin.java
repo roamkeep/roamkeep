@@ -499,6 +499,15 @@ public class NativeGeofencePlugin extends Plugin {
         Integer dbSchema = call.getInt("schemaVersion");
         prefs.setSchemaVersion(dbSchema == null ? 0 : dbSchema);
 
+        // A phone that has never been woken here (just installed, or signed
+        // back in) starts its alerts from now: what came before is in
+        // Activity, not news (RoamkeepMessagingService.isHistory).
+        if (prefs.getPushFloorMs() < 0 && prefs.getLastPushSeenInserted() == null
+                && prefs.getLastPushSeen() == null) {
+            prefs.setPushFloorMs(System.currentTimeMillis() - RoamkeepMessagingService.FLOOR_SLACK_MS);
+            prefs.journal("push: alerts start from now; earlier ones are in Activity");
+        }
+
         // Seed the receiver's "currently inside" set from what JS
         // knows. Merge rather than overwrite so any unmatched ENTERs
         // the receiver captured while the app was closed survive

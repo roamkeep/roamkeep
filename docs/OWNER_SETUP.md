@@ -43,7 +43,11 @@ On your phone:
 1. Install **Roamkeep** from Google Play and open it.
 2. Tap **Set up a new family**.
 3. Tap **Create a free Supabase account** and sign up, or tap **I have an
-   account**.
+   account**. Supabase then asks you to create an organization, and after
+   it a project. Create the organization (any name, on the free plan) but
+   **not the project**: go back to the app instead. Roamkeep makes the
+   project itself, and an extra one would only take up one of your free
+   projects. If you made one already, you can delete it in Supabase.
 4. **Give Roamkeep a temporary key.** Tap **Open the token page** and
    generate a new token:
    - **Name** it `Roamkeep`; **Expires in**: the shortest offered.
@@ -53,9 +57,7 @@ On your phone:
    - **Review access**, generate it, and copy it.
 
    Paste it into the app. It is used only on your phone, only to talk to
-   Supabase, and it is never saved. If you have only just signed up,
-   Supabase asks you to create an organization first: any name, on the free
-   plan.
+   Supabase, and it is never saved.
 5. **Choose where your data lives.** Roamkeep suggests the region nearest
    you, from your phone's time zone. Tap **Create the family server** and
    keep the app open for about three minutes; the screen stays on.
@@ -214,8 +216,10 @@ cd C:\roamkeep\roamkeep-main
 
 ### Get a Supabase access token
 
-Sign up at **<https://supabase.com>** if you haven't (Supabase asks a new
-account to create an organization first; the free plan is fine). Then go to
+Sign up at **<https://supabase.com>** if you haven't. Supabase asks a new
+account to create an organization (the free plan is fine) and then a
+project: create the organization but not the project, because the wizard
+makes it. Then go to
 **<https://supabase.com/dashboard/account/tokens>** and generate a new token:
 
 | Field | Choose |

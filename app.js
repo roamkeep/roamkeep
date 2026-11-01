@@ -2492,7 +2492,7 @@
     const lastAt = pts[len - 1].recorded_at;
     const hit = _tripsMemo.get(pts);
     if (hit && hit.sig === sig && hit.len === len && hit.lastAt === lastAt) return hit.trips;
-    const trips = segmentTrips(pts).map(tripStats).filter(isRealTrip);
+    const trips = segmentTrips(pts).flatMap(splitWalkLegs).map(tripStats).filter(isRealTrip);
     _tripsMemo.set(pts, { sig, len, lastAt, trips });
     return trips;
   }
@@ -2664,7 +2664,7 @@
       frag.appendChild(el('div', {
         class: 'map-place',
         style: 'left:' + pos.x + 'px;top:' + pos.y + 'px',
-        dataset: { action: 'focus-place', id: p.id },
+        dataset: { action: 'place-click', id: p.id },
         text: p.icon
       }));
     }
@@ -2688,10 +2688,11 @@
     placePop();
   }
 
-  // The member balloon. It was built to be glanced at — pointer-events:none,
-  // placed once at tap time, hidden after 3 s by a timer nobody cleared — and
-  // that was fine while it held nothing to tap. It now carries "Add place
-  // here", so it has to behave like a control:
+  // The map balloon, for a member or (since 4.12.0) a place. It was built to
+  // be glanced at — pointer-events:none, placed once at tap time, hidden after
+  // 3 s by a timer nobody cleared — and that was fine while it held nothing
+  // to tap. It now carries "Add place here" and "Edit place", so it has to
+  // behave like a control:
   //  - ONE timer, cleared on every open. The old one was never cleared, so
   //    tapping a second member within 3 s let the first timer hide the second
   //    balloon early.
@@ -2704,19 +2705,34 @@
   function hidePop() {
     if (_popTimer) { clearTimeout(_popTimer); _popTimer = null; }
     S.popMemberId = null;
+    S.popPlaceId = null;
     const pop = $('map-pop');
     if (pop) pop.style.display = 'none';
   }
 
   function placePop() {
-    if (!S.popMemberId) return;
+    if (!S.popMemberId && !S.popPlaceId) return;
     const pop = $('map-pop');
-    const m = S.members.find(x => x.id === S.popMemberId);
-    // Gone, paused or position-less means the pin itself is no longer drawn.
-    if (!pop || !m || m.lat == null || m.lng == null || isPausedRow(m)) { hidePop(); return; }
-    const pos = ll2px(m.lat, m.lng);
+    let at = null;
+    if (S.popPlaceId) {
+      // Deleted, here or on another phone, means its icon is no longer drawn.
+      at = (S.places || []).find(x => x.id === S.popPlaceId);
+    } else {
+      const m = S.members.find(x => x.id === S.popMemberId);
+      // Gone, paused or position-less means the pin itself is no longer drawn.
+      if (m && m.lat != null && m.lng != null && !isPausedRow(m)) at = m;
+    }
+    if (!pop || !at) { hidePop(); return; }
+    const pos = ll2px(at.lat, at.lng);
     pop.style.left = pos.x + 'px';
     pop.style.top = pos.y + 'px';
+  }
+
+  function showPop(pop) {
+    pop.style.display = 'block';
+    placePop();
+    if (_popTimer) clearTimeout(_popTimer);
+    _popTimer = setTimeout(hidePop, POP_MS);
   }
 
   function pinClick(id) {
@@ -2747,11 +2763,33 @@
       }));
     }
     S.popMemberId = m.id;
-    pop.style.display = 'block';
-    placePop();
-    if (_popTimer) clearTimeout(_popTimer);
-    _popTimer = setTimeout(hidePop, POP_MS);
+    S.popPlaceId = null;
+    showPop(pop);
     loadTrail(id);
+  }
+
+  // A place's balloon: its name and the size of its alert area, as the
+  // Places tab shows them, and Edit place, the counterpart of a member's
+  // Add place here. Tapping a place icon used to recentre the map on it,
+  // which the Places tab still does.
+  function placeClick(id) {
+    const p = (S.places || []).find(x => x.id === id);
+    const pop = $('map-pop');
+    if (!p || !pop) return;
+    clear(pop);
+    pop.appendChild(el('strong', { text: p.icon + ' ' + p.name }));
+    pop.appendChild(el('div', { class: 'pp-s',
+      text: (S.insidePlaces.has(p.id) ? 'You are here · ' : '') + p.radius_m + 'm radius' }));
+    pop.appendChild(el('button', {
+      class: 'pp-act',
+      type: 'button',
+      'aria-label': 'Edit ' + p.name,
+      dataset: { action: 'edit-place', id: p.id },
+      html: iconSvg('pencil', 16) + '<span>Edit place</span>'
+    }));
+    S.popPlaceId = p.id;
+    S.popMemberId = null;
+    showPop(pop);
   }
 
   // ── GPS & BATTERY ──────────────────────────────────────────────
@@ -3261,11 +3299,22 @@
     }
   }
 
+  // The smallest alert area a place can be saved with (4.12.0; it was 25 m).
+  // Android's own geofencing guide puts the minimum at 100 to 150 m, because a
+  // phone's position from Wi-Fi is only good to about 50 m: a smaller fence
+  // sees someone arrive and leave while they sit still. An older, smaller
+  // place keeps its size until someone saves it, and then becomes 100 m, even
+  // when only its name changed; the editor says so first (openPlaceEditor).
+  // Nothing enlarges it unasked: the database still allows 25 m, for those
+  // places and for older apps, and arming a bigger fence on the phone than
+  // the database holds would be the divergence bug.
+  const PLACE_MIN_RADIUS_M = 100;
+
   async function addPlace(fields) {
     const name = (fields.name || '').trim();
     if (!name) { toast('Place needs a name', 'err'); return false; }
     const icon = fields.icon || '📍';
-    const radius_m = Math.max(25, Math.min(2000, Number(fields.radius_m) || 100));
+    const radius_m = Math.max(PLACE_MIN_RADIUS_M, Math.min(2000, Number(fields.radius_m) || 100));
     const { error } = await S.sb.from('keep_places').insert({
       keep_id: S.keepId,
       name, icon, radius_m,
@@ -3281,7 +3330,7 @@
     const name = (fields.name || '').trim();
     if (!name) { toast('Place needs a name', 'err'); return false; }
     const icon = fields.icon || '📍';
-    const radius_m = Math.max(25, Math.min(2000, Number(fields.radius_m) || 100));
+    const radius_m = Math.max(PLACE_MIN_RADIUS_M, Math.min(2000, Number(fields.radius_m) || 100));
     const patch = { name, icon, radius_m };
     // lat/lng only update if they were dragged (currently we keep them).
     if (typeof fields.lat === 'number') patch.lat = fields.lat;
@@ -3545,7 +3594,7 @@
 
     S.placePicker = { lat, lng, id: editing ? existing.id : null };
     S.placeIcon = editing ? existing.icon : PLACE_ICONS[0];
-    S.placeRadius = editing ? existing.radius_m : 100;
+    S.placeRadius = editing ? Math.max(existing.radius_m, PLACE_MIN_RADIUS_M) : PLACE_MIN_RADIUS_M;
 
     // Title + CTA copy reflect mode.
     const title = $('pe-title');
@@ -3561,6 +3610,14 @@
     }
     const rIn = $('pe-radius');
     if (rIn) rIn.value = String(S.placeRadius);
+    const rNote = $('pe-radius-note');
+    if (rNote) {
+      const small = editing && existing.radius_m < PLACE_MIN_RADIUS_M;
+      rNote.hidden = !small;
+      // True wherever the slider is moved to, so it never needs redrawing.
+      rNote.textContent = !small ? '' : 'This place has a ' + existing.radius_m +
+        'm radius. The smallest is now ' + PLACE_MIN_RADIUS_M + 'm, so saving makes it bigger.';
+    }
     const rLbl = $('pe-radius-lbl');
     if (rLbl) rLbl.textContent = String(S.placeRadius);
     const coord = $('pe-coord');
@@ -3827,6 +3884,7 @@
   }
 
   function editPlace(id) {
+    hidePop();
     const p = S.places.find(x => x.id === id);
     if (!p) return;
     openPlaceEditor(p.lat, p.lng, p.id);
@@ -4629,6 +4687,11 @@
   const DRIVE_AVG_MS = 8;     // ~29 km/h sustained
   const DRIVE_MAX_MS = 12.5;  // ~45 km/h peak
   const RIDE_AVG_MS  = 2.2;   // ~8 km/h sustained — above brisk-walk pace
+  // On foot at a drive's start or end (splitWalkLegs): every point no faster
+  // than a brisk walk, for at least this long. Shorter is getting out of the
+  // car.
+  const WALK_MAX_MS = 2.5;    // ~9 km/h
+  const WALK_LEG_MIN_MS = 2 * 60 * 1000;
 
   function tlDayStart(offset) {
     const d = new Date();
@@ -4775,15 +4838,13 @@
     }
   }
 
-  // Distance / duration / speed stats for one breadcrumb trip.
-  function tripStats(trip) {
-    if (!trip || trip.length < 2) return null;
-    // Leg speeds first: they are both the teleport test and the corroboration
-    // for the stored speed column.
+  // Leg speeds between consecutive breadcrumbs. They are both the teleport
+  // test and the corroboration for the stored speed column, and tripStats
+  // and splitWalkLegs read them from here so they cannot disagree.
+  function legSpeeds(trip) {
     const legM = new Array(trip.length).fill(0);
     const legMs = new Array(trip.length).fill(0);
     const legOk = new Array(trip.length).fill(true);
-    let distM = 0;
     for (let i = 1; i < trip.length; i++) {
       legM[i] = distanceM(trip[i - 1].lat, trip[i - 1].lng, trip[i].lat, trip[i].lng);
       const dt = Math.max(MIN_LEG_DT_S,
@@ -4793,22 +4854,36 @@
       // A leg nothing on the ground could have travelled is one bad fix, not
       // five kilometres of driving. It contributes neither distance nor a
       // top speed.
-      if (legMs[i] > MAX_LEG_SPEED_MS) { legOk[i] = false; continue; }
-      distM += legM[i];
+      if (legMs[i] > MAX_LEG_SPEED_MS) legOk[i] = false;
     }
+    return { legM, legMs, legOk };
+  }
+
+  // Point i's stored GPS speed if the path around it can support it, else
+  // null. max() of the two adjacent legs, not min(): the first fix after
+  // pulling away from a stop has a backward leg spanning the whole stop,
+  // which reads slow — its forward leg is the honest one. Only a point with
+  // BOTH neighbours stationary is distrusted.
+  function trustedSpeed(trip, i, legMs, legOk) {
+    const sp = trip[i].speed;
+    if (typeof sp !== 'number' || sp < 0 || sp > MAX_LEG_SPEED_MS) return null;
+    const back = (i >= 1 && legOk[i]) ? legMs[i] : 0;
+    const fwd = (i + 1 < trip.length && legOk[i + 1]) ? legMs[i + 1] : 0;
+    const around = Math.max(back, fwd);
+    if (sp > Math.max(DRIVE_MAX_MS, around * SPEED_CORROB_MULT)) return null;
+    return sp;
+  }
+
+  // Distance / duration / speed stats for one breadcrumb trip.
+  function tripStats(trip) {
+    if (!trip || trip.length < 2) return null;
+    const { legM, legMs, legOk } = legSpeeds(trip);
+    let distM = 0;
+    for (let i = 1; i < trip.length; i++) if (legOk[i]) distM += legM[i];
     let maxSp = 0, spSum = 0, spN = 0;
     for (let i = 0; i < trip.length; i++) {
-      const sp = trip[i].speed;
-      if (typeof sp !== 'number' || sp < 0 || sp > MAX_LEG_SPEED_MS) continue;
-      // The path around the point has to corroborate the reading. max() of
-      // the two adjacent legs, not min(): the first fix after pulling away
-      // from a stop has a backward leg spanning the whole stop, which reads
-      // slow — its forward leg is the honest one. Only a point with BOTH
-      // neighbours stationary is distrusted.
-      const back = (i >= 1 && legOk[i]) ? legMs[i] : 0;
-      const fwd = (i + 1 < trip.length && legOk[i + 1]) ? legMs[i + 1] : 0;
-      const around = Math.max(back, fwd);
-      if (sp > Math.max(DRIVE_MAX_MS, around * SPEED_CORROB_MULT)) continue;
+      const sp = trustedSpeed(trip, i, legMs, legOk);
+      if (sp == null) continue;
       maxSp = Math.max(maxSp, sp);
       spSum += sp; spN++;
     }
@@ -4823,6 +4898,56 @@
       kind: 'trip', startMs, endMs, durMs, distM, maxSp, mode,
       pts: trip
     };
+  }
+
+  // A drive that starts or ends on foot comes back as a walk and a drive,
+  // not one Drive across both (owner report 2026-11-01: someone drove
+  // somewhere, got out and walked on, and History said Drive for all of it).
+  //
+  // Only at the ENDS. A slow stretch between two fast ones stays part of the
+  // drive: speed cannot tell a car in a queue from a person walking, and a
+  // walk in the middle of a drive with no stop long enough for segmentTrips
+  // to split on is the queue far more often than not. Only a drive is split,
+  // too, because a ride's speeds overlap a walk's and a split there would be
+  // a guess. The known limit is a car crawling for WALK_LEG_MIN_MS at the
+  // very start or end, such as a queue out of a car park: it reads as a walk.
+  //
+  // This labels and never hides. Each piece has to pass isRealTrip on its
+  // own or nothing is split, and the point at a change belongs to both
+  // pieces, so every point and every metre of the trip is still on the map
+  // and in the list. Hiding is what the three removed 4.8.5 filters did.
+  function splitWalkLegs(trip) {
+    const whole = tripStats(trip);
+    if (!whole || whole.mode !== 'drive') return [trip];
+    const n = trip.length;
+    const { legMs, legOk } = legSpeeds(trip);
+    // On foot when everything known about the point's pace says so: its GPS
+    // speed if that is believed, else both legs either side of it.
+    const onFoot = (i) => {
+      const sp = trustedSpeed(trip, i, legMs, legOk);
+      if (sp != null) return sp <= WALK_MAX_MS;
+      const back = (i >= 1 && legOk[i]) ? legMs[i] : 0;
+      const fwd = (i + 1 < n && legOk[i + 1]) ? legMs[i + 1] : 0;
+      return Math.max(back, fwd) <= WALK_MAX_MS;
+    };
+    let first = 0;
+    while (first < n && onFoot(first)) first++;
+    if (first >= n) return [trip];
+    let last = n - 1;
+    while (last > first && onFoot(last)) last--;
+    const isWalk = (pts) => {
+      const t = pts.length >= 3 ? tripStats(pts) : null;
+      return !!t && t.mode === 'walk' && t.durMs >= WALK_LEG_MIN_MS && isRealTrip(t);
+    };
+    const lead = first > 0 && isWalk(trip.slice(0, first)) ? trip.slice(0, first) : null;
+    const tail = last < n - 1 && isWalk(trip.slice(last + 1)) ? trip.slice(last + 1) : null;
+    if (!lead && !tail) return [trip];
+    // The stretch between the last point on foot and the first in the car is
+    // the drive's: that is where they got in, or pulled up and got out.
+    const drive = trip.slice(lead ? first - 1 : 0, tail ? last + 2 : n);
+    const d = tripStats(drive);
+    if (!d || d.mode !== 'drive' || !isRealTrip(d)) return [trip];
+    return [lead, drive, tail].filter(Boolean);
   }
 
   // Merge stays (check-in pairs), trips (breadcrumbs) and one-off events
@@ -6336,6 +6461,7 @@
     'close-place-notify': closePlaceNotify,
     'toggle-place-notify': (t) => togglePlaceNotify(t, t.dataset.id),
     'focus-place': (t) => focusPlace(t.dataset.id),
+    'place-click': (t) => placeClick(t.dataset.id),
     'pick-place-icon': (t) => pickPlaceIcon(t, t.dataset.icon),
     'toggle-notify': (t) => toggleNotify(t),
     'set-track-mode': (t) => applyTrackingMode(t.dataset.mode),

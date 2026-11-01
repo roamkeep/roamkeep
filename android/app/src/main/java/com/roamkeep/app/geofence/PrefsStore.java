@@ -351,6 +351,13 @@ public class PrefsStore {
     public String getLastPushSeenInserted()           { return sp.getString(K_LAST_PUSH_SEEN_INS, null); }
     public void setLastPushSeenInserted(String isoTs) { sp.edit().putString(K_LAST_PUSH_SEEN_INS, isoTs).apply(); }
 
+    // When this phone started listening for alerts, on its own clock (4.12.0):
+    // set at the first app open with no watermark, so after an install or a
+    // sign-out, nothing the server had before then is raised as new. -1 unset.
+    private static final String K_PUSH_FLOOR = "push_floor_ms";
+    public long getPushFloorMs() { return sp.getLong(K_PUSH_FLOOR, -1L); }
+    public void setPushFloorMs(long ms) { sp.edit().putLong(K_PUSH_FLOOR, ms).apply(); }
+
     // IDs of check-ins already raised as notifications, oldest first, capped.
     // The notification query deliberately OVERLAPS its window, because a row
     // can land after a newer one (a crossing queued through a network

@@ -7,6 +7,37 @@ the app says so, and an owner updates it from **Settings → Family server**.
 An older server keeps working; it just goes without the new features that
 need it.
 
+## 4.12.0 (in testing)
+
+No server update is needed.
+
+- **History shows the walk after a drive.** Someone who drove somewhere and
+  then walked on showed as one Drive for the whole outing. A walk of two
+  minutes or more at the start or end of a drive is now a trip of its own,
+  worked out from the speeds Roamkeep already records, so it applies to the
+  past week of history too. A slow stretch in the middle of a drive stays
+  part of the drive, because speed alone can't tell traffic from walking.
+- **Tap a place on the map to see it.** A balloon shows the place's name and
+  the size of its alert area, with Edit place, like Add place here on a
+  person. Tapping a place used to centre the map on it; tapping it in the
+  Places tab still does.
+- **Places are now at least 100 m.** The smallest alert area is now 100 m
+  (it was 25 m). That is Android's own guidance: a phone's position can be
+  50 m out, and a smaller place can tell the family someone arrived and left
+  while they sat still. A smaller place you already have works as before
+  until someone edits it. Saving it then makes it 100 m, even if only the
+  name changed, and the editor says so before you save.
+- **A newly set-up phone no longer brings back older alerts.** After
+  installing Roamkeep, or signing out and back in, the first alerts could
+  arrive with arrivals and departures from up to half an hour earlier, some
+  from before the phone was even set up, as if they had just happened. A
+  phone now raises arrivals and departures only from when it is signed in.
+  Everything earlier is still in Activity.
+- **Setup says you don't need a Supabase project.** After you sign up,
+  Supabase asks for an organization and then a project. Setup now says to
+  create the organization only: Roamkeep makes the project itself, and an
+  extra one takes up one of your free projects.
+
 ## 4.11.5 (in testing)
 
 Update your family's server (Settings → Family server). A server made before
