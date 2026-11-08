@@ -125,9 +125,34 @@ final class GeofenceArmer {
             parts.add(p.id + ':' + p.lat + ':' + p.lng + ':' + p.radius + ':' + p.name + ':' + p.icon);
         }
         java.util.Collections.sort(parts);
-        StringBuilder sb = new StringBuilder();
-        for (String s : parts) { if (sb.length() > 0) sb.append('|'); sb.append(s); }
+        StringBuilder sb = new StringBuilder(FENCE_FORMAT);
+        for (String s : parts) { sb.append('|'); sb.append(s); }
         return sb.toString();
+    }
+
+    // Changes whenever fence() registers something different, so a phone
+    // holding fences of the old kind re-arms at the next reconcile. An app
+    // update re-arms everything anyway (BootReceiver); this covers a phone
+    // that skipped that, paused or rejected at the time.
+    private static final String FENCE_FORMAT = "dwell1";
+
+    /**
+     * One fence, built the same way by every path that registers one: the
+     * whole-list arm here and the plugin's single-place add. ENTER and EXIT
+     * pair up the inside set. DWELL, once Play Services has had us inside
+     * for CONFIRM_DWELL_MS, is one of the confirmations of a held arrival
+     * (4.12.1).
+     */
+    static Geofence fence(String id, double lat, double lng, float radius) {
+        return new Geofence.Builder()
+                .setRequestId(id)
+                .setCircularRegion(lat, lng, radius)
+                .setExpirationDuration(Geofence.NEVER_EXPIRE)
+                .setTransitionTypes(Geofence.GEOFENCE_TRANSITION_ENTER
+                        | Geofence.GEOFENCE_TRANSITION_EXIT
+                        | Geofence.GEOFENCE_TRANSITION_DWELL)
+                .setLoiteringDelay((int) GeofenceReceiver.CONFIRM_DWELL_MS)
+                .build();
     }
 
     /**
@@ -180,13 +205,7 @@ final class GeofenceArmer {
             // arm yet (no permission) is still repairable later.
             prefs.putPlace(p);
             stored++;
-            fences.add(new Geofence.Builder()
-                    .setRequestId(p.id)
-                    .setCircularRegion(p.lat, p.lng, p.radius)
-                    .setExpirationDuration(Geofence.NEVER_EXPIRE)
-                    .setTransitionTypes(Geofence.GEOFENCE_TRANSITION_ENTER
-                            | Geofence.GEOFENCE_TRANSITION_EXIT)
-                    .build());
+            fences.add(fence(p.id, p.lat, p.lng, p.radius));
         }
 
         // Play Services allows an app 100 geofences, and addGeofences is

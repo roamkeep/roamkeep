@@ -185,10 +185,12 @@ public class PrefsStore {
     // opposite failure to the one it is being given.
     private static final String K_REPAIR_WATCH = "repair_inside_since";
 
-    // {placeId: {t: epoch-ms, tr: bool}} — arrivals the drift gate recorded
-    // as state but did not announce, waiting for evidence either way. See
-    // GeofenceReceiver.confirmHeldArrivals. Device-local bookkeeping about
-    // what WE have said, not a mirror of any database row.
+    // {placeId: {t: epoch-ms, tr: bool, dw: bool, bl: int}} — arrivals
+    // recorded as state but not yet announced, waiting for evidence either
+    // way. Since 4.12.1 every arrival starts here: dw marks one waiting out
+    // the dwell, bl why its dwell is not counting (GeofenceReceiver.BLOCK_*).
+    // See GeofenceReceiver.confirmHeldArrivals. Device-local bookkeeping
+    // about what WE have said, not a mirror of any database row.
     private static final String K_HELD_ARRIVALS = "held_arrivals";
 
     // Epoch-ms of the last EXIT that was accepted and announced. One of the
@@ -943,18 +945,28 @@ public class PrefsStore {
 
     // ── Held arrivals ──────────────────────────────────────────────
     //
-    // An arrival the drift gate would not announce on the fix it came with.
-    // The inside-set above still records it — that set tracks what Play
-    // Services believes — but the family has not been told. A held arrival
-    // leaves this map exactly once: confirmed and announced, or discarded
-    // at the EXIT with neither side announced. Never silently.
+    // An arrival the family has not been told about yet: since 4.12.1 every
+    // one, waiting out the dwell, and before that only those the drift gate
+    // would not announce on the fix they came with. The inside-set above
+    // still records it — that set tracks what Play Services believes — but
+    // the family has not been told. A held arrival leaves this map exactly
+    // once: confirmed and announced, or discarded at the EXIT with neither
+    // side announced. Never silently.
+    //
+    // A place handed over to an overlapping one (4.12.1) is held again,
+    // blocked, while Play Services still has us inside it: its departure has
+    // been announced, so it must not count as where we are.
 
     public static final class Held {
-        public final long enterMs;     // when the gated ENTER happened
+        public final long enterMs;     // when the ENTER happened; the dwell counts from here
         public final boolean travel;   // arriving from travel at the time
-        Held(long enterMs, boolean travel) {
+        public final boolean dwell;    // waiting out the dwell; false for a drift hold (4.9.2)
+        public final int blocked;      // GeofenceReceiver.BLOCK_*: why the dwell is not counting
+        Held(long enterMs, boolean travel, boolean dwell, int blocked) {
             this.enterMs = enterMs;
             this.travel = travel;
+            this.dwell = dwell;
+            this.blocked = blocked;
         }
     }
 
@@ -966,33 +978,88 @@ public class PrefsStore {
         }
     }
 
+    // A hold written by 4.12.0 or earlier has no dw or bl: a drift hold,
+    // judged by the rules it was made under.
     private static Held parseHeld(JSONObject o) {
         if (o == null) return null;
         long t = o.optLong("t", 0L);
-        return t > 0L ? new Held(t, o.optBoolean("tr", false)) : null;
+        return t > 0L ? new Held(t, o.optBoolean("tr", false), o.optBoolean("dw", false),
+                o.optInt("bl", 0)) : null;
+    }
+
+    private static JSONObject heldJson(long t, boolean travel, boolean dwell, int blocked)
+            throws JSONException {
+        JSONObject o = new JSONObject();
+        o.put("t", t);
+        o.put("tr", travel);
+        o.put("dw", dwell);
+        o.put("bl", blocked);
+        return o;
     }
 
     /**
      * Hold an arrival. If one is already held for this place, keep its
      * EARLIER time — the dwell is measured from the first crossing — and
-     * treat it as travel if either reading was.
+     * treat it as travel, or as waiting out the dwell, if either reading
+     * was. Why it is blocked is this reading's.
      */
-    public void holdArrival(String id, long enterMs, boolean travel) {
+    public void holdArrival(String id, long enterMs, boolean travel, boolean dwell, int blocked) {
         if (id == null) return;
         synchronized (LOCK) {
             JSONObject all = readHeld();
             Held prev = parseHeld(all.optJSONObject(id));
             long t = prev != null ? Math.min(prev.enterMs, enterMs) : enterMs;
             boolean tr = travel || (prev != null && prev.travel);
+            boolean dw = dwell || (prev != null && prev.dwell);
             try {
-                JSONObject o = new JSONObject();
-                o.put("t", t);
-                o.put("tr", tr);
-                all.put(id, o);
+                all.put(id, heldJson(t, tr, dw, blocked));
             } catch (JSONException e) {
                 return;
             }
             sp.edit().putString(K_HELD_ARRIVALS, all.toString()).commit();
+        }
+    }
+
+    /**
+     * Rewrite a held arrival that is still there; nothing if another thread
+     * has just claimed it, so a revision can never bring a settled hold back.
+     */
+    public void reviseHeldArrival(String id, long enterMs, boolean travel, boolean dwell,
+                                  int blocked) {
+        if (id == null) return;
+        synchronized (LOCK) {
+            JSONObject all = readHeld();
+            if (!all.has(id)) return;
+            try {
+                all.put(id, heldJson(enterMs, travel, dwell, blocked));
+            } catch (JSONException e) {
+                return;
+            }
+            sp.edit().putString(K_HELD_ARRIVALS, all.toString()).commit();
+        }
+    }
+
+    /**
+     * Hand a place over to an overlapping one (4.12.1): an announced place
+     * that Play Services still has us inside becomes a blocked hold, so it
+     * stops counting as where we are. True only for the caller that made the
+     * change, which then announces its departure. Compare-and-set under LOCK,
+     * like claimHeldArrival: two workers confirming arrivals must not both
+     * announce one departure.
+     */
+    public boolean claimHandover(String id, long enterMs, int blocked) {
+        if (id == null) return false;
+        synchronized (LOCK) {
+            if (!getInsidePlaceIds().contains(id)) return false;
+            JSONObject all = readHeld();
+            if (all.has(id)) return false;
+            try {
+                all.put(id, heldJson(enterMs, false, true, blocked));
+            } catch (JSONException e) {
+                return false;
+            }
+            sp.edit().putString(K_HELD_ARRIVALS, all.toString()).commit();
+            return true;
         }
     }
 

@@ -129,17 +129,33 @@ both parts must count as trips by themselves, they share the point where
 they meet, and a slow part in the middle of a drive is left alone, since
 speed cannot tell traffic from walking.
 
+A stop at a saved place also ends a trip. Because nothing is recorded inside
+a place, a short stop such as a school drop-off is only a brief gap in the
+trail, too short to end a trip by itself. The stop's own arrival and
+departure decide it instead: a trip that runs through one is shown as two,
+with the stay between them, provided each part counts as a trip on its own.
+The map and its trip count use the same stops. Stays are matched to the
+departure from the same place, so someone inside two overlapping places is
+shown at each for as long as they were in it.
+
 ### Held arrivals and departures
 
-A crossing reported with a fuzzy fix near the boundary is not announced at
-once, because it may be drift. It is not thrown away either. The phone
-records that it is inside (that state must follow what Play services
-believes, or later crossings stop pairing up) and **holds** the arrival. A
-held arrival is announced, with its original time, when a precise fix
-confirms it, when a precise crossing does, or when the person arrived from
-travel and stayed. It is discarded at the matching departure, which is then
-not announced either, so the family is never told someone left a place they
-were never told they had reached.
+No arrival is announced at once. The phone records that it is inside (that
+state must follow what Play services believes, or later crossings stop
+pairing up) and **holds** the arrival until it has lasted three minutes, so
+driving through a place, or stopping at a red light inside one, says
+nothing. The arrival is then announced with its original time. Whichever
+notices first confirms it: the phone's own location updates, Play services'
+dwell event (which still arrives when a phone maker's battery manager has
+stopped the app), or the departure itself, if the stay lasted. A departure
+that comes first discards the arrival, and is then not announced either, so
+the family is never told someone left a place they were never told they had
+reached. Departures themselves are not delayed.
+
+A crossing reported with a fuzzy fix near the boundary is held for longer,
+because it may be drift: it waits for a precise fix inside it, or, when the
+person arrived from travel, for the same three minutes. A phone sitting
+still near an edge never confirms one on time alone.
 
 Departures are held the same way. Play services reports a crossing once, so
 a fuzzy departure that turns out to be real will not be reported again, and
@@ -212,7 +228,31 @@ from Wi-Fi to mobile data. So the phone also compares the row with its own
 state on every regular update of the live pin, and sends the place again
 whenever they differ. On screen, a recorded place never outranks a position
 clearly outside it, and the app does not seed the phone's own state from a
-place its position contradicts. A status the phone owes the family, such as
+place its position contradicts.
+
+Places may overlap: a home can sit beside its school, and a home can lie
+inside a town. When someone is inside more than one, the phone and the app
+name the same one. A place that wholly contains another gives way to it, and
+otherwise the person is at the place whose middle they are nearer, counted
+as a share of its radius.
+
+Places side by side are one place at a time. Play services reports only
+crossings, and where two circles share ground the crossings say nothing
+useful: a home whose edge runs through its school's yard would report
+leaving and arriving home every few minutes at pickup. So while someone is
+inside both, the place whose middle a precise fix puts them nearer is the
+one that counts. An arrival at the other waits, and its three minutes start
+only once a fix puts them there. When it is announced, the family is told
+they left the first place at the same moment, and that place's own
+departure, when Play services reports it, is not announced a second time.
+With no precise fix there is no evidence, and the place already announced
+keeps them. A place inside another is different: someone at home in a town
+is in both, and leaving home does not announce arriving in the town.
+
+The place editor says when a place overlaps another side by side, and
+suggests a smaller radius when one would keep them apart.
+
+A status the phone owes the family, such as
 "not sharing" when notifications are off, is kept until it lands, for the
 same reason.
 
@@ -222,7 +262,9 @@ so if there is nothing to show.
 
 These failures produce no error and no wrong-looking screen, so the native
 code keeps a journal (Settings, Tracking diagnostics). Anything that writes native
-state records it there, and anything that drops or prunes says how much.
+state records it there, and anything that drops or prunes says how much. The
+journal never leaves the phone by itself; Share journal hands the whole of it,
+as text, to the share sheet, for the person to send where they choose.
 
 ## The backend is chosen at run time
 

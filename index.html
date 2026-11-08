@@ -679,6 +679,7 @@
             <div id="diag-body" style="display:none">
               <div id="diag-rows"></div>
               <button class="diag-refresh" data-action="refresh-diag">Refresh</button>
+              <button class="diag-refresh" id="diag-share" data-action="share-diag" hidden>Share journal</button>
             </div>
           </div>
         </div>
@@ -746,6 +747,7 @@
       <label for="pe-radius">Radius: <span id="pe-radius-lbl">100</span>m</label>
       <input id="pe-radius" type="range" min="100" max="500" step="5" value="100">
       <p class="pe-radius-note" id="pe-radius-note" hidden></p>
+      <p class="pe-radius-note" id="pe-overlap-note" hidden></p>
     </div>
     <div class="pe-coord" id="pe-coord"></div>
     <button class="btn btn-g" id="pe-save" data-action="save-place"><span class="ic" data-icon="save"></span> Save place</button>  </div>

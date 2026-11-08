@@ -596,12 +596,7 @@ public class NativeGeofencePlugin extends Plugin {
                     + "transitions will only fire while the app is open");
         }
 
-        Geofence fence = new Geofence.Builder()
-                .setRequestId(id)
-                .setCircularRegion(lat, lng, radius.floatValue())
-                .setExpirationDuration(Geofence.NEVER_EXPIRE)
-                .setTransitionTypes(Geofence.GEOFENCE_TRANSITION_ENTER | Geofence.GEOFENCE_TRANSITION_EXIT)
-                .build();
+        Geofence fence = GeofenceArmer.fence(id, lat, lng, radius.floatValue());
         GeofencingRequest req = new GeofencingRequest.Builder()
                 .setInitialTrigger(0)
                 .addGeofences(Collections.singletonList(fence))

@@ -565,7 +565,7 @@ public class LocationUpdateReceiver extends BroadcastReceiver {
                 // background (the JS battery listener only runs foreground).
                 int batt = SupabaseRest.currentBatteryLevel(ctx);
                 if (batt >= 0) upd.put("battery", batt);
-                writePin(prefs, rest, memberId, upd, nowMs);
+                writePin(prefs, rest, memberId, upd, lats[last], lngs[last], nowMs);
             } catch (JSONException e) {
                 Log.w(TAG, "pin update payload build failed", e);
             }
@@ -698,9 +698,10 @@ public class LocationUpdateReceiver extends BroadcastReceiver {
      * answer changes.
      */
     private static void writePin(PrefsStore prefs, SupabaseRest rest, String memberId,
-                                 JSONObject upd, long nowMs) throws JSONException {
+                                 JSONObject upd, double lat, double lng, long nowMs)
+            throws JSONException {
         final String sent = prefs.getLastPlaceSent();
-        final String want = GeofenceReceiver.lastPlaceNow(prefs, sent);
+        final String want = GeofenceReceiver.lastPlaceNow(prefs, sent, lat, lng);
         final boolean withPlace = !want.equals(sent);
         if (withPlace) upd.put("last_place_id", want.isEmpty() ? JSONObject.NULL : want);
         int status = rest.updateMemberStatus(memberId, upd);

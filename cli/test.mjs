@@ -797,7 +797,8 @@ console.log('\napp: where a member is');
   const slack = Number((app.match(/const CHECKED_IN_SLACK_M = (\d+);/) || [])[1]);
   const nearMax = Number((app.match(/const NEAR_PLACE_MAX_M = (\d+);/) || [])[1]);
   const heads = ['function distanceM(lat1, lng1, lat2, lng2)', 'function formatCoords(lat, lng)',
-    'function placeContaining(lat, lng)', 'function nearestPlace(lat, lng)', 'function formatDistance(m)',
+    'function placeContaining(lat, lng)', 'function pickPlace(here, lat, lng)',
+    'function nearestPlace(lat, lng)', 'function formatDistance(m)',
     'function checkedInPlace(m)', 'function whereIs(m)', 'async function loadPlaces()'];
   const srcs = heads.map(cutFromApp);
   if (srcs.some((s) => !s) || !slack || !nearMax) {
@@ -835,6 +836,154 @@ console.log('\napp: where a member is');
     check('launch seeds the place the member is checked into', r.length === 1 && r[0] === 'h', JSON.stringify(r));
     r = await seed(at({ lat: 0.05, lng: 0 }));
     check('launch does not seed one their position contradicts', r.length === 0, JSON.stringify(r));
+
+    // Inside two places at once (4.12.1). It used to be whichever came first
+    // in the list. The same rule as GeofenceReceiver.pickPlace (LastPlaceTest).
+    // Home and a bigger school side by side, centres ~117 m apart, and a town
+    // around both.
+    const nextHome = { id: 'd', name: 'Home', icon: '🏠', lat: 0, lng: 0, radius_m: 100 };
+    const school = { id: 'e', name: 'School', icon: '🏫', lat: 0.00105, lng: 0, radius_m: 130 };
+    const town = { id: 'f', name: 'Town', icon: '🏙', lat: 0.0004, lng: 0, radius_m: 2000 };
+    const S2 = { places: [town, school, nextHome], members: [], myId: 'me', insidePlaces: new Set() };
+    const w2 = (await make(S2)).whereIs;
+    const no = (lat) => w2({ last_place_id: null, lat, lng: 0 });
+    check('in the shared strip, nearer the school: At School', no(0.00075) === 'At 🏫 School', no(0.00075));
+    check('in the shared strip, nearer home: At Home', no(0.0004) === 'At 🏠 Home', no(0.0004));
+    // The far edge of home, away from the school: 142 m from the town's
+    // centre, so by share of radius the town is far nearer (0.07 against 0.98).
+    check('at the edge of a home inside a town: At Home, not the town',
+      no(-0.00088) === 'At 🏠 Home', no(-0.00088));
+    check('in the town and nowhere else: At Town', no(-0.005) === 'At 🏙 Town', no(-0.005));
+  }
+}
+
+// The web app's arrivals and departures, cut out of app.js (4.12.1). Every
+// arrival waits ARRIVAL_DWELL_MS, so a drive through a place says nothing,
+// and of places side by side that overlap, the one whose middle is nearer is
+// where they are. Owner report 2026-11-02: a child's home and school 117 m
+// apart, both at 100 m, and nine alerts at pickup of which two were true.
+// GeofenceReceiver applies the same rules to Play Services' events
+// (HeldArrivalTest); this is the same day from positions alone.
+console.log('\napp: arrivals wait, and overlapping places are one at a time');
+{
+  const app = fs.readFileSync(path.join(REPO, 'app.js'), 'utf8');
+  const java = fs.readFileSync(path.join(REPO,
+    'android/app/src/main/java/com/roamkeep/app/geofence/GeofenceReceiver.java'), 'utf8');
+  const ms = (src, re) => { const m = src.match(re); return m ? Function('return ' + m[1].replace(/_/g, ''))() : NaN; };
+  const dwell = ms(app, /const ARRIVAL_DWELL_MS = ([^;]+);/);
+  const nativeDwell = ms(java, /static final long CONFIRM_DWELL_MS = ([^;]+);/);
+  const minR = Number((app.match(/const PLACE_MIN_RADIUS_M = (\d+);/) || [])[1]);
+  check('the web app waits as long as the phone does', dwell > 0 && dwell === nativeDwell,
+    dwell + ' against ' + nativeDwell);
+  const heads = ['function distanceM(lat1, lng1, lat2, lng2)', 'function pickPlace(here, lat, lng)',
+    'function partiallyOverlap(a, b)', 'function arrivalSteps(places, inside, held, lat, lng, nowMs)',
+    'function overlapNote(lat, lng, radius, selfId)'];
+  const srcs = heads.map(cutFromApp);
+  if (srcs.some((s) => !s) || !dwell || !minR) {
+    check('arrival functions found in app.js', false, 'moved or renamed');
+  } else {
+    const S = { places: [] };
+    const { arrivalSteps, overlapNote } = new Function('S', `
+      const ARRIVAL_DWELL_MS = ${dwell}, PLACE_MIN_RADIUS_M = ${minR};
+      ${srcs.join('\n')}
+      return { arrivalSteps, overlapNote };`)(S);
+    const M = 111_194.93;   // metres in a degree of latitude, near enough
+    const pl = (id, northM, r) => ({ id, name: id, icon: '', lat: northM / M, lng: 0, radius_m: r });
+    const home = pl('home', 0, 100), school = pl('school', 117, 100);
+    const D = Date.UTC(2026, 10, 2);
+    const at = (h, m, s = 0) => D + ((h * 60 + m) * 60 + s) * 1000;
+    // Fixes every `step` ms, moving in a straight line from `from` to `to` m north.
+    const go = (t0, t1, from, to, step) => {
+      const pts = [];
+      for (let t = t0; t <= t1; t += step) pts.push([t, from + (to - from) * (t - t0) / (t1 - t0)]);
+      return pts;
+    };
+    const run = (places, seed, plan) => {
+      let inside = new Set(seed), held = new Map();
+      const out = [];
+      for (const [t, n] of plan) {
+        const s = arrivalSteps(places, inside, held, n / M, 0, t);
+        inside = s.inside; held = s.held;
+        for (const l of s.leave) out.push({ type: 'left', id: l.id, t: l.t });
+        for (const a of s.arrive) out.push({ type: 'arrived', id: a.id, t: a.t });
+      }
+      return out;
+    };
+    const said = (out) => out.map((e) => e.type + ' ' + e.id).join(', ') || 'nothing';
+
+    // A drive through a place 1 km up the road, at 15 m/s.
+    const shop = pl('shop', 1000, 100);
+    let out = run([shop], [], go(at(9, 0), at(9, 0, 20), 850, 1150, 2000));
+    check('a drive through a place says nothing', out.length === 0, said(out));
+    out = run([shop], [], [...go(at(9, 0), at(9, 0, 10), 850, 1000, 2000),
+      ...go(at(9, 0, 12), at(9, 2, 10), 1000, 1000.1, 10000), ...go(at(9, 2, 12), at(9, 2, 22), 1000, 1150, 2000)]);
+    check('a two-minute stop says nothing either', out.length === 0, said(out));
+    out = run([shop], [], [...go(at(9, 0), at(9, 0, 10), 850, 1000, 2000),
+      ...go(at(9, 0, 12), at(9, 10), 1000, 1000.1, 10000), ...go(at(9, 10, 2), at(9, 10, 12), 1000, 1150, 2000)]);
+    check('a stay is announced, then its departure', said(out) === 'arrived shop, left shop', said(out));
+    const enter = out[0] && out[0].t;
+    check('the arrival keeps the time they got there', enter > at(9, 0) && enter < at(9, 0, 12),
+      new Date(enter).toISOString());
+    const announcedAt = (() => {
+      let inside = new Set(), held = new Map();
+      for (const [t, n] of go(at(9, 0, 12), at(9, 10), 1000, 1000.1, 10000)) {
+        const s = arrivalSteps([shop], inside, held, n / M, 0, t);
+        inside = s.inside; held = s.held;
+        if (s.arrive.length) return t;
+      }
+      return null;
+    })();
+    check('...and is announced once it has lasted the dwell', announcedAt === at(9, 0, 12) + dwell,
+      announcedAt && new Date(announcedAt).toISOString());
+
+    // Monday, the child's day. Home at 0 m, school at 117 m, both 100 m:
+    // home's edge runs through the school yard (100 m), the school's edge
+    // passes 17 m from home, and the middles are equal 58.5 m out.
+    const day = [
+      ...go(at(7, 50), at(8, 0), 0, 0, 30000),        // at home, as the app last said
+      ...go(at(8, 0, 15), at(8, 2), 0, 150, 15000),   // the walk in
+      ...go(at(8, 2, 30), at(15, 0), 150, 150, 600000),
+    ];
+    // Pickup: back and forth across home's edge in the yard for seven minutes.
+    for (let i = 0; i < 7; i++) day.push(...go(at(15, i), at(15, i, 30), i % 2 ? 105 : 90, i % 2 ? 90 : 105, 15000));
+    day.push(...go(at(15, 7, 30), at(15, 9), 105, 105, 30000));
+    day.push(...go(at(15, 9, 15), at(15, 15), 105, 0, 15000));   // the walk home
+    day.push(...go(at(15, 15, 30), at(15, 40), 0, 0, 30000));
+    out = run([home, school], ['home'], day);
+    check('the school day is four alerts: left home, arrived school, left school, arrived home',
+      said(out) === 'left home, arrived school, left school, arrived home', said(out));
+    check('nothing at all at pickup, across home\'s edge in the yard',
+      !out.some((e) => e.t >= at(15, 0) && e.t < at(15, 9)), said(out.filter((e) => e.t >= at(15, 0))));
+    const backHome = out.find((e) => e.type === 'arrived' && e.id === 'home');
+    check('home is arrived at where its middle became the nearer, not at its edge',
+      backHome && backHome.t > at(15, 11) && backHome.t < at(15, 12, 30),
+      backHome && new Date(backHome.t).toISOString());
+
+    // Lingering in the shared ground nearer the school: a hand-over, home's
+    // departure a millisecond before the school's arrival.
+    out = run([home, school], ['home'], [...go(at(8, 0), at(8, 1), 0, 90, 15000),
+      ...go(at(8, 1, 15), at(8, 10), 90, 90, 15000)]);
+    check('a hand-over: left home, then arrived school', said(out) === 'left home, arrived school', said(out));
+    check('...the departure just before the arrival', out.length === 2 && out[0].t === out[1].t - 1);
+    out = run([home, school], ['home'], [...go(at(8, 0), at(8, 1), 0, 90, 15000),
+      ...go(at(8, 1, 15), at(8, 10), 90, 90, 15000), ...go(at(8, 10, 15), at(8, 11), 90, 160, 15000),
+      ...go(at(8, 11, 15), at(8, 20), 160, 160, 60000)]);
+    check('a place handed over says nothing when they leave its circle', said(out) === 'left home, arrived school', said(out));
+
+    // Nesting is not rivalry: leaving a home inside a town is not arriving in the town.
+    const town = pl('town', 300, 2000);
+    out = run([home, town], ['home', 'town'], [...go(at(9, 0), at(9, 5), 0, 500, 15000),
+      ...go(at(9, 5, 15), at(9, 20), 500, 500, 60000)]);
+    check('leaving a home inside a town is only leaving home', said(out) === 'left home', said(out));
+
+    // The editor's note.
+    S.places = [home];
+    check('the editor warns about a place side by side', overlapNote(school.lat, 0, 100, 'school').startsWith('Overlaps '));
+    check('...and gives no radius when even the minimum overlaps', !/A radius of/.test(overlapNote(school.lat, 0, 100, 'school')));
+    check('...and gives one when the slider can keep them apart',
+      /A radius of 200m or less/.test(overlapNote(302 / M, 0, 210, 'x')), overlapNote(302 / M, 0, 210, 'x'));
+    S.places = [town];
+    check('...but not about a home inside its town', overlapNote(0, 0, 100, 'home') === '');
   }
 }
 
@@ -1027,7 +1176,8 @@ console.log('\napp: a drive and a walk are two trips');
   const consts = names.map((n) => (app.match(new RegExp('const ' + n + ' += [^;]+;')) || [])[0]);
   const srcs = ['function distanceM(lat1, lng1, lat2, lng2)', 'function segmentTrips(pts)',
     'function isRealTrip(t)', 'function legSpeeds(trip)', 'function trustedSpeed(trip, i, legMs, legOk)',
-    'function tripStats(trip)', 'function splitWalkLegs(trip)', 'function tripsFrom(pts)'].map(cutFromApp);
+    'function tripStats(trip)', 'function splitWalkLegs(trip)', 'function tripsFrom(pts, stops)',
+    'function splitAtStops(trip, stops)'].map(cutFromApp);
   const memo = (app.match(/const _tripsMemo = [^;]+;/) || [])[0];
   if (srcs.some((s) => !s) || consts.some((s) => !s) || !memo) {
     check('trip functions found in app.js', false, 'moved or renamed');
@@ -1089,7 +1239,122 @@ console.log('\napp: a drive and a walk are two trips');
     const legs = tripsFrom(route([DRIVE, PARK, WALK]));
     check('a drive or walk drawn on its own stays one trip', legs.length === 2
       && legs.every((x) => tripsFrom(x.pts.slice()).length === 1));
+
+    // A school drop-off (4.12.1): drive, five minutes at a saved place where
+    // nothing is written, drive on. That is shorter than TRIP_GAP_MS, so it
+    // was one drive, and History listed the stay after the drive it fell in.
+    const at = (p) => new Date(p.recorded_at).getTime();
+    const leg1 = route([DRIVE]);
+    const t1 = at(leg1[leg1.length - 1]), t2 = t1 + 5 * 60 * 1000;
+    const leg2 = route([DRIVE]).map((p) => ({ ...p, lat: p.lat + leg1[leg1.length - 1].lat + 0.001,
+      recorded_at: new Date(at(p) - at(leg1[0]) + t2).toISOString() }));
+    const drop = leg1.concat(leg2);
+    const stay = { startMs: t1 + 20e3, endMs: t2 - 20e3 };
+    check('without its stay, a drop-off is one drive', tripsFrom(drop).length === 1);
+    const cut = tripsFrom(drop, [stay]);
+    check('the stay at a saved place cuts the drive in two', modes(cut) === 'drive+drive', modes(cut));
+    check('every point is in one of the two', cut.length === 2
+      && cut[0].pts.length + cut[1].pts.length === drop.length);
+    check('the first ends before the stay and the second starts after it', cut.length === 2
+      && cut[0].endMs <= stay.startMs && cut[1].startMs >= stay.endMs);
+    check('a stop the trip only starts in cuts nothing (a late departure)',
+      tripsFrom(drop.slice(), [{ startMs: at(drop[0]) - 60e3, endMs: at(drop[0]) + 60e3 }]).length === 1);
+    check('a stop that would leave a side too short to be a trip cuts nothing',
+      tripsFrom(drop.slice(), [{ startMs: at(drop[0]) + 3e3, endMs: at(drop[0]) + 8e3 }]).length === 1);
+    check('each half drawn on its own stays one trip',
+      cut.every((x) => tripsFrom(x.pts.slice()).length === 1));
+    check('the same points asked again without stops are not served the cut answer',
+      tripsFrom(drop, [stay]).length === 2 && tripsFrom(drop).length === 1);
   }
+}
+
+// Stays in History, paired per place (4.12.1). One stay used to be open at a
+// time and a "left" ended whichever it was, so someone inside two overlapping
+// places (a home next to a school) got the wrong one ended and an invented
+// "School, from midnight".
+console.log('\napp: History pairs each stay with its own place');
+{
+  const srcs = ['function distanceM(lat1, lng1, lat2, lng2)',
+    'function staysFrom(prior, checkins, dayStartMs, endMs)'].map(cutFromApp);
+  if (srcs.some((s) => !s)) {
+    check('stay functions found in app.js', false, 'moved or renamed');
+  } else {
+    const home = { id: 'h', name: 'Home', icon: '🏠', lat: 0, lng: 0, radius_m: 100 };
+    const school = { id: 's', name: 'School', icon: '🏫', lat: 0.00105, lng: 0, radius_m: 100 };
+    const shop = { id: 'p', name: 'Shop', icon: '🛒', lat: 0.02, lng: 0, radius_m: 100 };
+    const S = { places: [home, school, shop] };
+    const staysFrom = new Function('S', `${srcs.join('\n')}\nreturn staysFrom;`)(S);
+    const day = Date.UTC(2026, 10, 2), hm = (h, m) => day + (h * 60 + m) * 60e3;
+    const ci = (type, p, h, m) => ({ type, place: p.icon + ' ' + p.name, place_id: p.id,
+      created_at: new Date(hm(h, m)).toISOString() });
+    const show = (stays) => stays.map((s) => s.place.split(' ')[1] + ' '
+      + (s.fromPrev ? 'midnight' : new Date(s.startMs).toISOString().slice(11, 16)) + '-'
+      + (s.stillThere ? 'now' : new Date(s.endMs).toISOString().slice(11, 16))).join(', ');
+    const end = hm(20, 0);
+
+    let out = show(staysFrom([ci('arrived', home, -2, 0)], [
+      ci('arrived', school, 8, 1), ci('left', home, 8, 3), ci('left', school, 15, 10),
+      ci('arrived', home, 15, 12)], day, end));
+    check('home next to school: each left ends its own stay',
+      out === 'Home midnight-08:03, School 08:01-15:10, Home 15:12-now', out);
+
+    out = show(staysFrom([ci('arrived', home, -2, 0)], [ci('arrived', school, 8, 1),
+      ci('left', school, 15, 10)], day, end));
+    check('home never left by the fences: both stays shown, home all day',
+      out === 'School 08:01-15:10, Home midnight-now', out);
+
+    out = show(staysFrom([ci('arrived', home, -2, 0)], [ci('arrived', shop, 9, 0),
+      ci('left', shop, 9, 30)], day, end));
+    check('an arrival somewhere apart still ends a stay whose departure was lost',
+      out === 'Home midnight-09:00, Shop 09:00-09:30', out);
+
+    out = show(staysFrom([ci('arrived', home, -30, 0), ci('arrived', school, -10, 0),
+      ci('left', home, -9, 58)], [ci('left', school, 15, 0)], day, end));
+    check('inside one of two overlapping places at midnight: that one from midnight',
+      out === 'School midnight-15:00', out);
+
+    out = show(staysFrom([], [ci('left', shop, 7, 0)], day, end));
+    check('a left with no arrival still reads as a stay from midnight', out === 'Shop midnight-07:00', out);
+
+    const old = { type: 'arrived', place: '🏠 Home', place_id: null, created_at: new Date(hm(7, 0)).toISOString() };
+    out = show(staysFrom([], [old, { ...old, type: 'left', created_at: new Date(hm(8, 0)).toISOString() }], day, end));
+    check('rows from before place_id existed pair on the place text', out === 'Home 07:00-08:00', out);
+  }
+}
+
+console.log('\napp: Share journal sends the whole journal');
+{
+  const src = cutFromApp('function diagnosticsText(d, now)');
+  if (!src) {
+    check('diagnosticsText found in app.js', false, 'moved or renamed');
+  } else {
+    const diagnosticsText = new Function(`${src}\nreturn diagnosticsText;`)();
+    const t0 = Date.UTC(2026, 10, 2, 7, 0, 0);
+    const entries = Array.from({ length: 120 }, (_, i) => ({ t: t0 + i * 61e3, e: 'line ' + i }));
+    const now = new Date(t0 + 3 * 3600e3);
+    const text = diagnosticsText({ rows: [['App version', '4.12.1 (83)'], [' · judged stationary', '3']],
+      entries, exits: [] }, now);
+    const lines = text.split('\n');
+    const off = -now.getTimezoneOffset();
+    const tz = 'UTC' + (off < 0 ? '-' : '+') + String(Math.floor(Math.abs(off) / 60)).padStart(2, '0') + ':'
+      + String(Math.abs(off) % 60).padStart(2, '0');
+    check('the header says which offset the times are in', lines[0].includes('(times are ' + tz + ')'), lines[0]);
+    check('every journal line is in it, not the 40 on screen',
+      lines.filter((l) => / · line \d+$/.test(l)).length === 120);
+    const first = lines.findIndex((l) => l.endsWith(' · line 0'));
+    check('oldest first', first > 0 && lines[first + 119].endsWith(' · line 119'));
+    check('the readout rows come first', lines.includes('App version: 4.12.1 (83)')
+      && lines.indexOf('App version: 4.12.1 (83)') < first);
+    check('times carry seconds', /\d{2}:\d{2}:\d{2}/.test(lines[first]), lines[first]);
+    check('no process-death heading when there were none', !text.includes('Process deaths'));
+    const withExit = diagnosticsText({ rows: [], entries: [],
+      exits: [{ t: t0, reason: 'LOW_MEMORY', desc: 'killed' }] }, now);
+    check('process deaths are listed when there were some', /Process deaths[^\n]*\n[^\n]* · LOW_MEMORY: killed\n/.test(withExit));
+  }
+  const html = fs.readFileSync(path.join(REPO, 'index.html'), 'utf8');
+  const app = fs.readFileSync(path.join(REPO, 'app.js'), 'utf8');
+  check('the Share journal button reaches its handler', /data-action="share-diag"/.test(html)
+    && /'share-diag': shareDiagnostics,/.test(app));
 }
 
 // The suite read src/index.js as TEXT for the --from checks above and never

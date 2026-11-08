@@ -7,6 +7,44 @@ the app says so, and an owner updates it from **Settings → Family server**.
 An older server keeps working; it just goes without the new features that
 need it.
 
+## 4.12.1 (in testing)
+
+No server update is needed.
+
+- **Driving past a place no longer announces it.** An arrival is now
+  announced once someone has been there for three minutes, so driving
+  through a saved place, or waiting at lights inside one, sends nothing, and
+  nor does the departure that follows. Every arrival alert therefore comes
+  about three minutes late; it shows the time they actually arrived.
+  Departures are not delayed.
+- **Places side by side are one place at a time.** Where a home and a
+  school overlap, someone in the part they share counts as at whichever
+  place's middle they are nearer, so the family hears "left Home" and
+  "arrived School" once, as they cross the middle, rather than a string of
+  arrivals and departures at either edge. A place inside another, like a
+  home inside a town, is not affected.
+- **A short stop no longer hides inside a drive.** A quick stop at a saved
+  place, like a school drop-off, made one long Drive in History, with the
+  stop listed after it. It is now two trips with the stop between them, in
+  History, on the map and in the trip count. It is worked out from arrivals
+  and departures already recorded, so it applies to the past week too.
+- **History handles places that overlap.** Someone inside two places at
+  once, such as a home next to a school, could be shown at the wrong place,
+  or at one "from midnight" they had not been at. Each arrival is now paired
+  with the departure from the same place.
+- **The place editor says when places overlap.** When a place you put down
+  shares ground with another beside it, the editor says how alerts between
+  them work, and when a smaller radius would keep them apart, how small.
+- **Inside two places, the more fitting one is named.** The Family tab names
+  the place whose middle someone is nearer, or the smaller one when it lies
+  inside the other, such as a home inside a town. It used to depend on the
+  order the places were listed in.
+- **Tracking diagnostics can send the whole journal.** The screen shows the
+  newest 40 lines of the phone's diagnostic journal, which keeps up to 120.
+  **Share journal** sends all of it as text, through the share sheet, so
+  someone helping with a problem can see a whole day instead of a
+  screenshot. It goes only where you send it.
+
 ## 4.12.0 (in testing)
 
 No server update is needed.

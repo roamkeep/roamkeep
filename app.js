@@ -182,6 +182,7 @@
     deferredPrompt: null,
     places: [],
     insidePlaces: new Set(),   // place IDs the local user is currently inside
+    heldPlaces: new Map(),     // of those, arrivals not yet announced: id → { t } (arrivalSteps)
     placePicker: null,         // { lat, lng } while picking icon/name for a new place
     placeIcon: '🏠',
     placeRadius: 100,
@@ -189,6 +190,8 @@
     trail: [],                 // breadcrumb points {lat,lng,recorded_at} for trailMemberId
     trailMemberId: null,       // whose trail is currently shown (null = none)
     trailLabel: '24h',         // window label in the trail pill ('24h' or a timeline day)
+    trailCheckins: null,       // the live 24h trail's arrived/left rows; null for one past trip
+    trailStops: null,          // stopsFrom(trailCheckins): where tripsFrom cuts the trail
     trackingMode: 'auto',      // auto | live | balanced | saver
     tlMemberId: null,          // timeline: selected member (defaults to self)
     tlDayOffset: 0,            // timeline: 0 = today … HISTORY_DAYS-1
@@ -1927,6 +1930,15 @@
         if (!ci) return;
         S.checkins.unshift(ci);
         renderCheckins();
+        // The live trail grows as they move; its stops have to keep up, or
+        // the drop-off they just made would not cut the drive on the map.
+        if (S.trailCheckins && S.trailMemberId === ci.member_id
+            && (ci.type === 'arrived' || ci.type === 'left')) {
+          S.trailCheckins = S.trailCheckins.concat(ci);
+          S.trailStops = stopsFrom(S.trailCheckins);
+          updateTrailPill();
+          scheduleDraw();
+        }
         // The activity list still shows everything — it is a log. Only
         // the interruption is gated. Before v13 this toast consulted no
         // preference at all, not even the existing global mute, so a
@@ -2484,17 +2496,59 @@
   // so the same array grows; and the places signature because isRealTrip
   // reads S.places, and a trail computed before loadPlaces returned would
   // otherwise stay cached against an empty list.
+  //
+  // `stops` (4.12.1) are the member's finished stays at saved places, from
+  // staysFrom: the map passes the 24h trail's, History the day's. Without
+  // them nothing is split at a stop, which is what a single trip drawn on its
+  // own wants.
   const _tripsMemo = new WeakMap();
-  function tripsFrom(pts) {
+  function tripsFrom(pts, stops) {
     if (!pts || !pts.length) return [];
     const sig = placesSignature();
     const len = pts.length;
     const lastAt = pts[len - 1].recorded_at;
     const hit = _tripsMemo.get(pts);
-    if (hit && hit.sig === sig && hit.len === len && hit.lastAt === lastAt) return hit.trips;
-    const trips = segmentTrips(pts).flatMap(splitWalkLegs).map(tripStats).filter(isRealTrip);
-    _tripsMemo.set(pts, { sig, len, lastAt, trips });
+    if (hit && hit.sig === sig && hit.len === len && hit.lastAt === lastAt
+        && hit.stops === stops) return hit.trips;
+    const trips = segmentTrips(pts).flatMap(t => splitAtStops(t, stops))
+      .flatMap(splitWalkLegs).map(tripStats).filter(isRealTrip);
+    _tripsMemo.set(pts, { sig, len, lastAt, stops, trips });
     return trips;
+  }
+
+  // A stop at a saved place ends one trip and starts the next (4.12.1).
+  //
+  // Nothing is written while someone is inside a place, so a stop there is a
+  // silence, and one shorter than TRIP_GAP_MS left a single trip running
+  // through it. A school drop-off read "Drive 08:00–08:30" in History, with
+  // the school, 08:10 to 08:15, listed after the drive it happened in (owner
+  // report 2026-11-02). The family's own arrived/left pair is the best
+  // evidence of a stop there is, so that is where it is cut.
+  //
+  // Only a stop that lies wholly inside the trip: a departure filed a minute
+  // after the first breadcrumb (Play Services is often that late) is not a
+  // stop in the middle of anything. A fix taken during the stop goes to the
+  // nearer end, which is where a late exit's first fixes belong.
+  //
+  // Like splitWalkLegs, it labels and never hides: both sides must be real
+  // trips on their own or the trip stays whole. Unlike it, the pieces share
+  // no point, because what lies between them is the stay.
+  function splitAtStops(trip, stops) {
+    if (!stops || !stops.length || trip.length < 4) return [trip];
+    const at = (p) => new Date(p.recorded_at).getTime();
+    const t0 = at(trip[0]), t1 = at(trip[trip.length - 1]);
+    for (const s of stops) {
+      if (!(s.startMs > t0 && s.endMs < t1)) continue;
+      const before = [], after = [];
+      for (const p of trip) {
+        const t = at(p);
+        if (t <= s.startMs || (t < s.endMs && t - s.startMs < s.endMs - t)) before.push(p);
+        else after.push(p);
+      }
+      if (!isRealTrip(tripStats(before)) || !isRealTrip(tripStats(after))) continue;
+      return [...splitAtStops(before, stops), ...splitAtStops(after, stops)];
+    }
+    return [trip];
   }
 
   function drawArrowhead(ctx, x0, y0, x1, y1, color) {
@@ -2519,7 +2573,7 @@
     // The same filtered list the timeline shows. Sub-threshold clusters now
     // vanish from the map too, which is the point: a day spent at home should
     // render as an empty map, not as a scribble the list refuses to explain.
-    const trips = tripsFrom(pts);
+    const trips = tripsFrom(pts, S.trailStops);
     if (!trips.length) return;
     ctx.save();
     ctx.lineJoin = 'round';
@@ -2951,10 +3005,9 @@
     }
   }
 
-  async function renderDiagnostics() {
-    const host = $('diag-rows');
-    if (!host) return;
-    clear(host);
+  // What the readout shows, gathered once for the screen and for Share
+  // journal alike, so the text someone sends is what they were looking at.
+  async function collectDiagnostics() {
     const rows = [];
 
     let version = '—';
@@ -3017,6 +3070,32 @@
         S.lastFixMs ? timeAgo(new Date(S.lastFixMs).toISOString()) : 'never', null]);
     }
 
+    // Black-box journal + process-death history (native only). The
+    // journal is what the pipeline was doing while nobody watched —
+    // doze transitions, service lifecycle, geofence fires — and the
+    // exits are the OS's own record of every time our process died
+    // and why. Together they made the doze-stall diagnosis possible
+    // without adb.
+    let entries = [], exits = [];
+    const NG2 = isNative() ? nativeGeo() : null;
+    if (NG2 && typeof NG2.getJournal === 'function') {
+      try {
+        const j = await NG2.getJournal();
+        entries = (j && j.entries) || [];
+        exits = (j && j.exits) || [];
+      } catch (e) { console.warn('getJournal', e); }
+    }
+    return { rows, entries, exits };
+  }
+
+  async function renderDiagnostics() {
+    const host = $('diag-rows');
+    if (!host) return;
+    const { rows, entries, exits } = await collectDiagnostics();
+    clear(host);
+    const share = $('diag-share');
+    if (share) share.hidden = !entries.length;
+
     for (const [label, value, ok] of rows) {
       host.appendChild(el('div', { class: 'diag-row' }, [
         el('div', { class: 'diag-k', text: label }),
@@ -3027,38 +3106,61 @@
       ]));
     }
 
-    // Black-box journal + process-death history (native only). The
-    // journal is what the pipeline was doing while nobody watched —
-    // doze transitions, service lifecycle, geofence fires — and the
-    // exits are the OS's own record of every time our process died
-    // and why. Together they made the doze-stall diagnosis possible
-    // without adb; render them so the next one needs only a screenshot.
-    const NG2 = isNative() ? nativeGeo() : null;
-    if (NG2 && typeof NG2.getJournal === 'function') {
-      try {
-        const j = await NG2.getJournal();
-        const fmtT = (ms) => new Date(ms).toLocaleString([], {
-          weekday: 'short', hour: '2-digit', minute: '2-digit'
-        });
-        const entries = (j && j.entries) || [];
-        if (entries.length) {
-          host.appendChild(el('div', { class: 'diag-sub', text: '📓 Pipeline journal (newest first)' }));
-          for (const e of entries.slice(-40).reverse()) {
-            host.appendChild(el('div', { class: 'diag-log', text: fmtT(e.t) + ' · ' + e.e }));
-          }
-        }
-        const exits = (j && j.exits) || [];
-        if (exits.length) {
-          host.appendChild(el('div', { class: 'diag-sub', text: '💀 Process deaths (OS record)' }));
-          for (const x of exits.slice(0, 10)) {
-            host.appendChild(el('div', {
-              class: 'diag-log',
-              text: fmtT(x.t) + ' · ' + x.reason + (x.desc ? ': ' + x.desc : '')
-            }));
-          }
-        }
-      } catch (e) { console.warn('getJournal', e); }
+    // The newest 40 on screen; Share journal sends all of it.
+    const fmtT = (ms) => new Date(ms).toLocaleString([], {
+      weekday: 'short', hour: '2-digit', minute: '2-digit'
+    });
+    if (entries.length) {
+      host.appendChild(el('div', { class: 'diag-sub', text: '📓 Pipeline journal (newest first)' }));
+      for (const e of entries.slice(-40).reverse()) {
+        host.appendChild(el('div', { class: 'diag-log', text: fmtT(e.t) + ' · ' + e.e }));
+      }
     }
+    if (exits.length) {
+      host.appendChild(el('div', { class: 'diag-sub', text: '💀 Process deaths (OS record)' }));
+      for (const x of exits.slice(0, 10)) {
+        host.appendChild(el('div', {
+          class: 'diag-log',
+          text: fmtT(x.t) + ' · ' + x.reason + (x.desc ? ': ' + x.desc : '')
+        }));
+      }
+    }
+  }
+
+  /**
+   * The readout as plain text, for Share journal (4.12.1). The phone keeps
+   * 120 journal lines and the screen shows 40, so the evidence for a bug on
+   * someone else's phone used to be screenshots taken the same evening, or
+   * nothing. This is all of it, oldest first, with seconds and the UTC
+   * offset so lines can be matched against the server's check-in times.
+   */
+  function diagnosticsText(d, now) {
+    const off = -now.getTimezoneOffset();
+    const pad = (n) => String(n).padStart(2, '0');
+    const tz = 'UTC' + (off < 0 ? '-' : '+') + pad(Math.floor(Math.abs(off) / 60)) + ':' + pad(Math.abs(off) % 60);
+    const fmt = (ms) => new Date(ms).toLocaleString([], {
+      weekday: 'short', day: 'numeric', month: 'short',
+      hour: '2-digit', minute: '2-digit', second: '2-digit'
+    });
+    const out = ['Roamkeep diagnostics, ' + fmt(now.getTime()) + ' (times are ' + tz + ')', ''];
+    for (const [label, value] of d.rows) out.push(label + ': ' + value);
+    out.push('', 'Journal, oldest first (' + d.entries.length + ' lines):');
+    for (const e of d.entries) out.push(fmt(e.t) + ' · ' + e.e);
+    if (d.exits.length) {
+      out.push('', 'Process deaths (OS record):');
+      for (const x of d.exits) out.push(fmt(x.t) + ' · ' + x.reason + (x.desc ? ': ' + x.desc : ''));
+    }
+    return out.join('\n') + '\n';
+  }
+
+  // Through the share sheet the person picks, which has Copy too, and to
+  // nowhere else. Where nothing can share, it is copied, as an invite is.
+  async function shareDiagnostics() {
+    const text = diagnosticsText(await collectDiagnostics(), new Date());
+    const r = await shareText('Roamkeep diagnostics', text);
+    if (r === 'shared' || r === 'cancelled') return;
+    if (await copyText(text)) toast('Journal copied. Paste it into a message', 'ok');
+    else toast('Couldn’t share or copy the journal', 'err');
   }
 
   // `whenMs` is the epoch-ms timestamp the OS stamped on the location
@@ -3234,68 +3336,130 @@
     return false;
   }
 
-  // Called from pushLocation on every GPS tick. For each place, if the
-  // user just crossed the boundary we insert an arrived/left check-in
-  // and update keep_members.last_place_id. The insidePlaces Set keeps
-  // the transition edge — without it we'd spam check-ins.
+  // How long an arrival must last before it is announced (4.12.1): the same
+  // as the native CONFIRM_DWELL_MS, which cli/test.mjs checks. A drive
+  // through a place used to send "arrived" and "left" a minute apart.
+  const ARRIVAL_DWELL_MS = 3 * 60_000;
+
+  // Two places that share ground without either lying inside the other: side
+  // by side, one place at a time (4.12.1). A home inside a town is nesting,
+  // and in both on purpose. GeofenceReceiver.partiallyOverlap is the same.
+  function partiallyOverlap(a, b) {
+    const d = distanceM(a.lat, a.lng, b.lat, b.lng);
+    return d < a.radius_m + b.radius_m
+      && d + Math.min(a.radius_m, b.radius_m) > Math.max(a.radius_m, b.radius_m);
+  }
+
+  // The web app's arrivals and departures from one fix (4.12.1), by the
+  // native rules (GeofenceReceiver), for a browser with no native plugin.
+  // Pure, for cli/test.mjs. `inside` is every place the fix is in; `held`
+  // the arrivals among them not yet announced, id → { t }.
+  //  - Every arrival is held, and announced for its own time once it has
+  //    lasted ARRIVAL_DWELL_MS. One that ends first is never announced, and
+  //    nor is its departure: a drive through says nothing.
+  //  - Of places side by side that overlap, the one pickPlace chooses is
+  //    where they are. A held place that is not the pick is blocked, and its
+  //    dwell starts again from the first fix that picks it. When it is
+  //    announced, the overlapping place the family was told they were at is
+  //    announced as left a millisecond earlier, and held again, blocked, so
+  //    that it says nothing when they leave it.
+  // The native side has Play Services and fuzzy fixes to weigh; this has a
+  // position every fix and nothing else, so it needs neither.
+  function arrivalSteps(places, inside, held, lat, lng, nowMs) {
+    const byId = new Map(places.map(p => [p.id, p]));
+    const nowIn = new Set(places.filter(p => distanceM(lat, lng, p.lat, p.lng) <= p.radius_m).map(p => p.id));
+    const nextHeld = new Map(held);
+    const arrive = [], leave = [];
+    for (const id of inside) {
+      if (nowIn.has(id) && byId.has(id)) continue;
+      if (nextHeld.delete(id)) continue;     // never announced, so nor is this
+      if (byId.has(id)) leave.push({ id, t: nowMs });
+    }
+    for (const id of nowIn) if (!inside.has(id)) nextHeld.set(id, { t: nowMs, blocked: false });
+    for (const [id, h] of [...nextHeld]) {
+      const p = byId.get(id);
+      if (!p || !nowIn.has(id)) { nextHeld.delete(id); continue; }
+      const rivals = places.filter(q => q.id !== id && nowIn.has(q.id) && partiallyOverlap(p, q));
+      if (rivals.length && pickPlace([p, ...rivals], lat, lng) !== p) {
+        nextHeld.set(id, { t: nowMs, blocked: true });
+        continue;
+      }
+      if (h.blocked) { nextHeld.set(id, { t: nowMs, blocked: false }); continue; }
+      if (nowMs - h.t < ARRIVAL_DWELL_MS) continue;
+      nextHeld.delete(id);
+      for (const r of rivals) {
+        if (nextHeld.has(r.id)) continue;
+        nextHeld.set(r.id, { t: nowMs, blocked: true });
+        leave.push({ id: r.id, t: h.t - 1 });
+      }
+      arrive.push({ id, t: h.t });
+    }
+    return { inside: nowIn, held: nextHeld, arrive, leave };
+  }
+
+  // Called from pushLocation on every GPS tick. The rules are arrivalSteps';
+  // this files what it decides and keeps keep_members.last_place_id with it.
   async function checkGeofenceTransitions(lat, lng, whenIso) {
     if (!S.places || !S.places.length || !S.myId) return;
     const me = S.members.find(m => m.id === S.myId);
     const myName = me ? me.name : 'Someone';
     const myAv = me ? me.avatar : '📍';
-    const ts = whenIso || new Date().toISOString();
+    const nowMs = Date.parse(whenIso || '') || Date.now();
+    // Decided and stored before anything is awaited, so a fix landing while
+    // this one's writes are in flight starts from the new state.
+    const step = arrivalSteps(S.places, S.insidePlaces, S.heldPlaces, lat, lng, nowMs);
+    S.insidePlaces = step.inside;
+    S.heldPlaces = step.held;
     // When the native plugin is handling transitions, Google Play
     // Services is already firing ENTER/EXIT and the BroadcastReceiver
     // is writing check-ins directly. We still maintain the insidePlaces
     // Set locally so the "You are here" UI label stays responsive
     // between GPS fixes, but we must NOT duplicate the DB writes.
-    const nativeActive = !!S._nativeGeoReady;
-    for (const p of S.places) {
-      const inside = distanceM(lat, lng, p.lat, p.lng) <= p.radius_m;
-      const was = S.insidePlaces.has(p.id);
-      if (inside && !was) {
-        S.insidePlaces.add(p.id);
-        if (nativeActive) continue;
-        const { error } = await S.sb.from('checkins').insert({
-          keep_id: S.keepId,
-          member_id: S.myId,
-          member_name: myName,
-          member_avatar: myAv,
-          type: 'arrived',
-          place: p.icon + ' ' + p.name,
-          // v13: `place` is a display string composed right here, so it
-          // can't be matched back to a place after a rename. place_id is
-          // what the per-place mute rule joins on.
-          place_id: p.id,
-          created_at: ts
-        });
-        // 4.11.1: postgrest-js resolves { error } rather than throwing, so a
-        // failed arrival used to be marked as handled and was never filed:
-        // nothing re-sends it until the person leaves and comes back. Undo
-        // the state instead, and the next fix tries again.
-        if (error) { console.warn('arrival not filed', error); S.insidePlaces.delete(p.id); continue; }
-        await S.sb.from('keep_members').update({ last_place_id: p.id })
-          .eq('id', S.myId);
-      } else if (!inside && was) {
-        S.insidePlaces.delete(p.id);
-        if (nativeActive) continue;
-        const { error } = await S.sb.from('checkins').insert({
-          keep_id: S.keepId,
-          member_id: S.myId,
-          member_name: myName,
-          member_avatar: myAv,
-          type: 'left',
-          place: p.icon + ' ' + p.name,
-          place_id: p.id,
-          created_at: ts
-        });
-        if (error) { console.warn('departure not filed', error); S.insidePlaces.add(p.id); continue; }
-        // Clear last_place_id only if this was the one they were in.
-        if (me && me.last_place_id === p.id) {
-          await S.sb.from('keep_members').update({ last_place_id: null })
-            .eq('id', S.myId);
-        }
+    if (S._nativeGeoReady) return;
+    const file = (p, type, t) => S.sb.from('checkins').insert({
+      keep_id: S.keepId,
+      member_id: S.myId,
+      member_name: myName,
+      member_avatar: myAv,
+      type,
+      place: p.icon + ' ' + p.name,
+      // v13: `place` is a display string composed right here, so it
+      // can't be matched back to a place after a rename. place_id is
+      // what the per-place mute rule joins on.
+      place_id: p.id,
+      created_at: new Date(t).toISOString()
+    });
+    const announcedHere = () => S.places.filter(x => S.insidePlaces.has(x.id) && !S.heldPlaces.has(x.id));
+    // Departures first: a hand-over's comes before the arrival it makes way for.
+    for (const l of step.leave) {
+      const p = S.places.find(x => x.id === l.id);
+      if (!p) continue;
+      const { error } = await file(p, 'left', l.t);
+      // 4.11.1: postgrest-js resolves { error } rather than throwing, so a
+      // failed write used to be marked as handled and never filed. Put the
+      // place back as announced, and the next fix tries again. A hand-over's
+      // place is still inside, so there is nothing to put back.
+      if (error) {
+        console.warn('departure not filed', error);
+        if (!S.insidePlaces.has(p.id)) { S.insidePlaces = new Set(S.insidePlaces).add(p.id); }
+        continue;
       }
+      // Only if this was the one they were in. Still at another place, that
+      // one, chosen as the native side chooses (4.12.1); it was null.
+      if (me && me.last_place_id === p.id && !step.arrive.length) {
+        const still = pickPlace(announcedHere(), lat, lng);
+        await S.sb.from('keep_members').update({ last_place_id: still ? still.id : null })
+          .eq('id', S.myId);
+      }
+    }
+    for (const a of step.arrive) {
+      const p = S.places.find(x => x.id === a.id);
+      if (!p) continue;
+      const { error } = await file(p, 'arrived', a.t);
+      // Held again, so the next fix tries again (as above).
+      if (error) { console.warn('arrival not filed', error); S.heldPlaces.set(p.id, { t: a.t, blocked: false }); continue; }
+      await S.sb.from('keep_members').update({ last_place_id: p.id })
+        .eq('id', S.myId);
     }
   }
 
@@ -3577,6 +3741,42 @@
     S.placeIcon = icon;
   }
 
+  // Said in the editor when the place being saved overlaps another side by
+  // side (4.12.1). A warning, never a block: a home next to its school cannot
+  // be kept apart at the 100 m minimum. Where they share ground, someone
+  // counts as at whichever middle is nearer (arrivalSteps and
+  // GeofenceReceiver), so the alert as they cross between them comes where
+  // that changes rather than at either edge. A place inside another, a home
+  // inside a town, is not this: each keeps its own alerts. Where a smaller
+  // radius on the slider would keep them apart, it says how small; when even
+  // the minimum overlaps, it doesn't.
+  function overlapNote(lat, lng, radius, selfId) {
+    const self = { lat, lng, radius_m: radius };
+    const hits = [];
+    let apart = Infinity;
+    for (const p of (S.places || [])) {
+      if (p.id === selfId || !partiallyOverlap(self, p)) continue;
+      hits.push(p.icon + ' ' + p.name);
+      apart = Math.min(apart, distanceM(lat, lng, p.lat, p.lng) - p.radius_m);
+    }
+    if (!hits.length) return '';
+    const names = hits.length === 1 ? hits[0]
+      : hits.slice(0, -1).join(', ') + ' and ' + hits[hits.length - 1];
+    const fit = Math.floor(apart / 5) * 5;
+    return 'Overlaps ' + names + '. Where they share ground, someone counts as at whichever ' +
+      'middle they are nearer, so alerts as they go between them come partway across.' +
+      (fit >= PLACE_MIN_RADIUS_M ? ' A radius of ' + fit + 'm or less keeps them apart.' : '');
+  }
+
+  function renderOverlapNote() {
+    const note = $('pe-overlap-note');
+    if (!note) return;
+    const pk = S.placePicker;
+    const text = pk ? overlapNote(pk.lat, pk.lng, S.placeRadius || PLACE_MIN_RADIUS_M, pk.id) : '';
+    note.hidden = !text;
+    note.textContent = text;
+  }
+
   // A live pin older than this may no longer be where the person is: a still
   // phone refreshes its pin only every PIN_EVERY_* and a doze-bound or
   // switched-off one not at all. Warned about, never blocked.
@@ -3620,6 +3820,7 @@
     }
     const rLbl = $('pe-radius-lbl');
     if (rLbl) rLbl.textContent = String(S.placeRadius);
+    renderOverlapNote();
     const coord = $('pe-coord');
     if (coord) coord.textContent = '📍 ' + lat.toFixed(5) + ', ' + lng.toFixed(5);
     // Directly under the title, not in pe-coord, which sits low in the sheet:
@@ -4091,12 +4292,42 @@
     return Number(lat).toFixed(5) + ', ' + Number(lng).toFixed(5);
   }
 
-  /** The saved place a position is inside, or null. */
+  /** The saved place a position is inside, or null. Inside several, pickPlace
+   *  says which; it used to be whichever came first in the list. */
   function placeContaining(lat, lng) {
-    for (const p of (S.places || [])) {
-      if (distanceM(lat, lng, p.lat, p.lng) <= p.radius_m) return p;
+    return pickPlace((S.places || []).filter(p => distanceM(lat, lng, p.lat, p.lng) <= p.radius_m),
+      lat, lng);
+  }
+
+  /**
+   * Which of several places someone inside all of them is at (4.12.1). The
+   * same rule as GeofenceReceiver.pickPlace, which writes last_place_id; the
+   * two must agree.
+   *
+   * 1. A place that wholly contains another candidate gives way to it: a
+   *    home inside a town says home, wherever in the home they stand.
+   * 2. Of the rest, the one whose centre is nearest as a share of its
+   *    radius: a home and a school side by side, overlapping, say whichever
+   *    middle they are nearer.
+   * 3. No position, or a tie: the smaller place, then the lower id.
+   *
+   * Rule 2 alone gets nesting wrong: at the edge of a home whose town's
+   * centre happens to be close by, the town's share is the smaller.
+   */
+  function pickPlace(here, lat, lng) {
+    const located = typeof lat === 'number' && typeof lng === 'number';
+    const encloses = (p) => here.some(q => q !== p && q.radius_m < p.radius_m
+      && distanceM(p.lat, p.lng, q.lat, q.lng) + q.radius_m <= p.radius_m);
+    let best = null, bestShare = 0;
+    for (const p of here) {
+      if (encloses(p)) continue;
+      const share = located ? distanceM(lat, lng, p.lat, p.lng) / p.radius_m : 0;
+      if (!best || share < bestShare || (share === bestShare && (p.radius_m < best.radius_m
+          || (p.radius_m === best.radius_m && String(p.id) < String(best.id))))) {
+        best = p; bestShare = share;
+      }
     }
-    return null;
+    return best;
   }
 
   /** Nearest saved place and how far, or null when there are no places. */
@@ -4618,6 +4849,10 @@
   // interleaved with trips (segmentTrips over that day's breadcrumbs).
   // Loaded on demand when the tab opens — nothing here runs otherwise.
   const HISTORY_DAYS = 7;
+  // How many arrived/left rows before a day are replayed to find the places
+  // the member woke up inside. A place whose last row is older than this is
+  // not shown as a stay from midnight.
+  const HISTORY_PRIOR_ROWS = 30;
   const TRIP_MIN_M = 120;        // shorter than this is GPS noise, not a trip
   // There is deliberately no "the trip must have gone somewhere" test.
   //
@@ -4805,19 +5040,20 @@
         // All of the day's breadcrumbs (paged) — never truncate a drive.
         fetchHistoryPaged(mid, startIso, endIso, 'lat,lng,speed,recorded_at'),
         S.sb.from('checkins')
-          .select('type,place,created_at')
+          .select('type,place,place_id,created_at')
           .eq('keep_id', S.keepId).eq('member_id', mid)
           .gte('created_at', startIso).lt('created_at', endIso)
           .order('created_at', { ascending: true }).limit(200),
-        // The check-in immediately before the day tells us whether the
-        // member woke up inside a place — without it, a day spent
-        // entirely at home (no transitions) would render empty.
+        // The check-ins before the day tell us which places the member
+        // woke up inside. Without them, a day spent entirely at home (no
+        // transitions) would render empty. Several, not the last one, since
+        // 4.12.1: someone can be inside two overlapping places at midnight.
         S.sb.from('checkins')
-          .select('type,place,created_at')
+          .select('type,place,place_id,created_at')
           .eq('keep_id', S.keepId).eq('member_id', mid)
           .in('type', ['arrived', 'left'])
           .lt('created_at', startIso)
-          .order('created_at', { ascending: false }).limit(1)
+          .order('created_at', { ascending: false }).limit(HISTORY_PRIOR_ROWS)
       ]);
       if (pts.error || cis.error || prior.error) {
         console.warn('loadTimeline', pts.error || cis.error || prior.error);
@@ -4829,7 +5065,7 @@
       // already switched member or day.
       if (mid !== S.tlMemberId || dayStart.getTime() !== tlDayStart(S.tlDayOffset).getTime()) return;
       const entries = buildTimeline(
-        pts.data || [], cis.data || [], (prior.data || [])[0],
+        pts.data || [], cis.data || [], (prior.data || []).slice().reverse(),
         dayStart.getTime(), dayEndMs
       );
       renderTimeline(entries);
@@ -4950,43 +5186,83 @@
     return [lead, drive, tail].filter(Boolean);
   }
 
-  // Merge stays (check-in pairs), trips (breadcrumbs) and one-off events
-  // (manual / SOS check-ins) into a single chronological list.
-  function buildTimeline(points, checkins, priorCheckin, dayStartMs, dayEndMs) {
-    const entries = [];
+  // Stays at saved places, from arrived/left pairs (4.12.1).
+  //
+  // Paired per place: a "left" ends that place's stay. Until 4.12.1 one stay
+  // was open at a time and a "left" ended whichever it was, so someone inside
+  // two overlapping places got the wrong stay ended and an invented one. A
+  // home next to a school read "School 08:01 to 08:03", then "School, from
+  // midnight, left 15:10".
+  //
+  // An arrival still ends any open stay at a place it does not overlap, as it
+  // always did. Nobody is in both, and a departure that was never filed must
+  // not leave a stay open for days. Places that overlap can both be open.
+  //
+  // `prior` (oldest first) is replayed only to find what was open at
+  // midnight; those stays start at dayStartMs. Pure apart from S.places.
+  function staysFrom(prior, checkins, dayStartMs, endMs) {
+    const stays = [];
+    const open = new Map();          // place_id, or the place text before v13
+    const keyOf = (c) => c.place_id || c.place;
+    const placeOf = (id) => (id && (S.places || []).find(p => p.id === id)) || null;
+    const overlap = (a, b) => !!a && !!b
+      && distanceM(a.lat, a.lng, b.lat, b.lng) < a.radius_m + b.radius_m;
+    let recording = false;
+    const close = (key, t, stillThere) => {
+      const s = open.get(key);
+      open.delete(key);
+      if (recording) {
+        stays.push({ kind: 'stay', place: s.place, startMs: s.startMs, endMs: t,
+          fromPrev: !!s.fromPrev, stillThere: !!stillThere });
+      }
+    };
+    const apply = (c) => {
+      const t = new Date(c.created_at).getTime();
+      const key = keyOf(c);
+      if (c.type === 'arrived') {
+        const here = placeOf(c.place_id);
+        for (const [k, s] of [...open]) {
+          if (k === key || !overlap(here, placeOf(s.placeId))) close(k, t);
+        }
+        open.set(key, { place: c.place, placeId: c.place_id || null, startMs: t });
+      } else if (c.type === 'left') {
+        if (open.has(key)) close(key, t);
+        else if (recording) {
+          stays.push({ kind: 'stay', place: c.place, startMs: dayStartMs, endMs: t,
+            fromPrev: true, stillThere: false });
+        }
+      }
+    };
+    prior.forEach(apply);
+    for (const s of open.values()) { s.startMs = dayStartMs; s.fromPrev = true; }
+    recording = true;
+    checkins.forEach(apply);
+    for (const k of [...open.keys()]) close(k, endMs, true);
+    return stays;
+  }
 
-    S.tlTrips = tripsFrom(points).slice();
+  /** The finished stays in a run of check-ins: where tripsFrom cuts a trip. */
+  function stopsFrom(checkins) {
+    return staysFrom([], checkins, 0, Date.now()).filter(s => !s.fromPrev && !s.stillThere);
+  }
+
+  // Merge stays (check-in pairs), trips (breadcrumbs) and one-off events
+  // (manual / SOS check-ins) into a single chronological list. A trip that
+  // ran through a stay is two trips either side of it (splitAtStops), so the
+  // stay is listed between them rather than after the drive it fell in.
+  function buildTimeline(points, checkins, prior, dayStartMs, dayEndMs) {
+    const stays = staysFrom(prior, checkins, dayStartMs, Math.min(Date.now(), dayEndMs));
+    const entries = stays.slice();
+
+    S.tlTrips = tripsFrom(points, stays.filter(s => !s.fromPrev && !s.stillThere)).slice();
     S.tlTrips.forEach((t, i) => { t.idx = i; entries.push(t); });
 
-    // Reconstruct stays. `open` is the stay we're currently inside of;
-    // it's seeded from the last check-in before the day so a day spent
-    // entirely at one place still shows up.
-    let open = null;
-    if (priorCheckin && priorCheckin.type === 'arrived') {
-      open = { place: priorCheckin.place, startMs: dayStartMs, fromPrev: true };
-    }
-    const closeStay = (endMs, stillThere) => {
-      if (!open) return;
-      entries.push({
-        kind: 'stay', place: open.place,
-        startMs: open.startMs, endMs,
-        fromPrev: !!open.fromPrev, stillThere: !!stillThere
-      });
-      open = null;
-    };
     for (const c of checkins) {
-      const t = new Date(c.created_at).getTime();
-      if (c.type === 'arrived') {
-        closeStay(t);               // close any dangling stay first
-        open = { place: c.place, startMs: t };
-      } else if (c.type === 'left') {
-        if (open) closeStay(t);
-        else entries.push({ kind: 'stay', place: c.place, startMs: dayStartMs, endMs: t, fromPrev: true });
-      } else if (c.type === 'sos' || c.type === 'manual') {
+      if (c.type === 'sos' || c.type === 'manual') {
+        const t = new Date(c.created_at).getTime();
         entries.push({ kind: 'event', type: c.type, place: c.place, startMs: t, endMs: t });
       }
     }
-    closeStay(Math.min(Date.now(), dayEndMs), true);
 
     entries.sort((a, b) => a.startMs - b.startMs);
     return entries;
@@ -5068,6 +5344,7 @@
     // keep-wide stream used to tack today's fixes onto yesterday's drive).
     unsubscribeTrail();
     S.trail = trip.pts;
+    S.trailCheckins = S.trailStops = null;   // one trip, already cut
     S.trailMemberId = S.tlMemberId;
     S.trailLabel = tlDayLabel(S.tlDayOffset);
     fitTrail(trip.pts);
@@ -5109,11 +5386,26 @@
       // both paths run it through tripsFrom, and two fetches of one member's
       // points differing only in their columns is how the memo above came to
       // hand the timeline a speed-less answer.
-      const { data, error } = await fetchHistoryPaged(memberId, cutoff, endIso, 'lat,lng,speed,recorded_at');
+      //
+      // The member's arrived/left rows come with it, so the map and the pill
+      // cut trips at the same stops as History (4.12.1). If they can't be
+      // read the trail is drawn uncut, as before, rather than not at all.
+      const [{ data, error }, cis] = await Promise.all([
+        fetchHistoryPaged(memberId, cutoff, endIso, 'lat,lng,speed,recorded_at'),
+        S.sb.from('checkins')
+          .select('type,place,place_id,created_at')
+          .eq('keep_id', S.keepId).eq('member_id', memberId)
+          .in('type', ['arrived', 'left'])
+          .gte('created_at', cutoff)
+          .order('created_at', { ascending: true }).limit(200)
+      ]);
       if (error) { console.warn('loadTrail', error); return; }
+      if (cis.error) console.warn('loadTrail: check-ins', cis.error);
       S.trail = data;
       S.trailMemberId = memberId;
       S.trailLabel = '24h';
+      S.trailCheckins = cis.error ? null : (cis.data || []);
+      S.trailStops = S.trailCheckins ? stopsFrom(S.trailCheckins) : null;
       // The rolling 24h trail is the only one that grows live.
       subscribeTrail(memberId);
       updateTrailPill();
@@ -5123,6 +5415,7 @@
 
   function clearTrail() {
     S.trail = [];
+    S.trailCheckins = S.trailStops = null;
     S.trailMemberId = null;
     unsubscribeTrail();
     updateTrailPill();
@@ -5137,7 +5430,7 @@
     const who = m ? (m.id === S.myId ? 'Your' : m.name + "’s") : 'Member';
     const lbl = $('trail-pill-lbl');
     if (lbl) {
-      const trips = S.trail.length ? tripsFrom(S.trail).length : 0;
+      const trips = S.trail.length ? tripsFrom(S.trail, S.trailStops).length : 0;
       if (!S.trail.length) {
         lbl.textContent = '🧭 ' + who + ' trail · no points yet';
       } else if (!trips) {
@@ -6467,6 +6760,7 @@
     'set-track-mode': (t) => applyTrackingMode(t.dataset.mode),
     'toggle-diag': (t) => toggleDiag(t),
     'refresh-diag': renderDiagnostics,
+    'share-diag': shareDiagnostics,
     'refresh-fix': () => onResume()
   };
 
@@ -6496,6 +6790,7 @@
       S.placeRadius = v;
       const lbl = $('pe-radius-lbl');
       if (lbl) lbl.textContent = String(v);
+      renderOverlapNote();
       scheduleDraw();
     });
 

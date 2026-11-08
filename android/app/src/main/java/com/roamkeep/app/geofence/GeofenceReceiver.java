@@ -87,12 +87,74 @@ public class GeofenceReceiver extends BroadcastReceiver {
     // mistaken for one that just got somewhere.
     static final long TRAVEL_WINDOW_MS = 10 * 60_000;
 
-    // How long a held arrival from travel must go without an EXIT before it
-    // is believed. Same scale as REPAIR_SETTLE_MS and the service's
-    // STILL_AFTER, for the same reason: it separates a real stop from
-    // driving past, and costs a real arrival only a few minutes' delay. The
-    // arrival is announced with its ORIGINAL time, not the confirmation's.
+    // How long a held arrival must go without an EXIT before it is believed:
+    // since 4.12.1 every arrival, and before that one held from travel. Same
+    // scale as REPAIR_SETTLE_MS and the service's STILL_AFTER, for the same
+    // reason: it separates a real stop from driving past, and costs a real
+    // arrival only a few minutes' delay. A car crosses a 100 m place in
+    // seconds and a red light takes a minute or two; walking straight through
+    // one takes about two and a half. The arrival is announced with its
+    // ORIGINAL time, not the confirmation's. Also the loitering delay of
+    // Play Services' DWELL transition (GeofenceArmer.fence), which is one of
+    // the confirmations.
     static final long CONFIRM_DWELL_MS = 3 * 60_000;
+
+    // ── Every arrival waits (4.12.1) ───────────────────────────────
+    //
+    // An ENTER used to be announced at once, so driving through a place sent
+    // "arrived" and "left" a minute apart. Now every arrival is HELD, as a
+    // drift-gated one already was, and it leaves the hold the same two ways:
+    // confirmed once it has lasted CONFIRM_DWELL_MS, and announced for its
+    // ENTER's time; or discarded at its EXIT, and then neither side is
+    // announced. Departures are not held: "left school" is the alert people
+    // wait for, and a "left" is still never sent without its "arrived".
+    //
+    // A precise fix inside no longer confirms anything by itself, because a
+    // car driving through gives exactly those. It turns a drift hold into a
+    // dwell hold instead (judgeHeld).
+    //
+    // What confirms one, since nothing happens at the moment it is due: the
+    // breadcrumb batches (confirmHeldArrivals), Play Services' DWELL
+    // transition, and the EXIT itself (confirmsAtExit). DWELL is the one that
+    // still arrives after an OEM battery manager has killed the service, but
+    // it is never the only one: re-registering the fences resets Play
+    // Services' view, and a DWELL due across a re-arm never comes.
+    //
+    // ── Overlapping places (4.12.1) ────────────────────────────────
+    //
+    // Two places side by side that overlap (neither inside the other) are
+    // one place at a time. Where their circles share ground, the arrival
+    // that counts is the place pickPlace chooses from a precise fix: the one
+    // whose middle is nearer, as a share of its radius. Play Services cannot
+    // say this, because it reports crossings, and the shared ground has none
+    // that mean anything: a home whose edge runs through its school's yard
+    // sent "left Home" and "arrived Home" every few minutes at pickup.
+    //
+    // So a held arrival at a place with a RIVAL (another place we are inside
+    // that overlaps it) is BLOCKED while the evidence says the rival: its
+    // dwell does not count, and it cannot be confirmed at its EXIT or by a
+    // DWELL. A precise fix that picks it unblocks it, and its dwell starts
+    // again from that fix. When it is confirmed, the rival it took over from
+    // is HANDED OVER: its departure is announced for the same moment, and it
+    // becomes a blocked hold while Play Services still has us inside it, so
+    // that its own EXIT, when it comes, announces nothing a second time.
+    //
+    // With no precise fix there is no evidence, and the place already
+    // announced keeps it: a new hold with a rival starts blocked. When a
+    // rival's EXIT leaves a hold with none, it is unblocked from that moment
+    // (releaseRivals).
+    //
+    // Nesting is not rivalry. A home inside a town is in both on purpose,
+    // and leaving the home must not announce arriving in the town.
+
+    // A DWELL from Play Services is counted from its ENTER, and the ENTER's
+    // time here is the triggering fix's. Allow for the two clocks.
+    static final long DWELL_EVENT_SLACK_MS = 30_000;
+
+    // Why a held arrival's dwell is not counting.
+    static final int BLOCK_NONE = 0;
+    static final int BLOCK_RIVAL = 1;   // the evidence says an overlapping place
+    static final int BLOCK_AWAY = 2;    // a precise fix outside it, with a rival to go to
 
     // ── Held departures (4.11.4) ───────────────────────────────────
     //
@@ -169,9 +231,20 @@ public class GeofenceReceiver extends BroadcastReceiver {
 
     // judgeHeld verdicts.
     static final int HOLD_WAIT = 0;
-    static final int HOLD_CONFIRM_POSITION = 1;
-    static final int HOLD_CONFIRM_DWELL = 2;
-    static final int HOLD_DEMOTE = 3;
+    static final int HOLD_CONFIRM = 1;        // announce it, for its ENTER's time
+    static final int HOLD_DEMOTE = 2;         // a drift hold from travel now needs a precise fix inside
+    static final int HOLD_UPGRADE = 3;        // a drift hold, seen inside: now waiting out the dwell
+    static final int HOLD_BLOCK_RIVAL = 4;
+    static final int HOLD_BLOCK_AWAY = 5;
+    static final int HOLD_UNBLOCK = 6;        // its dwell starts again from this fix
+    static final int HOLD_RESTART = 7;        // seen outside, no rival: its dwell starts again
+
+    // What a fix says about one held arrival (positionFor).
+    static final int POS_NONE = 0;    // not a precise fix: no evidence
+    static final int POS_EDGE = 1;    // precise, but too near the edge to tell
+    static final int POS_HERE = 2;    // precise, inside by its error, and no rival nearer
+    static final int POS_AWAY = 3;    // precise and outside by its error
+    static final int POS_RIVAL = 4;   // precise, and an overlapping place is nearer
 
     @Override
     public void onReceive(Context context, Intent intent) {
@@ -215,8 +288,10 @@ public class GeofenceReceiver extends BroadcastReceiver {
             type = "arrived";
         } else if (transition == Geofence.GEOFENCE_TRANSITION_EXIT) {
             type = "left";
+        } else if (transition == Geofence.GEOFENCE_TRANSITION_DWELL) {
+            type = "dwell";   // confirms a held arrival; never one by itself (4.12.1)
         } else {
-            return; // ignore DWELL and anything unknown
+            return;
         }
 
         List<Geofence> triggered = event.getTriggeringGeofences();
@@ -295,6 +370,17 @@ public class GeofenceReceiver extends BroadcastReceiver {
             PrefsStore.Place p = prefs.findPlace(placeId);
             if (p == null) {
                 Log.w(TAG, "triggered unknown geofence " + placeId + " — possibly stale from a previous session");
+                continue;
+            }
+
+            // Play Services has had us inside for the dwell: one of the ways
+            // a held arrival is confirmed (4.12.1). It changes no state, so
+            // it needs none of the gates below.
+            if ("dwell".equals(type)) {
+                if (confirmOnDwell(prefs, rest, p, System.currentTimeMillis())) {
+                    anyAccepted = true;
+                    updateMemberAfter(ctx, prefs, rest, memberId, p, "arrived", isoTime, tLat, tLng);
+                }
                 continue;
             }
 
@@ -378,12 +464,12 @@ public class GeofenceReceiver extends BroadcastReceiver {
                     String outcome;
                     if ("arrived".equals(type)) {
                         if (prefs.claimInsidePlace(placeId)) {
-                            PrefsStore.Motion m = prefs.getMotion();
-                            boolean travel = isTravel(m.valid, m.movingUntilMs,
-                                    prefs.getLastExitMs(), whenMs);
-                            prefs.holdArrival(placeId, whenMs, travel);
+                            boolean travel = travelAt(prefs, whenMs);
+                            int bl = admitArrival(prefs, p, whenMs, travel, false, tLat, tLng,
+                                    tAcc == null ? -1f : tAcc);
                             outcome = "held until confirmed ("
-                                    + (travel ? "arriving from travel" : "no recent travel") + ")";
+                                    + (travel ? "arriving from travel" : "no recent travel")
+                                    + rivalNote(bl) + ")";
                         } else {
                             PrefsStore.HeldExit hx = prefs.claimHeldExit(placeId);
                             outcome = hx == null ? "not announced (already inside)"
@@ -443,21 +529,21 @@ public class GeofenceReceiver extends BroadcastReceiver {
                         prefs.journal("geo: arrived " + p.name + " — already inside; the departure"
                                 + " held since " + hhmm(hx.exitMs) + " was drift, discarded");
                     }
-                    // If that is because the arrival is held, this ENTER —
-                    // one the drift gate let through, so precise or clearly
-                    // on the inside of the edge — is the evidence it was
-                    // waiting for: announce it, with its original time.
-                    PrefsStore.Held held = prefs.claimHeldArrival(placeId);
-                    if (held == null) {
+                    // If that is because the arrival is held by the drift
+                    // gate, this ENTER (one the gate let through, so precise
+                    // or clearly on the inside of the edge) says they are
+                    // there. Until 4.12.1 that announced it; now it waits out
+                    // the dwell like any arrival, because being there is not
+                    // staying, and a car driving through is there too.
+                    PrefsStore.Held held = prefs.getHeldArrivals().get(placeId);
+                    if (held == null || held.dwell) {
                         Log.i(TAG, "duplicate ENTER for " + p.name + " — already inside, skipping");
                         if (hx == null) prefs.journal("geo: duplicate ENTER " + p.name + " dropped");
                         continue;
                     }
-                    prefs.journal("geo: arrived " + p.name + " — held arrival confirmed by an"
-                            + " unambiguous enter, announced for " + hhmm(held.enterMs));
-                    fileCheckin(prefs, rest, p, "arrived", held.enterMs);
-                    anyAccepted = true;
-                    updateMemberAfter(ctx, prefs, rest, memberId, p, "arrived", isoTime, tLat, tLng);
+                    prefs.reviseHeldArrival(placeId, held.enterMs, held.travel, true, held.blocked);
+                    prefs.journal("geo: arrived " + p.name + " — held arrival from "
+                            + hhmm(held.enterMs) + " has an unambiguous enter; waiting out the dwell");
                     continue;
                 }
             } else {
@@ -484,14 +570,17 @@ public class GeofenceReceiver extends BroadcastReceiver {
                 updateMemberAfter(ctx, prefs, rest, memberId, p, "left", isoTime, tLat, tLng);
                 continue;
             }
-            prefs.journal("geo: " + type + " " + p.name);
+            // An arrival, newly inside. Held for the dwell (4.12.1), not
+            // announced: a drive through the place must say nothing. It is
+            // announced by whichever confirmation comes first, for this
+            // ENTER's time, and discarded by an EXIT that comes first.
+            boolean travel = travelAt(prefs, whenMs);
+            int bl = admitArrival(prefs, p, whenMs, travel, true, tLat, tLng,
+                    tAcc == null ? -1f : tAcc);
+            prefs.journal("geo: arrived " + p.name + " — held for " + (CONFIRM_DWELL_MS / 60_000)
+                    + "m before it is announced" + rivalNote(bl));
             anyAccepted = true;
-
-            // The row itself — write-ahead, idempotent, result handled, and
-            // shared with every other path that files a check-in. A failed
-            // POST is already queued, so carry on to the member update: the
-            // avatar should still move.
-            fileCheckin(prefs, rest, p, type, whenMs);
+            // The avatar should still move.
             updateMemberAfter(ctx, prefs, rest, memberId, p, type, isoTime, tLat, tLng);
         }
 
@@ -549,7 +638,12 @@ public class GeofenceReceiver extends BroadcastReceiver {
             }
             int batt = SupabaseRest.currentBatteryLevel(ctx);
             if (batt >= 0) upd.put("battery", batt);
-            String place = lastPlaceNow(prefs, "arrived".equals(type) ? p.id : prefs.getLastPlaceSent());
+            // An arrival still held is not where the family has been told
+            // they are, so it must not displace what was written (4.12.1).
+            boolean announced = "arrived".equals(type)
+                    && !prefs.getHeldArrivals().containsKey(p.id);
+            String place = lastPlaceNow(prefs, announced ? p.id : prefs.getLastPlaceSent(),
+                    tLat, tLng);
             upd.put("last_place_id", place.isEmpty() ? JSONObject.NULL : place);
             if (rest.updateMember(memberId, upd)) {
                 prefs.setLastPlaceSent(place);
@@ -570,10 +664,16 @@ public class GeofenceReceiver extends BroadcastReceiver {
      * family (4.11.4); the 4.8.5 shape is one rule kept on one path only.
      *
      * An arrival still held at its own departure: either the stay itself
-     * proves it (arriving from travel and staying past the dwell, which the
-     * breadcrumb path would normally have confirmed already), or nothing
-     * ever did, and then this departure is not announced either. The family
-     * must never get a "left" without its "arrived".
+     * proves it (staying past the dwell, which the breadcrumb path would
+     * normally have confirmed already), or nothing ever did, and then this
+     * departure is not announced either. The family must never get a "left"
+     * without its "arrived". Since 4.12.1 that is also a drive through.
+     *
+     * A blocked hold says nothing at its EXIT: either an overlapping place
+     * was where they were, and if this one had been announced its departure
+     * went out at the hand-over, or a precise fix had already shown them
+     * gone. Either way the EXIT may leave a hold with no rival, which then
+     * counts from now (releaseRivals).
      *
      * @param depMs when it happened, which becomes created_at
      * @param note  appended to the journal line; "" for a plain transition
@@ -581,18 +681,33 @@ public class GeofenceReceiver extends BroadcastReceiver {
      */
     static boolean settleDeparture(PrefsStore prefs, SupabaseRest rest, PrefsStore.Place p,
                                    long depMs, String note) {
+        boolean announce = true;
         PrefsStore.Held held = prefs.claimHeldArrival(p.id);
         if (held != null) {
-            if (!confirmsAtExit(held.enterMs, held.travel, depMs)) {
+            if (held.blocked == BLOCK_RIVAL) {
+                prefs.journal("geo: left " + p.name + " — an overlapping place was where they"
+                        + " were; nothing to announce");
+                announce = false;
+            } else if (!confirmsAtExit(held.enterMs, held.travel, held.dwell, held.blocked, depMs)) {
                 prefs.journal("geo: left " + p.name + " — its arrival ("
                         + hhmm(held.enterMs) + ") was never confirmed; neither announced");
-                return false;
+                announce = false;
+            } else {
+                announceArrival(prefs, rest, p, held, "confirmed at departure (stayed "
+                        + ((depMs - held.enterMs) / 60_000) + "m)");
             }
-            prefs.journal("geo: arrived " + p.name + " — confirmed at departure (stayed "
-                    + ((depMs - held.enterMs) / 60_000) + "m after arriving from travel),"
-                    + " announced for " + hhmm(held.enterMs));
-            fileCheckin(prefs, rest, p, "arrived", held.enterMs);
         }
+        if (announce) announceLeft(prefs, rest, p, depMs, note);
+        releaseRivals(prefs, p, depMs);
+        return announce;
+    }
+
+    /**
+     * The departure itself, wherever it was decided: an EXIT, a confirmed
+     * held departure, or a hand-over to an overlapping place (4.12.1).
+     */
+    static void announceLeft(PrefsStore prefs, SupabaseRest rest, PrefsStore.Place p,
+                             long depMs, String note) {
         // An ANNOUNCED departure — and only that — counts as recent travel
         // for the next place's held arrival. A discarded one must not: at
         // night that is a drift EXIT, and letting it vouch for the next drift
@@ -600,7 +715,107 @@ public class GeofenceReceiver extends BroadcastReceiver {
         prefs.setLastExitMs(depMs);
         prefs.journal("geo: left " + p.name + note);
         fileCheckin(prefs, rest, p, "left", depMs);
+    }
+
+    /**
+     * Announce a held arrival this caller has claimed: first the hand-over
+     * from any overlapping place the family was told they were at, then the
+     * arrival, both for the ENTER's time. Every confirmation goes through
+     * here (a breadcrumb batch, Play Services' DWELL, the EXIT), so the
+     * hand-over cannot be left off one of them: the 4.8.5 shape is one rule
+     * kept on one path only. The caller brings last_place_id up to date.
+     */
+    static void announceArrival(PrefsStore prefs, SupabaseRest rest, PrefsStore.Place p,
+                                PrefsStore.Held h, String how) {
+        for (PrefsStore.Place r : rivalsOf(p, prefs.getPlaces(), prefs.getInsidePlaceIds())) {
+            // Only one that was announced: claimHandover refuses a held one.
+            if (!prefs.claimHandover(r.id, h.enterMs, BLOCK_RIVAL)) continue;
+            // A millisecond before the arrival, so every list sorted by time
+            // shows the departure first.
+            announceLeft(prefs, rest, r, h.enterMs - 1, " — handed over to " + p.name
+                    + ", announced for " + hhmm(h.enterMs));
+        }
+        prefs.journal("geo: arrived " + p.name + " — " + how + ", announced for " + hhmm(h.enterMs));
+        fileCheckin(prefs, rest, p, "arrived", h.enterMs);
+    }
+
+    /**
+     * After an EXIT: a hold that the departed place was blocking, and that
+     * now has no rival at all, is where they are from this moment (4.12.1),
+     * judged from here on like any arrival. One that still has a rival waits
+     * for a precise fix to choose between them.
+     */
+    static void releaseRivals(PrefsStore prefs, PrefsStore.Place gone, long atMs) {
+        List<PrefsStore.Place> places = prefs.getPlaces();
+        Set<String> inside = prefs.getInsidePlaceIds();
+        for (Map.Entry<String, PrefsStore.Held> e : prefs.getHeldArrivals().entrySet()) {
+            PrefsStore.Held h = e.getValue();
+            if (h.blocked == BLOCK_NONE) continue;
+            PrefsStore.Place q = prefs.findPlace(e.getKey());
+            if (q == null || !partiallyOverlap(q, gone)) continue;
+            if (!rivalsOf(q, places, inside).isEmpty()) continue;
+            prefs.reviseHeldArrival(q.id, atMs, h.travel, true, BLOCK_NONE);
+            prefs.journal("geo: " + q.name + " — " + gone.name + " is behind them, so the dwell"
+                    + " here counts from " + hhmm(atMs));
+        }
+    }
+
+    /**
+     * Play Services' DWELL for a place: confirm its held arrival if the rules
+     * allow (confirmsOnDwellEvent). Never an arrival by itself. True if one
+     * was announced; the caller brings last_place_id up to date.
+     */
+    static boolean confirmOnDwell(PrefsStore prefs, SupabaseRest rest, PrefsStore.Place p,
+                                  long nowMs) {
+        PrefsStore.Held h = prefs.getHeldArrivals().get(p.id);
+        if (h == null) {
+            // Already announced, which is usual: a batch got there first. With
+            // state saying outside, though, its ENTER never reached us.
+            if (!prefs.isInsidePlace(p.id)) {
+                prefs.journal("geo: dwell " + p.name + " while state says outside; its enter"
+                        + " never reached us");
+            }
+            return false;
+        }
+        if (!confirmsOnDwellEvent(h.enterMs, h.travel, h.dwell, h.blocked,
+                prefs.hasHeldExit(p.id), nowMs)) {
+            return false;
+        }
+        PrefsStore.Held c = prefs.claimHeldArrival(p.id);
+        if (c == null) return false;
+        announceArrival(prefs, rest, p, c, "confirmed by Play Services' dwell after "
+                + ((nowMs - c.enterMs) / 60_000) + "m");
         return true;
+    }
+
+    /**
+     * Hold an arrival this caller has just claimed (claimInsidePlace), and
+     * block it if an overlapping place is where they are (4.12.1). Every way
+     * an arrival begins goes through here: the transition, the drift gate
+     * and the missed-arrival repair.
+     *
+     * With a rival and no precise fix there is no evidence either way, and
+     * the place they were already at keeps it.
+     *
+     * @return why it is blocked, BLOCK_NONE if it is not
+     */
+    static int admitArrival(PrefsStore prefs, PrefsStore.Place p, long whenMs, boolean travel,
+                            boolean dwell, Double lat, Double lng, float acc) {
+        List<PrefsStore.Place> rivals = rivalsOf(p, prefs.getPlaces(), prefs.getInsidePlaceIds());
+        int bl = rivals.isEmpty() || positionFor(p, rivals, lat, lng, acc) == POS_HERE
+                ? BLOCK_NONE : BLOCK_RIVAL;
+        prefs.holdArrival(p.id, whenMs, travel, dwell, bl);
+        return bl;
+    }
+
+    /** For a journal line: "" unless blocked by a rival. */
+    private static String rivalNote(int blocked) {
+        return blocked == BLOCK_RIVAL ? "; an overlapping place is where they are, so it waits" : "";
+    }
+
+    private static boolean travelAt(PrefsStore prefs, long whenMs) {
+        PrefsStore.Motion m = prefs.getMotion();
+        return isTravel(m.valid, m.movingUntilMs, prefs.getLastExitMs(), whenMs);
     }
 
     /**
@@ -879,13 +1094,15 @@ public class GeofenceReceiver extends BroadcastReceiver {
             watch.remove(p.id);
             watchChanged = true;
             if (!prefs.claimInsidePlace(p.id)) continue;
+            // Held like every arrival (4.12.1), from the first fix that
+            // showed it, so the dwell it has just waited out counts.
+            // confirmHeldArrivals runs straight after this, on the same fix,
+            // and announces it unless an overlapping place is where they are.
+            int bl = admitArrival(prefs, p, since, travelAt(prefs, since), true, lat, lng, acc);
             prefs.journal("geo: arrived " + p.name + " — recovered from position (no"
-                    + " geofence enter in " + ((whenMs - since) / 60_000) + "m)");
+                    + " geofence enter in " + ((whenMs - since) / 60_000) + "m)" + rivalNote(bl));
             Log.i(TAG, "repaired missed ENTER for " + p.name
                     + " (±" + Math.round(acc) + "m, " + Math.round(d[0]) + "m from centre)");
-
-            fileCheckin(prefs, rest, p, "arrived", whenMs);
-            writeLastPlace(prefs, rest, memberId, p.id);
         }
         if (watchChanged) prefs.setRepairWatch(watch);
     }
@@ -896,8 +1113,10 @@ public class GeofenceReceiver extends BroadcastReceiver {
      * rest, in handleTransitions).
      *
      * Runs on every location batch, which keeps arriving while the device is
-     * parked, so a held arrival from travel is normally announced within a
-     * batch or two of CONFIRM_DWELL_MS rather than at its departure.
+     * parked, so a held arrival is normally announced within a batch or two
+     * of CONFIRM_DWELL_MS rather than at its departure. It is also where the
+     * evidence between overlapping places is weighed (4.12.1): each batch can
+     * block a hold or start its dwell again.
      *
      * @param lat,lng,acc the batch's most PRECISE fix, as for
      *                    repairMissedArrival — the position rules rest on
@@ -911,7 +1130,8 @@ public class GeofenceReceiver extends BroadcastReceiver {
         String memberId = prefs.getMemberId();
         if (prefs.getKeepId() == null || memberId == null) return;
 
-        float[] d = new float[1];
+        List<PrefsStore.Place> places = prefs.getPlaces();
+        Set<String> inside = prefs.getInsidePlaceIds();
         for (Map.Entry<String, PrefsStore.Held> e : held.entrySet()) {
             String id = e.getKey();
             PrefsStore.Held h = e.getValue();
@@ -925,61 +1145,155 @@ public class GeofenceReceiver extends BroadcastReceiver {
                 }
                 continue;
             }
-            Location.distanceBetween(lat, lng, p.lat, p.lng, d);
-            int verdict = judgeHeld(h.enterMs, h.travel, nowMs, d[0], p.radius, acc);
+            List<PrefsStore.Place> rivals = rivalsOf(p, places, inside);
+            int pos = positionFor(p, rivals, lat, lng, acc);
+            int verdict = judgeHeld(h.enterMs, h.travel, h.dwell, h.blocked, !rivals.isEmpty(),
+                    nowMs, pos);
             // "Without an EXIT" includes one that is held (4.11.4): Play
             // Services has said we left, and until that is settled the stay
             // is not proven. settleDeparture applies the dwell instead, up to
             // the departure, if it is confirmed.
-            if (verdict == HOLD_CONFIRM_DWELL && prefs.hasHeldExit(id)) verdict = HOLD_WAIT;
+            if (verdict == HOLD_CONFIRM && prefs.hasHeldExit(id)) verdict = HOLD_WAIT;
             if (verdict == HOLD_WAIT) continue;
+            String fix = "precise fix ±" + Math.round(acc) + "m";
             if (verdict == HOLD_DEMOTE) {
                 prefs.demoteHeldArrival(id);
-                prefs.journal("geo: held arrival at " + p.name + " — precise fix ±"
-                        + Math.round(acc) + "m outside it; now needs a precise fix inside");
+                prefs.journal("geo: held arrival at " + p.name + " — " + fix
+                        + " outside it; now needs a precise fix inside");
                 continue;
             }
-            // Claim before acting: the geofence worker may be settling this
-            // same hold at an EXIT right now, and only one of us may speak.
+            if (verdict == HOLD_UPGRADE) {
+                prefs.reviseHeldArrival(id, h.enterMs, h.travel, true, BLOCK_NONE);
+                prefs.journal("geo: held arrival at " + p.name + " — " + fix
+                        + " inside it; waiting out the dwell from " + hhmm(h.enterMs));
+                continue;
+            }
+            if (verdict == HOLD_BLOCK_RIVAL || verdict == HOLD_BLOCK_AWAY) {
+                boolean rival = verdict == HOLD_BLOCK_RIVAL;
+                prefs.reviseHeldArrival(id, h.enterMs, h.travel, h.dwell,
+                        rival ? BLOCK_RIVAL : BLOCK_AWAY);
+                prefs.journal("geo: held arrival at " + p.name + " — " + fix
+                        + (rival ? " nearer an overlapping place" : " outside it")
+                        + "; its dwell stops until a fix puts them here");
+                continue;
+            }
+            if (verdict == HOLD_UNBLOCK) {
+                prefs.reviseHeldArrival(id, nowMs, h.travel, true, BLOCK_NONE);
+                prefs.journal("geo: held arrival at " + p.name + " — " + fix
+                        + " puts them here; the dwell counts from " + hhmm(nowMs));
+                continue;
+            }
+            if (verdict == HOLD_RESTART) {
+                // Not journalled: driving away before the EXIT lands does
+                // this on every batch. The line that settles the hold says
+                // the time it was announced for.
+                prefs.reviseHeldArrival(id, nowMs, h.travel, true, BLOCK_NONE);
+                continue;
+            }
+            // HOLD_CONFIRM. Claim before acting: the geofence worker may be
+            // settling this same hold at an EXIT right now, and only one of
+            // us may speak.
             PrefsStore.Held c = prefs.claimHeldArrival(id);
             if (c == null) continue;
-            prefs.journal("geo: arrived " + p.name + " — held arrival confirmed "
-                    + (verdict == HOLD_CONFIRM_POSITION
-                        ? "by a precise fix (±" + Math.round(acc) + "m)"
-                        : "after " + ((nowMs - c.enterMs) / 60_000) + "m with no exit (arriving from travel)")
-                    + ", announced for " + hhmm(c.enterMs));
-            fileCheckin(prefs, rest, p, "arrived", c.enterMs);
-            writeLastPlace(prefs, rest, memberId, p.id);
+            announceArrival(prefs, rest, p, c, "held arrival confirmed after "
+                    + ((nowMs - c.enterMs) / 60_000) + "m with no exit");
+            writeLastPlace(prefs, rest, memberId, p.id, lat, lng);
         }
     }
 
     /**
-     * What a fresh fix says about one held arrival. Pure, so the rules can
-     * be tested without a device.
+     * What one fix says about a held arrival at p (4.12.1). Pure.
      *
-     * Position, when the fix is PRECISE (the bar the drift gate itself uses):
-     *   - inside by its whole error radius — no plausible reading puts us
-     *     outside — CONFIRMS it;
-     *   - outside by its whole error radius DEMOTES a hold from travel to one
-     *     that needs a precise fix inside. Its departure may simply not have
-     *     fired yet, and the dwell rule below must not announce a place we
-     *     have visibly left. State is left alone: it tracks Play Services.
-     * Otherwise, time: a hold from travel that has gone CONFIRM_DWELL_MS
-     * without an EXIT is a stop, not a drive-past, and is CONFIRMED.
+     * Only a PRECISE fix (the drift gate's own bar) is evidence. Outside by
+     * its whole error radius is AWAY. With rivals (overlapping places we are
+     * also inside), pickPlace decides between them, so a fix in the shared
+     * ground says the place whose middle is nearer. Without, inside by the
+     * whole error radius is HERE and anything nearer the edge says nothing.
      *
-     * A hold NOT from travel never confirms on time — that is a phone sitting
-     * still near a boundary, which is the case the drift gate exists for.
-     * Play Services can believe "inside" on drift for hours.
-     *
-     * @param accM negative means unknown, which is not precise.
+     * @param rivals rivalsOf(p, ...)
+     * @param accM   negative means unknown, which is not precise
      */
-    static int judgeHeld(long enterMs, boolean travel, long nowMs,
-                         float distM, float radiusM, float accM) {
-        boolean precise = accM >= 0 && accM <= DRIFT_MIN_ACC_M;
-        if (precise && distM < radiusM - accM) return HOLD_CONFIRM_POSITION;
-        if (precise && distM > radiusM + accM) return travel ? HOLD_DEMOTE : HOLD_WAIT;
-        if (travel && nowMs - enterMs >= CONFIRM_DWELL_MS) return HOLD_CONFIRM_DWELL;
-        return HOLD_WAIT;
+    static int positionFor(PrefsStore.Place p, List<PrefsStore.Place> rivals,
+                           Double lat, Double lng, float accM) {
+        if (lat == null || lng == null || accM < 0 || accM > DRIFT_MIN_ACC_M) return POS_NONE;
+        double d = metresBetween(lat, lng, p.lat, p.lng);
+        if (d > p.radius + accM) return POS_AWAY;
+        if (!rivals.isEmpty()) {
+            List<PrefsStore.Place> here = new ArrayList<>(rivals);
+            here.add(p);
+            return pickPlace(here, lat, lng) == p ? POS_HERE : POS_RIVAL;
+        }
+        return d < p.radius - accM ? POS_HERE : POS_EDGE;
+    }
+
+    /**
+     * The places we are inside (Play Services' view) that overlap p without
+     * either containing the other: the ones it is one place at a time with
+     * (4.12.1). Pure.
+     */
+    static List<PrefsStore.Place> rivalsOf(PrefsStore.Place p, List<PrefsStore.Place> places,
+                                           Set<String> inside) {
+        List<PrefsStore.Place> out = new ArrayList<>();
+        for (PrefsStore.Place q : places) {
+            if (q.id.equals(p.id) || !inside.contains(q.id)) continue;
+            if (partiallyOverlap(p, q)) out.add(q);
+        }
+        return out;
+    }
+
+    /**
+     * True when the two circles share ground and neither lies wholly inside
+     * the other, which is nesting (enclosesAnother uses the same edge).
+     */
+    static boolean partiallyOverlap(PrefsStore.Place a, PrefsStore.Place b) {
+        double d = metresBetween(a.lat, a.lng, b.lat, b.lng);
+        return d < a.radius + b.radius
+                && d + Math.min(a.radius, b.radius) > Math.max(a.radius, b.radius);
+    }
+
+    /**
+     * What a fix says about one held arrival, given positionFor's answer.
+     * Pure, so the rules can be tested without a device.
+     *
+     * A BLOCKED hold (4.12.1) waits for a fix that puts them HERE, and then
+     * its dwell starts again from that fix, or for its rivals' EXITs
+     * (releaseRivals). A rival's fix blocks it.
+     *
+     * A DWELL hold, every arrival since 4.12.1, is confirmed once it has gone
+     * CONFIRM_DWELL_MS without an EXIT. A fix inside does not confirm it
+     * sooner: a car driving through gives those. A fix outside starts its
+     * dwell again (RESTART), so a car that has driven on is not announced
+     * while its EXIT is late, and a person who has gone indoors, where no
+     * fix is precise, still is, three minutes on. With a rival to be at
+     * instead, a fix outside blocks it: time alone would announce the place
+     * they have left while they are at the other one.
+     *
+     * A DRIFT hold (4.9.2), made when the ENTER's fix was too fuzzy to trust:
+     *   - a fix HERE says the ENTER was real, and it becomes a dwell hold,
+     *     dated from that ENTER, so it is confirmed at once if the dwell has
+     *     passed (UPGRADE, or CONFIRM);
+     *   - a fix AWAY demotes a hold from travel to one that needs a fix HERE.
+     *     Its departure may simply not have fired yet, and the time rule
+     *     must not announce a place we have visibly left. State is left
+     *     alone: it tracks Play Services;
+     *   - otherwise a hold from travel that has gone CONFIRM_DWELL_MS without
+     *     an EXIT is a stop, not a drive-past, and is CONFIRMED. One NOT from
+     *     travel never confirms on time: that is a phone sitting still near a
+     *     boundary, the case the drift gate exists for. Play Services can
+     *     believe "inside" on drift for hours.
+     */
+    static int judgeHeld(long enterMs, boolean travel, boolean dwell, int blocked,
+                         boolean hasRivals, long nowMs, int pos) {
+        if (blocked != BLOCK_NONE) return pos == POS_HERE ? HOLD_UNBLOCK : HOLD_WAIT;
+        if (pos == POS_RIVAL) return HOLD_BLOCK_RIVAL;
+        boolean due = nowMs - enterMs >= CONFIRM_DWELL_MS;
+        if (dwell) {
+            if (pos == POS_AWAY) return hasRivals ? HOLD_BLOCK_AWAY : HOLD_RESTART;
+            return due ? HOLD_CONFIRM : HOLD_WAIT;
+        }
+        if (pos == POS_HERE) return due ? HOLD_CONFIRM : HOLD_UPGRADE;
+        if (pos == POS_AWAY) return travel ? HOLD_DEMOTE : HOLD_WAIT;
+        return travel && due ? HOLD_CONFIRM : HOLD_WAIT;
     }
 
     /**
@@ -1006,13 +1320,29 @@ public class GeofenceReceiver extends BroadcastReceiver {
 
     /**
      * An arrival still held when its EXIT comes: does the stay itself prove
-     * it? Only from travel, and only if it lasted the dwell — the same
-     * condition the breadcrumb path confirms on, applied as a backstop for a
-     * device that produced no batch in between. Anything else was a drive
-     * past or drift, and neither side is announced.
+     * it? Only if it lasted the dwell, unblocked, and for a drift hold only
+     * from travel: the same condition the breadcrumb path confirms on,
+     * applied as a backstop for a device that produced no batch in between.
+     * Anything else was a drive past, drift, or a stay at an overlapping
+     * place, and neither side is announced.
      */
-    static boolean confirmsAtExit(long enterMs, boolean travel, long exitMs) {
-        return travel && exitMs - enterMs >= CONFIRM_DWELL_MS;
+    static boolean confirmsAtExit(long enterMs, boolean travel, boolean dwell, int blocked,
+                                  long exitMs) {
+        return blocked == BLOCK_NONE && (dwell || travel) && exitMs - enterMs >= CONFIRM_DWELL_MS;
+    }
+
+    /**
+     * Play Services' DWELL for a place with a held arrival: Play Services
+     * saying it has had us inside since its ENTER, for the dwell. That is
+     * the time rule, so the same holds are confirmed by it as by time
+     * (judgeHeld), never a blocked one, a drift hold not from travel, or one
+     * whose departure is held. Counted from the hold's own time, because an
+     * unblocked hold's dwell restarted after Play Services' began.
+     */
+    static boolean confirmsOnDwellEvent(long enterMs, boolean travel, boolean dwell, int blocked,
+                                        boolean exitHeld, long nowMs) {
+        return blocked == BLOCK_NONE && !exitHeld && (dwell || travel)
+                && nowMs - enterMs >= CONFIRM_DWELL_MS - DWELL_EVENT_SLACK_MS;
     }
 
     /**
@@ -1073,7 +1403,7 @@ public class GeofenceReceiver extends BroadcastReceiver {
                     " — held departure confirmed by precise fixes outside for "
                     + ((fixMs - c.outSinceMs) / 60_000) + "m (±" + Math.round(acc) + "m, "
                     + Math.round(d[0] - p.radius) + "m out), announced for " + hhmm(depMs));
-            if (announced) writeLastPlace(prefs, rest, memberId, prefs.getLastPlaceSent());
+            if (announced) writeLastPlace(prefs, rest, memberId, prefs.getLastPlaceSent(), lat, lng);
         }
     }
 
@@ -1136,9 +1466,7 @@ public class GeofenceReceiver extends BroadcastReceiver {
      * keep_members.last_place_id should say: one the inside-set holds whose
      * arrival was announced, not held. `prefer` when it qualifies, so a value
      * already written is kept rather than swapped for another place we are
-     * also inside; otherwise the smallest such place, the most specific
-     * answer (a home inside a neighbourhood says home), ties broken by id so
-     * every caller agrees. Null for none.
+     * also inside; otherwise pickPlace's answer. Null for none.
      *
      * A place with no metadata here is skipped: it is not one of ours any
      * more, and last_place_id is a foreign key that would refuse it.
@@ -1148,21 +1476,77 @@ public class GeofenceReceiver extends BroadcastReceiver {
      * for LastPlaceTest.
      */
     static String placeToShow(Set<String> inside, Set<String> heldArrivals,
-                              List<PrefsStore.Place> places, String prefer) {
-        PrefsStore.Place best = null;
+                              List<PrefsStore.Place> places, String prefer,
+                              Double lat, Double lng) {
+        List<PrefsStore.Place> here = new ArrayList<>();
         for (PrefsStore.Place p : places) {
             if (!inside.contains(p.id) || heldArrivals.contains(p.id)) continue;
             if (p.id.equals(prefer)) return p.id;
-            if (best == null || p.radius < best.radius
-                    || (p.radius == best.radius && p.id.compareTo(best.id) < 0)) best = p;
+            here.add(p);
         }
+        PrefsStore.Place best = pickPlace(here, lat, lng);
         return best == null ? null : best.id;
     }
 
-    /** placeToShow from this device's state, "" for none. */
-    static String lastPlaceNow(PrefsStore prefs, String prefer) {
+    /**
+     * Which of several places someone inside all of them is at (4.12.1). The
+     * app's pickPlace is the same rule; the two must agree, because this one
+     * writes last_place_id and that one reads positions without it.
+     *
+     * 1. A place that wholly contains another candidate gives way to it: a
+     *    home inside a town says home, wherever in the home they stand.
+     * 2. Of the rest, the one whose centre is nearest as a share of its
+     *    radius: a home and a school side by side, overlapping, say whichever
+     *    middle they are nearer. "Smallest" got that case wrong whenever the
+     *    two differed in size, and said nothing at all when they did not.
+     * 3. No position, or a tie: the smaller place, then the lower id, so every
+     *    caller agrees.
+     *
+     * Rule 2 alone gets nesting wrong: at the edge of a home whose town's
+     * centre happens to be close by, the town's share is the smaller.
+     */
+    static PrefsStore.Place pickPlace(List<PrefsStore.Place> here, Double lat, Double lng) {
+        final boolean located = lat != null && lng != null;
+        PrefsStore.Place best = null;
+        double bestShare = 0;
+        for (PrefsStore.Place p : here) {
+            if (enclosesAnother(p, here)) continue;
+            double share = located ? metresBetween(lat, lng, p.lat, p.lng) / p.radius : 0;
+            if (best == null || share < bestShare
+                    || (share == bestShare && (p.radius < best.radius
+                        || (p.radius == best.radius && p.id.compareTo(best.id) < 0)))) {
+                best = p;
+                bestShare = share;
+            }
+        }
+        return best;
+    }
+
+    /** True when another, smaller place in the list lies wholly inside p. */
+    static boolean enclosesAnother(PrefsStore.Place p, List<PrefsStore.Place> here) {
+        for (PrefsStore.Place q : here) {
+            if (q == p || q.radius >= p.radius) continue;
+            if (metresBetween(p.lat, p.lng, q.lat, q.lng) + q.radius <= p.radius) return true;
+        }
+        return false;
+    }
+
+    /**
+     * Great-circle distance in metres. Location.distanceBetween is an Android
+     * stub under plain JUnit, and a ranking needs nothing finer than this.
+     */
+    static double metresBetween(double lat1, double lng1, double lat2, double lng2) {
+        double dLat = Math.toRadians(lat2 - lat1), dLng = Math.toRadians(lng2 - lng1);
+        double a = Math.sin(dLat / 2) * Math.sin(dLat / 2)
+                + Math.cos(Math.toRadians(lat1)) * Math.cos(Math.toRadians(lat2))
+                * Math.sin(dLng / 2) * Math.sin(dLng / 2);
+        return 2 * 6_371_000 * Math.asin(Math.sqrt(a));
+    }
+
+    /** placeToShow from this device's state, "" for none. lat/lng may be null. */
+    static String lastPlaceNow(PrefsStore prefs, String prefer, Double lat, Double lng) {
         String id = placeToShow(prefs.getInsidePlaceIds(), prefs.getHeldArrivals().keySet(),
-                prefs.getPlaces(), prefer);
+                prefs.getPlaces(), prefer, lat, lng);
         return id == null ? "" : id;
     }
 
@@ -1173,8 +1557,8 @@ public class GeofenceReceiver extends BroadcastReceiver {
      * from what last landed.
      */
     private static void writeLastPlace(PrefsStore prefs, SupabaseRest rest, String memberId,
-                                       String prefer) {
-        String place = lastPlaceNow(prefs, prefer);
+                                       String prefer, double lat, double lng) {
+        String place = lastPlaceNow(prefs, prefer, lat, lng);
         try {
             JSONObject upd = new JSONObject();
             upd.put("last_place_id", place.isEmpty() ? JSONObject.NULL : place);
