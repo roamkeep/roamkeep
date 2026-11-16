@@ -124,6 +124,13 @@
              intent-filter and not exported. -->
         <receiver android:name="com.roamkeep.app.geofence.NotificationRestoreReceiver" android:exported="false" />
 
+        <!-- Activity recognition (4.13.0): Play Services' "started driving /
+             cycling / walking" events, which can wake GPS out of low power
+             and restart a tracking service the OS killed. A trigger only;
+             the GPS fix decides. Targeted by an explicit PendingIntent, so
+             no intent-filter and not exported. -->
+        <receiver android:name="com.roamkeep.app.geofence.MotionSignalReceiver" android:exported="false" />
+
         <!-- Push is content-free: the relay only sends {"t":"sync"}, and
              this service reads the actual check-in back out of the
              family's own Supabase to build the notification on-device.
@@ -218,4 +225,16 @@
     <!-- Needed to re-register geofences after device reboot (they are
          cleared on boot and must be re-added by the app, via BootReceiver). -->
     <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
+
+    <!-- Noticing a trip start (4.13.0). Physical activity is optional and
+         asked for from the setup sheet: activity recognition says "started
+         driving" within about a minute, used on the phone only, never sent
+         anywhere. Below Android 10 it is the Play Services permission,
+         granted at install. ACCESS_NETWORK_STATE lets the tracking service
+         notice the phone leaving its Wi-Fi network, another sign of a trip
+         starting. -->
+    <uses-permission android:name="android.permission.ACTIVITY_RECOGNITION" />
+    <uses-permission android:name="com.google.android.gms.permission.ACTIVITY_RECOGNITION"
+        android:maxSdkVersion="28" />
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
 </manifest>

@@ -808,6 +808,7 @@ console.log('\napp: where a member is');
     const make = (S) => new AsyncFunction('S', `
       const CHECKED_IN_SLACK_M = ${slack}, NEAR_PLACE_MAX_M = ${nearMax};
       const renderPlaces = () => {};
+      const renderMembers = () => { S.memberRenders = (S.memberRenders || 0) + 1; };
       const console = { warn() {} };
       ${srcs.join('\n')}
       return { whereIs, loadPlaces };`)(S);
@@ -830,10 +831,14 @@ console.log('\napp: where a member is');
       const s = { places: [], members: [me], myId: 'me', insidePlaces: new Set(), keepId: 'k',
         sb: { from: () => ({ select: () => ({ eq: () => ({ order: async () => ({ data: [home], error: null }) }) }) }) } };
       await (await make(s)).loadPlaces();
+      seed.renders = s.memberRenders || 0;
       return [...s.insidePlaces];
     };
     let r = await seed(at({ lat: 0, lng: 0 }));
     check('launch seeds the place the member is checked into', r.length === 1 && r[0] === 'h', JSON.stringify(r));
+    // The cards were drawn before the places arrived and said coordinates
+    // until something else redrew them (found in the 4.13.0 harness).
+    check('loading the places redraws the family cards', seed.renders === 1, String(seed.renders));
     r = await seed(at({ lat: 0.05, lng: 0 }));
     check('launch does not seed one their position contradicts', r.length === 0, JSON.stringify(r));
 
@@ -1104,6 +1109,27 @@ console.log('\nnative: the location service never stops under a pending start');
     const hard = onStart.match(/\b(stopService|stopForDisclosure|stop)\(/g) || [];
     check('onStartCommand never calls stopService, directly or through stop()', hard.length === 0, JSON.stringify(hard));
   }
+
+  // 4.13.0: activity recognition can start the service from a broadcast,
+  // with the app closed. That is a recording path, so it must go through
+  // start() and its notification gate, and respect a pause and a server
+  // that has stopped accepting this member, as BootReceiver does.
+  const signal = body('static void onActivitySignal(Context ctx, int source, String what)');
+  const recv = fs.readFileSync(path.join(REPO,
+    'android/app/src/main/java/com/roamkeep/app/geofence/MotionSignalReceiver.java'), 'utf8')
+    .replace(/\/\*[\s\S]*?\*\//g, '').replace(/\/\/.*$/gm, '');
+  if (!signal) {
+    check('LocationForegroundService.onActivitySignal found', false, 'moved or renamed');
+  } else {
+    check('the activity signal starts the service only through start()',
+      /\bstart\(ctx,/.test(signal) && !/startForegroundService|startService/.test(signal + recv));
+    check('the activity signal respects a pause and a rejected member',
+      /isPaused\(\)/.test(signal) && /isServerRejected\(\)/.test(signal)
+      && signal.indexOf('isPaused()') < signal.indexOf('start(ctx,'));
+    const stopBody = body('public static void stop(Context ctx)');
+    check('every deliberate stop withdraws the activity signal',
+      !!stopBody && /MotionSignalReceiver\.unregister\(/.test(stopBody));
+  }
 }
 
 console.log('\nwizard: every source file parses');
@@ -1265,6 +1291,156 @@ console.log('\napp: a drive and a walk are two trips');
       cut.every((x) => tripsFrom(x.pts.slice()).length === 1));
     check('the same points asked again without stops are not served the cut answer',
       tripsFrom(drop, [stay]).length === 2 && tripsFrom(drop).length === 1);
+  }
+}
+
+// What someone is doing now (4.13.0): the badge on their pin and the first
+// line of their card, from their breadcrumbs through History's own tripsFrom.
+// Cut out of app.js and run, with readMotion driven against a stub client.
+console.log('\napp: driving, riding or walking now');
+{
+  const app = fs.readFileSync(path.join(REPO, 'app.js'), 'utf8');
+  const names = ['TRIP_GAP_MS', 'TRIP_MIN_M', 'MAX_LEG_SPEED_MS', 'MIN_LEG_DT_S', 'SPEED_CORROB_MULT',
+    'DRIVE_AVG_MS', 'DRIVE_MAX_MS', 'RIDE_AVG_MS', 'WALK_MAX_MS', 'WALK_LEG_MIN_MS',
+    'MOTION_FRESH_MS', 'MOTION_WINDOW_MS', 'MOTION_READ_ROWS', 'MOTION_WALK_AFTER_DRIVE_MS'];
+  const consts = names.map((n) => (app.match(new RegExp('const ' + n + ' += [^;]+;')) || [])[0]);
+  const srcs = ['function distanceM(lat1, lng1, lat2, lng2)', 'function segmentTrips(pts)',
+    'function isRealTrip(t)', 'function legSpeeds(trip)', 'function trustedSpeed(trip, i, legMs, legOk)',
+    'function tripStats(trip)', 'function splitWalkLegs(trip)', 'function tripsFrom(pts, stops)',
+    'function splitAtStops(trip, stops)', 'function motionFrom(pts, pin, nowMs)',
+    'function motionSlot(id)', 'function addMotionPoints(id, rows)',
+    'async function readMotion(ids)'].map(cutFromApp);
+  const memo = (app.match(/const _tripsMemo = [^;]+;/) || [])[0];
+  if (srcs.some((s) => !s) || consts.some((s) => !s) || !memo) {
+    check('live-activity functions found in app.js', false, 'moved or renamed');
+  } else {
+    // `answer(query)` is what the stub server says to a read.
+    const make = (answer) => new Function('answer', `
+      const S = { sb: null, keepId: 'k1', members: [] };
+      const isPausedRow = (m) => !!m.paused;
+      const placesSignature = () => '';
+      let changed = 0;
+      const motionChanged = () => { changed++; };
+      ${consts.join('\n')}
+      ${memo}
+      const _motion = new Map();
+      ${srcs.join('\n')}
+      const reads = [];
+      S.sb = { from(table) {
+        const q = { table, eq: [] };
+        reads.push(q);
+        const chain = {
+          select(c) { q.select = c; return chain; },
+          eq(k, v) { q.eq.push([k, v]); return chain; },
+          or(s) { q.or = s; return chain; },
+          order(c, o) { q.order = [c, o]; return chain; },
+          limit(n) { q.limit = n; return Promise.resolve(answer(q)); },
+        };
+        return chain;
+      } };
+      return { S, readMotion, motionFrom, tripsFrom, slot: (id) => _motion.get(id), reads, changed: () => changed };
+    `)(answer);
+    const { motionFrom, tripsFrom } = make(() => ({ data: [] }));
+
+    // A route north from the equator, as in the trips block: [seconds, m/s,
+    // a point every N seconds], starting at t0.
+    const t0 = Date.UTC(2026, 10, 10, 8, 20);
+    const route = (stretches) => {
+      const pts = [];
+      let t = t0, lat = 0;
+      const push = (sp) => pts.push({ lat, lng: 0, recorded_at: new Date(t).toISOString(), speed: sp });
+      push(stretches[0][1]);
+      for (const [secs, mps, every] of stretches) {
+        for (let s = every; s <= secs; s += every) { t += every * 1000; lat += (mps * every) / 111195; push(mps); }
+      }
+      return pts;
+    };
+    const end = (pts) => Date.parse(pts[pts.length - 1].recorded_at);
+    const DRIVE = [300, 14, 5], PARK = [20, 3, 5];
+    const drive = route([DRIVE]);
+    const at = end(drive);
+
+    let mo = motionFrom(drive, { ms: at, inPlace: false }, at + 10e3);
+    check('breadcrumbs up to the pin are a drive, now', mo?.mode === 'drive' && mo.stale === false, JSON.stringify(mo));
+    check('it is timed from the first breadcrumb', mo?.startMs === t0, String(mo?.startMs));
+
+    mo = motionFrom(drive, { ms: at + 4 * 60e3, inPlace: false }, at + 4 * 60e3 + 5e3);
+    check('pins going on four minutes after the last breadcrumb: stopped, nothing shown', mo === null, JSON.stringify(mo));
+
+    mo = motionFrom(drive, { ms: at + 20e3, inPlace: true }, at + 25e3);
+    check('a newer pin inside a saved place has stopped there, at once', mo === null, JSON.stringify(mo));
+    mo = motionFrom(drive, { ms: at + 20e3, inPlace: false }, at + 25e3);
+    check('the same pin outside every place is still driving', mo?.mode === 'drive', JSON.stringify(mo));
+
+    mo = motionFrom(drive, { ms: at, inPlace: false }, at + 14 * 60e3);
+    check('a phone silent for 14 minutes mid-drive was driving, gone quiet',
+      mo?.mode === 'drive' && mo.stale === true, JSON.stringify(mo));
+
+    mo = motionFrom(route([[60, 1, 10]]), { ms: NaN }, t0 + 70e3);
+    check('60 m is not a trip, so nothing is shown', mo === null, JSON.stringify(mo));
+
+    mo = motionFrom(route([[600, 1.3, 15]]), null, t0 + 610e3);
+    check('a walk on its own is walking', mo?.mode === 'walk', JSON.stringify(mo));
+
+    const jam = route([DRIVE, PARK, [180, 1.3, 15]]);
+    mo = motionFrom(jam, { ms: end(jam) }, end(jam) + 5e3);
+    check('three minutes at walking pace after a drive is still the drive (a jam)',
+      mo?.mode === 'drive' && mo.startMs === t0, JSON.stringify(mo));
+    const walked = route([DRIVE, PARK, [420, 1.3, 15]]);
+    mo = motionFrom(walked, { ms: end(walked) }, end(walked) + 5e3);
+    check('seven minutes on foot after a drive is walking', mo?.mode === 'walk', JSON.stringify(mo));
+    check('History itself still splits that walk off at two minutes',
+      tripsFrom(jam.slice()).map((x) => x.mode).join('+') === 'drive+walk');
+
+    check('no breadcrumbs, nothing shown', motionFrom([], { ms: at }, at) === null);
+
+    // A drive, a quarter of an hour parked, then a few metres of breadcrumbs:
+    // the label belongs to the trip ending NOW, and that one is not a trip.
+    const last = drive[drive.length - 1];
+    const shuffle = drive.concat([1, 2, 3].map((i) => ({ lat: last.lat + i * 0.00005, lng: 0,
+      speed: 0.5, recorded_at: new Date(at + 15 * 60e3 + i * 10e3).toISOString() })));
+    mo = motionFrom(shuffle, { ms: end(shuffle) }, end(shuffle) + 5e3);
+    check('an earlier drive does not label a few metres now', mo === null, JSON.stringify(mo));
+
+    // readMotion: one read for the family, each window ending at that
+    // member's own last sign of life, and a failed read changes nothing.
+    const seen = new Date(at).toISOString();
+    const rows = drive.map((p) => ({ member_id: 'm1', ...p }));
+    let h = make(() => ({ data: rows.slice().reverse() }));
+    h.S.members = [{ id: 'm1', last_seen: seen, lat: 1, lng: 1 }, { id: 'm2', last_seen: seen, lat: 1, lng: 1, paused: true }];
+    await h.readMotion(['m1', 'm2']);
+    const q = h.reads[0];
+    check('one read, of breadcrumbs', h.reads.length === 1 && q.table === 'location_history');
+    check('scoped to the keep', q.eq.some(([k, v]) => k === 'keep_id' && v === 'k1'));
+    check('a paused member is not read', !q.or.includes('m2'), q.or);
+    check('the window ends at their last sign of life, times quoted for PostgREST',
+      q.or === 'and(member_id.eq.m1,recorded_at.gt."' + new Date(at - 30 * 60e3).toISOString() + '")', q.or);
+    check('newest first, so a full page keeps the newest', q.order[1]?.ascending === false && q.limit === 1500);
+    check('the rows land oldest first', h.slot('m1').pts.length === drive.length
+      && h.slot('m1').pts[0].recorded_at === drive[0].recorded_at);
+    check('and say so', h.changed() === 1);
+
+    await h.readMotion(['m1']);
+    check('no new sign of life, no second read', h.reads.length === 1);
+    h.S.members[0].last_seen = new Date(at + 20e3).toISOString();
+    await h.readMotion(['m1']);
+    check('a newer pin reads again, a minute behind the newest breadcrumb',
+      h.reads.length === 2 && h.reads[1].or.includes(new Date(at - 60e3).toISOString()), h.reads[1]?.or);
+    check('rows read twice are kept once', h.slot('m1').pts.length === drive.length);
+
+    h = make(() => ({ data: null, error: { code: '500', message: 'down' } }));
+    h.S.members = [{ id: 'm1', last_seen: seen, lat: 1, lng: 1 }];
+    await h.readMotion(['m1']);
+    check('a failed read leaves the slot empty and says nothing changed',
+      h.slot('m1').pts.length === 0 && h.changed() === 0);
+    await h.readMotion(['m1']);
+    check('and asks again next time', h.reads.length === 2);
+
+    // Never from the Physical activity permission: the privacy page says
+    // that never leaves the phone.
+    const live = app.slice(app.indexOf('// ── WHAT SOMEONE IS DOING NOW'), app.indexOf('function drawMotionTails'));
+    check('the live activity reads no activity-recognition state',
+      live.length > 0 && !/activityRecognition|ACTIVITY_RECOGNITION|requestActivity/.test(live.replace(/\/\/.*$/gm, '')));
   }
 }
 

@@ -96,6 +96,23 @@ rate follows real GPS movement: frequent while moving, low power after a few
 minutes still. The service restarts after a reboot and re-arms itself
 periodically so a long session does not go stale.
 
+**Leaving low power.** On low power the phone's positions come from Wi-Fi
+and mobile networks. They are rough, and they can be stale: a phone can
+report itself at home minutes after it has driven away, which also starves
+the operating system's geofences, since they are fed the same positions. So a
+rough position never decides anything. Several signs may say a trip has
+started: the phone leaving its Wi-Fi network, the phone's motion sensor,
+Android's activity recognition if the person allows it (optional, and used on
+the phone only), and a rough position far from where the phone stopped. A
+strong sign (a vehicle, leaving the Wi-Fi) switches GPS on for a few minutes;
+a weak one asks for a single fresh GPS fix. Only a precise fix decides, and it
+is measured against where the phone has been sitting, not against the
+previous fix, because drift wanders around a point while travel moves away
+from it. A sign that turns out to be nothing backs off, and a rough position
+inside the radius drift has already been shown to reach is not checked again,
+so a phone on a table settles quickly. Activity recognition is a trigger only:
+when it once chose the mode outright, it got stuck both ways.
+
 **No notification, no recording.** The notification is the person's proof
 that their location is being shared, so every recording path first checks
 that it can be shown: the app's notifications are on and the tracking
@@ -137,6 +154,22 @@ with the stay between them, provided each part counts as a trip on its own.
 The map and its trip count use the same stops. Stays are matched to the
 departure from the same place, so someone inside two overlapping places is
 shown at each for as long as they were in it.
+
+**Driving, riding or walking now.** A member's pin carries a small icon
+while they are on the move, with a short fading tail behind it, and their
+card says what they are doing. It is worked out in the viewer's app from the
+member's recent trail, by the same rules History uses, from the trip that is
+still going on. Activity recognition plays no part: what it learns stays on
+the phone that learned it, and someone who declined it reads the same as
+someone who allowed it. The trail already carries the answer, since it is
+only written while the phone has decided it is moving. Someone sitting still
+shows nothing. When a phone stops reporting mid-trip, the icon turns grey and
+the card says what it was last doing, not what it is doing. The one
+difference from History is a walk at the end of a drive: in a finished trip
+two minutes on foot is getting out of the car, but in a trip still going on
+it can be a traffic jam, so it takes longer before the icon changes. No speed
+is shown. The trail is not streamed to every phone; the app reads it when the
+family list loads and again when a member's pin shows they may have moved.
 
 ### Held arrivals and departures
 

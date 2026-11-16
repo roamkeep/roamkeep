@@ -557,6 +557,56 @@ public class PrefsStore {
                 .apply();
     } }
 
+    // ── Movement checks (4.13.0) ─────────────────────────────────────
+    //
+    // Every GPS check LocationForegroundService makes on low power, totalled
+    // for the diagnostics screen, and windowed for one journal line at most
+    // every CHECK_JOURNAL_EVERY_MS. The window is persisted for the reason
+    // the crumbs window is: in fields it reset at every process death, and a
+    // count that silently restarts reads as a smaller number, not a gap.
+    private static final String K_CHK_MOVING = "chk_moving";
+    private static final String K_CHK_STILL = "chk_still";
+    private static final String K_CHK_NONE = "chk_none";
+    private static final String K_CHK_WINDOW = "chk_window";        // JSON [since, moving, still, none, src...]
+    private static final String K_CHK_LAST_JOURNAL = "chk_last_journal";
+    private static final long CHECK_JOURNAL_EVERY_MS = 30 * 60_000;
+
+    public int getCheckMovingCount() { return sp.getInt(K_CHK_MOVING, 0); }
+    public int getCheckStillCount()  { return sp.getInt(K_CHK_STILL, 0); }
+    public int getCheckNoneCount()   { return sp.getInt(K_CHK_NONE, 0); }
+
+    /** One check's verdict (MotionJudge.MOVING/STILL/UNKNOWN) and source. */
+    public void recordMotionCheck(int verdict, int source) { synchronized (LOCK) {
+        final long now = System.currentTimeMillis();
+        String total = verdict == MotionJudge.MOVING ? K_CHK_MOVING
+                     : verdict == MotionJudge.STILL ? K_CHK_STILL : K_CHK_NONE;
+        long[] w = new long[4 + MotionJudge.SOURCES];
+        try {
+            JSONArray a = new JSONArray(sp.getString(K_CHK_WINDOW, "[]"));
+            for (int i = 0; i < w.length && i < a.length(); i++) w[i] = a.optLong(i, 0);
+        } catch (JSONException ignored) {}
+        if (w[0] == 0) w[0] = now;
+        w[verdict == MotionJudge.MOVING ? 1 : verdict == MotionJudge.STILL ? 2 : 3]++;
+        if (source >= 0 && source < MotionJudge.SOURCES) w[4 + source]++;
+
+        long last = sp.getLong(K_CHK_LAST_JOURNAL, 0);
+        SharedPreferences.Editor ed = sp.edit().putInt(total, sp.getInt(total, 0) + 1);
+        if (last != 0 && now - last >= CHECK_JOURNAL_EVERY_MS) {
+            int[] bySource = new int[MotionJudge.SOURCES];
+            for (int s = 0; s < bySource.length; s++) bySource[s] = (int) w[4 + s];
+            journalLocked(MotionJudge.checkLine((int) w[1], (int) w[2], (int) w[3], bySource, now - w[0]));
+            ed.putLong(K_CHK_LAST_JOURNAL, now).putString(K_CHK_WINDOW, "[]");
+        } else {
+            // The first window ever starts the clock rather than writing a
+            // line at once, as the crumbs line does.
+            if (last == 0) ed.putLong(K_CHK_LAST_JOURNAL, now);
+            JSONArray a = new JSONArray();
+            for (long v : w) a.put(v);
+            ed.putString(K_CHK_WINDOW, a.toString());
+        }
+        ed.apply();
+    } }
+
     /** The last position accepted as real. Null until one has been recorded
      *  (fresh install, or after a sign-out clears everything). */
     public Anchor getBreadcrumbAnchor() { synchronized (LOCK) {

@@ -68,17 +68,22 @@ import java.util.List;
  *   Roamkeep.NativeGeofence.stopLocationUpdates()
  *   Roamkeep.NativeGeofence.setPaused({ pausedUntil })  → adult self-pause
  *   Roamkeep.NativeGeofence.getReliabilityStatus()  → diagnostics
+ *   Roamkeep.NativeGeofence.requestActivityRecognition()  → Physical activity (optional)
  */
 @CapacitorPlugin(
         name = "NativeGeofence",
         permissions = {
                 @Permission(
                         alias = NativeGeofencePlugin.BG_LOCATION,
-                        strings = { Manifest.permission.ACCESS_BACKGROUND_LOCATION })
+                        strings = { Manifest.permission.ACCESS_BACKGROUND_LOCATION }),
+                @Permission(
+                        alias = NativeGeofencePlugin.ACTIVITY,
+                        strings = { Manifest.permission.ACTIVITY_RECOGNITION })
         })
 public class NativeGeofencePlugin extends Plugin {
 
     static final String BG_LOCATION = "backgroundLocation";
+    static final String ACTIVITY = "activityRecognition";
     private static final String TAG = "RoamkeepGeo";
     private static final int PI_REQUEST_CODE = 0;
     private static final int LOC_PI_REQUEST_CODE = 1;
@@ -138,6 +143,44 @@ public class NativeGeofencePlugin extends Plugin {
             return;
         }
         requestPermissionForAlias(BG_LOCATION, call, "backgroundLocationResult");
+    }
+
+    /**
+     * Ask for Physical activity (4.13.0, optional). Activity recognition
+     * then tells the tracking service within about a minute that a drive,
+     * ride or walk has started, which wakes GPS even when the phone's own
+     * position is out of date. Used on the phone only.
+     *
+     * Below Android 10 there is nothing to ask: the Play Services permission
+     * is granted at install. Once refused twice, Android shows no dialog and
+     * the answer is "denied"; the caller then offers the app's settings.
+     */
+    @PluginMethod
+    public void requestActivityRecognition(PluginCall call) {
+        if (MotionSignalReceiver.allowed(getContext())) {
+            JSObject res = new JSObject();
+            res.put("status", "granted");
+            call.resolve(res);
+            return;
+        }
+        requestPermissionForAlias(ACTIVITY, call, "activityRecognitionResult");
+    }
+
+    @PermissionCallback
+    private void activityRecognitionResult(PluginCall call) {
+        boolean granted = MotionSignalReceiver.allowed(getContext());
+        if (granted) {
+            // The service registers it on every start; start it now rather
+            // than at the next one. start() is a no-op for a stopped
+            // service's reasons (paused, no notification) in onStartCommand.
+            PrefsStore prefs = new PrefsStore(getContext());
+            if (prefs.hasContext() && !prefs.isPaused() && !prefs.isServerRejected()) {
+                LocationForegroundService.start(getContext(), "activity permission");
+            }
+        }
+        JSObject res = new JSObject();
+        res.put("status", granted ? "granted" : "denied");
+        call.resolve(res);
     }
 
     @PermissionCallback
@@ -382,6 +425,16 @@ public class NativeGeofencePlugin extends Plugin {
         res.put("rejDriftCount", prefs.getRejDriftCount());
         res.put("rejUnusableCount", prefs.getRejUnusableCount());
         res.put("dbSchemaVersion", prefs.getSchemaVersion());
+        // Noticing a trip start (4.13.0): which signals this phone has, and
+        // what the GPS checks they asked for found.
+        res.put("activityRecognition", MotionSignalReceiver.allowed(ctx));
+        android.hardware.SensorManager sm =
+                (android.hardware.SensorManager) ctx.getSystemService(Context.SENSOR_SERVICE);
+        res.put("motionSensor", sm != null
+                && sm.getDefaultSensor(android.hardware.Sensor.TYPE_SIGNIFICANT_MOTION) != null);
+        res.put("checkMovingCount", prefs.getCheckMovingCount());
+        res.put("checkStillCount", prefs.getCheckStillCount());
+        res.put("checkNoneCount", prefs.getCheckNoneCount());
         call.resolve(res);
     }
 
@@ -699,6 +752,9 @@ public class NativeGeofencePlugin extends Plugin {
     public void clearAll(PluginCall call) {
         PrefsStore prefs = new PrefsStore(getContext());
         prefs.clearAll();
+        // Signed out: nothing may restart tracking (MotionSignalReceiver
+        // would find no context and do nothing, but withdraw it anyway).
+        MotionSignalReceiver.unregister(getContext());
         client().removeGeofences(pendingIntent())
                 .addOnSuccessListener(unused -> call.resolve())
                 .addOnFailureListener(e -> {
@@ -839,13 +895,14 @@ public class NativeGeofencePlugin extends Plugin {
     /** Build the LocationRequest for a mode.
      *
      *  live/balanced/saver are fixed (the user's explicit override). Only
-     *  'auto' adapts, and it adapts to REAL GPS MOVEMENT (decided by the
-     *  service), never the activity sensor — which proved unreliable and
-     *  got Auto stuck both ways (stranded "Still" on car trips, stuck
-     *  "Walking" burning battery at home). Moving → dense HIGH_ACCURACY;
-     *  Still → low-power, but still sampling ~every 30 s so the service
-     *  notices movement resuming. Density comes from the DISTANCE gate with
-     *  a small min-interval, so it stays dense even at speed. */
+     *  'auto' adapts, and it adapts to REAL MOVEMENT decided by the service
+     *  from precise fixes. The activity sensor never chooses the profile: it
+     *  got Auto stuck both ways when it did (stranded "Still" on car trips,
+     *  stuck "Walking" burning battery at home). Since 4.13.0 it, the motion
+     *  sensor and leaving a Wi-Fi network may only wake GPS to look (see
+     *  MotionJudge). Moving → dense HIGH_ACCURACY; Still → low-power, still
+     *  sampling ~every 30 s. Density comes from the DISTANCE gate with a
+     *  small min-interval, so it stays dense even at speed. */
     static LocationRequest requestFor(String mode, boolean moving) {
         int priority = Priority.PRIORITY_HIGH_ACCURACY;
         long intervalMs, minIntervalMs;

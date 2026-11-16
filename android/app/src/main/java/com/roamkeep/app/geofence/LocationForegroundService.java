@@ -10,7 +10,15 @@ import android.content.Context;
 import android.content.Intent;
 import android.content.IntentFilter;
 import android.content.pm.ServiceInfo;
+import android.hardware.Sensor;
+import android.hardware.SensorManager;
+import android.hardware.TriggerEvent;
+import android.hardware.TriggerEventListener;
 import android.location.Location;
+import android.net.ConnectivityManager;
+import android.net.Network;
+import android.net.NetworkCapabilities;
+import android.net.NetworkRequest;
 import android.os.Build;
 import android.os.Handler;
 import android.os.IBinder;
@@ -23,16 +31,20 @@ import androidx.core.app.NotificationManagerCompat;
 import androidx.core.app.ServiceCompat;
 import androidx.core.content.ContextCompat;
 
+import com.google.android.gms.location.CurrentLocationRequest;
 import com.google.android.gms.location.FusedLocationProviderClient;
 import com.google.android.gms.location.LocationCallback;
 import com.google.android.gms.location.LocationRequest;
 import com.google.android.gms.location.LocationResult;
 import com.google.android.gms.location.LocationServices;
 import com.google.android.gms.location.Priority;
+import com.google.android.gms.tasks.CancellationTokenSource;
 import com.roamkeep.app.R;
 
 import java.util.Collections;
+import java.util.HashSet;
 import java.util.List;
+import java.util.Set;
 
 /**
  * Foreground service that owns Roamkeep's location engine.
@@ -53,8 +65,11 @@ import java.util.List;
  *
  * The callback hands each batch to LocationUpdateReceiver.processLocations
  * (breadcrumb + live-pin + battery writes). For 'auto', the rate adapts to
- * real GPS movement decided here — dense on the move, low-power once
- * genuinely still — rather than the (unreliable) activity sensor.
+ * real movement decided here: dense on the move, low-power once genuinely
+ * still. Since 4.13.0 several signals can wake GPS out of low power
+ * (activity recognition, the motion sensor, leaving a Wi-Fi network, a
+ * rough position far from where the phone stopped), but only a precise fix
+ * decides. See MotionJudge, and "Noticing a trip start" below.
  *
  * (A hard OEM force-stop — Samsung "Deep sleeping apps" — cancels even
  * this; that needs the "Never sleeping apps" device setting. But a device
@@ -73,12 +88,13 @@ public class LocationForegroundService extends Service {
     private FusedLocationProviderClient fused;
     private LocationCallback locationCallback;
 
-    // Moving-vs-still is decided purely from GPS — the only reliable signal
-    // (the activity sensor got Auto stuck both ways). A fix counts as moving
-    // by reported speed (catches walking) or by displacement from the last
-    // fix (catches movement when speed is absent). We stay dense until
-    // STILL_AFTER of no movement, then relax — so red lights don't flap, but
-    // a genuinely parked phone drops to low power.
+    // Moving-vs-still is DECIDED from precise fixes only. The activity sensor
+    // got Auto stuck both ways when it chose the profile, so since 4.13.0 it
+    // may only ask for a GPS check (see MotionJudge). On dense, a fix counts
+    // as moving by reported speed (catches walking) or by displacement from
+    // the last fix (catches movement when speed is absent). We stay dense
+    // until STILL_AFTER of no movement, then relax, so red lights don't flap
+    // but a genuinely parked phone drops to low power.
     // MOVING_SPEED_MS, MOVING_DISP_M, MOVING_ACC_MULT and SPEED_TRUST_ACC_M
     // are package-private because LocationUpdateReceiver gates breadcrumb
     // WRITES on the same numbers. They were tuned here, against real journeys,
@@ -149,6 +165,57 @@ public class LocationForegroundService extends Service {
     private volatile int rearmsSinceFix = 0;
     private volatile long dozeMsSinceFix = 0;
     private volatile long dozeEnteredMs = 0;
+
+    // ── Noticing a trip start (4.13.0) ────────────────────────────────
+    //
+    // On the low-power profile the phone's positions come from Wi-Fi and
+    // mobile networks, and until 4.13.0 they alone decided when to leave it.
+    // They were wrong both ways. On 2026-11-10 a stale one put a phone near
+    // home five minutes into a school run: nothing switched to GPS, the drive
+    // was never recorded and "left Home" came 9.5 minutes late (Play
+    // Services' fences, fed the same positions, were fooled too). On
+    // 2026-11-09 drifting ones put GPS on 19 times in a day at home.
+    //
+    // So several signals may now say "maybe moving", and only a precise fix
+    // decides (MotionJudge has the rules and the reasons):
+    //
+    //  - activity recognition (MotionSignalReceiver), if the person allowed
+    //    Physical activity: a vehicle or bicycle opens a WATCH (dense for
+    //    STILL_AFTER, as a doze exit does), walking asks for a CHECK;
+    //  - the significant-motion sensor: a CHECK;
+    //  - losing the last Wi-Fi network: a WATCH;
+    //  - a rough position far from the ANCHOR, where the phone stopped: a
+    //    CHECK, where it used to go dense outright.
+    //
+    // A CHECK is one fresh GPS fix (getCurrentLocation, no cached answer
+    // accepted). Each source backs off after turning out to be nothing.
+    // Everything here runs on the main looper: the location callback, the
+    // check's answer, the sensor, and the Wi-Fi and activity signals, which
+    // are posted to it. One thread decides, so nothing here needs a lock.
+    private static final long CHECK_TIMEOUT_MS = 30_000;
+    private MotionJudge.Anchor anchor;              // low-power only; null when unknown
+    private double provenDriftM = 0;                // see MotionJudge.roughAsksForCheck
+    private final MotionJudge.Backoff[] backoff = newBackoffs();
+    private int denseSource = MotionJudge.SRC_NONE; // what opened the current dense spell
+    private boolean denseMoved = false;             // did that spell see real movement?
+    private float lastFixAcc = -1f;
+    private boolean checking = false;
+    private int checkSource = MotionJudge.SRC_NONE;
+    private double checkRoughM = 0;
+    private CancellationTokenSource checkCancel;
+    private int checkGen = 0;
+    private PowerManager.WakeLock checkLock;
+    private SensorManager sensors;
+    private Sensor sigMotion;
+    private boolean sensorArmed = false;
+    private ConnectivityManager.NetworkCallback wifiCallback;
+    private final Set<Network> wifiUp = new HashSet<>();
+
+    private static MotionJudge.Backoff[] newBackoffs() {
+        MotionJudge.Backoff[] b = new MotionJudge.Backoff[MotionJudge.SOURCES];
+        for (int i = 0; i < b.length; i++) b[i] = new MotionJudge.Backoff();
+        return b;
+    }
 
     // ── The "permanent" notification, and what Android allows ─────────
     //
@@ -261,9 +328,9 @@ public class LocationForegroundService extends Service {
      *  Play Services' fence evaluation catch up right now rather than
      *  at the OS's leisure. */
     private void onDozeExit() {
-        dense = true;                     // assume movement until proven still
-        lastMovingMs = System.currentTimeMillis();
-        applyProfile();
+        // Assume movement until proven still. No line of its own: the doze
+        // line above already says "dense profile".
+        enterDense(MotionJudge.SRC_NONE, null);
         try {
             fused.getCurrentLocation(Priority.PRIORITY_HIGH_ACCURACY, null)
                     .addOnSuccessListener(loc -> {
@@ -309,8 +376,33 @@ public class LocationForegroundService extends Service {
     }
 
     public static void stop(Context ctx) {
+        // Every deliberate stop comes through here (pause, sign-out's
+        // stopLocationUpdates, no notification, server rejection), so this is
+        // where the activity signal is withdrawn too: it outlives the process
+        // on purpose, to restart a service the OS killed, and must not
+        // restart one that was stopped deliberately.
+        MotionSignalReceiver.unregister(ctx);
         ctx.getApplicationContext().stopService(
                 new Intent(ctx.getApplicationContext(), LocationForegroundService.class));
+    }
+
+    /**
+     * Activity recognition says the person has started moving
+     * (MotionSignalReceiver). Running: hand it to the decider. Not running
+     * (killed by the OS, or not yet started since boot): start it, which
+     * starts dense, which is the watch. An activity-transition broadcast is
+     * one of the events Android 12+ allows a foreground-service start from.
+     * start() still checks the notification can be shown.
+     */
+    static void onActivitySignal(Context ctx, int source, String what) {
+        PrefsStore prefs = new PrefsStore(ctx);
+        if (!prefs.hasContext() || prefs.isPaused() || prefs.isServerRejected()) return;
+        final LocationForegroundService svc = instance;
+        if (svc != null) {
+            svc.handler.post(() -> svc.onSignal(source));
+            return;
+        }
+        start(ctx, "activity: " + what);
     }
 
     // ── No recording without the notification (4.11.1) ────────────────
@@ -442,6 +534,7 @@ public class LocationForegroundService extends Service {
         // catching kills that ApplicationExitInfo attributes later.
         new PrefsStore(this).journal("fgs: created");
         registerDozeReceiver();
+        setUpMotionSignals();
         fused = LocationServices.getFusedLocationProviderClient(this);
         locationCallback = new LocationCallback() {
             @Override
@@ -489,16 +582,38 @@ public class LocationForegroundService extends Service {
                 // Still idle? Restart the clock so the next gap only counts
                 // doze time that actually falls inside it.
                 if (dozeEnteredMs > 0) dozeEnteredMs = nowMs;
-                // Decide moving-vs-still from these fixes and flip the profile
-                // if it changed. Dense while moving; low-power after
-                // STILL_AFTER of no movement.
-                if (detectMoving(locs)) lastMovingMs = System.currentTimeMillis();
-                boolean shouldBeDense = System.currentTimeMillis() - lastMovingMs < STILL_AFTER_MS;
-                if (shouldBeDense != dense) {
-                    dense = shouldBeDense;
-                    applyProfile();
-                    new PrefsStore(LocationForegroundService.this)
-                            .journal(dense ? "auto: moving — dense profile" : "auto: still — low-power profile");
+                final android.location.Location newest = locs.get(locs.size() - 1);
+                lastFixAcc = newest.hasAccuracy() ? newest.getAccuracy() : -1f;
+                if (isAuto() && !dense) {
+                    // Low power: these fixes are judged against the anchor,
+                    // and only a precise one decides (4.13.0).
+                    judgeLowPowerFixes(locs);
+                } else {
+                    // Decide moving-vs-still from these fixes and flip the
+                    // profile if it changed. Dense while moving; low-power
+                    // after STILL_AFTER of no movement.
+                    if (detectMoving(locs)) {
+                        lastMovingMs = System.currentTimeMillis();
+                        // Real movement resets every backoff. "Real" is
+                        // judged from the anchor, by a precise fix: an indoor
+                        // GPS fix jittering 45 m between samples keeps a watch
+                        // open, but must not erase what the backoff learned.
+                        if (dense && !denseMoved && movedFromAnchor(locs)) {
+                            denseMoved = true;
+                            resetBackoffs();
+                        }
+                    }
+                    boolean shouldBeDense = System.currentTimeMillis() - lastMovingMs < STILL_AFTER_MS;
+                    if (shouldBeDense != dense) {
+                        if (shouldBeDense) {
+                            // Fixed modes only: auto leaves low power above.
+                            dense = true;
+                            applyProfile();
+                            new PrefsStore(LocationForegroundService.this).journal("auto: moving — dense profile");
+                        } else {
+                            enterStill();
+                        }
+                    }
                 }
                 // Off the main thread — processLocations does blocking HTTP —
                 // and onto the ONE worker that runs batches in order, because
@@ -610,12 +725,30 @@ public class LocationForegroundService extends Service {
         // including the START_STICKY restart after a kill (intent == null),
         // so tracking self-heals. Start dense so the beginning of any trip
         // is captured; the callback relaxes it once genuinely still.
+        // A start on a running service (the app opened, a geofence kick)
+        // keeps its anchor: measure the first dense fix from it, as
+        // enterDense does.
+        if (!dense && anchor != null) {
+            lastLat = anchor.lat;
+            lastLng = anchor.lng;
+        }
         dense = true;
         lastMovingMs = System.currentTimeMillis();
+        denseSource = MotionJudge.SRC_NONE;
+        denseMoved = false;
+        disarmSensor();
+        cancelCheck();
         PrefsStore prefs = new PrefsStore(this);
         if (prefs.hasContext()) {
             applyProfile();
-            prefs.journal("fgs: start — " + why + ", foreground=" + (promoted ? "yes" : "no") + ", armed (dense)");
+            // (Re-)register activity recognition on every start: a
+            // registration does not survive a reboot, and Physical activity
+            // may have been allowed since the last one.
+            boolean activity = MotionSignalReceiver.register(this);
+            prefs.journal("fgs: start — " + why + ", foreground=" + (promoted ? "yes" : "no")
+                    + ", armed (dense); signals: activity " + (activity ? "on" : "off")
+                    + ", motion sensor " + (sigMotion != null ? "on" : "none")
+                    + ", Wi-Fi " + (wifiCallback != null ? "on" : "off"));
         } else {
             // Nothing will record until initialize() supplies context. Worth
             // a line: the counters look identical to "armed but starved".
@@ -647,6 +780,328 @@ public class LocationForegroundService extends Service {
         }
     }
 
+    // ── Noticing a trip start (4.13.0): the decider ───────────────────
+
+    /** Only auto adapts. live, balanced and saver are the person's choice. */
+    private boolean isAuto() {
+        String m = new PrefsStore(this).getTrackMode();
+        return !("live".equals(m) || "balanced".equals(m) || "saver".equals(m));
+    }
+
+    /** The in-process signals: the motion sensor and the Wi-Fi watch. */
+    private void setUpMotionSignals() {
+        sensors = (SensorManager) getSystemService(Context.SENSOR_SERVICE);
+        // Optional hardware: most phones have it, and without it the other
+        // signals still work. It is a one-shot wake-up sensor, re-armed
+        // after each event (armSensor).
+        sigMotion = sensors == null ? null : sensors.getDefaultSensor(Sensor.TYPE_SIGNIFICANT_MOTION);
+
+        // Losing the last Wi-Fi network: the phone has probably left the
+        // building it was in. Counted only when NO Wi-Fi network is left, so
+        // a mesh or a hand-over between access points is not a departure.
+        ConnectivityManager cm = (ConnectivityManager) getSystemService(Context.CONNECTIVITY_SERVICE);
+        if (cm == null) return;
+        ConnectivityManager.NetworkCallback cb = new ConnectivityManager.NetworkCallback() {
+            @Override public void onAvailable(Network n) {
+                handler.post(() -> wifiUp.add(n));
+            }
+            @Override public void onLost(Network n) {
+                handler.post(() -> {
+                    if (wifiUp.remove(n) && wifiUp.isEmpty()) onSignal(MotionJudge.SRC_WIFI);
+                });
+            }
+        };
+        try {
+            cm.registerNetworkCallback(new NetworkRequest.Builder()
+                    .addTransportType(NetworkCapabilities.TRANSPORT_WIFI).build(), cb);
+            wifiCallback = cb;
+        } catch (Exception e) {
+            Log.w(TAG, "Wi-Fi watch unavailable", e);
+        }
+    }
+
+    private final TriggerEventListener sigListener = new TriggerEventListener() {
+        @Override public void onTrigger(TriggerEvent event) {
+            // One-shot: the system disarmed it in firing.
+            handler.post(() -> {
+                sensorArmed = false;
+                onSignal(MotionJudge.SRC_SENSOR);
+            });
+        }
+    };
+
+    private final Runnable armSensorLater = this::armSensor;
+
+    /** Arm the motion sensor while auto is on low power. If its backoff is
+     *  running, arm it when the backoff ends: armed now, it would wake the
+     *  processor at every step round the house only to be ignored. */
+    private void armSensor() {
+        handler.removeCallbacks(armSensorLater);
+        if (sigMotion == null || sensors == null || dense || !isAuto() || sensorArmed) return;
+        long wait = backoff[MotionJudge.SRC_SENSOR].untilMs - System.currentTimeMillis();
+        if (wait > 0) {
+            handler.postDelayed(armSensorLater, wait);
+            return;
+        }
+        try {
+            sensorArmed = sensors.requestTriggerSensor(sigListener, sigMotion);
+        } catch (Exception e) {
+            Log.w(TAG, "motion sensor arm failed", e);
+        }
+    }
+
+    private void disarmSensor() {
+        handler.removeCallbacks(armSensorLater);
+        if (sensorArmed && sensors != null && sigMotion != null) {
+            try { sensors.cancelTriggerSensor(sigListener, sigMotion); } catch (Exception ignored) {}
+        }
+        sensorArmed = false;
+    }
+
+    private void resetBackoffs() {
+        for (MotionJudge.Backoff b : backoff) b.reset();
+    }
+
+    /**
+     * Something says the phone may be moving. On dense it is already
+     * watching, so there is nothing to do; on low power a strong signal opens
+     * a watch and a weak one asks for a check, unless that source is backing
+     * off.
+     */
+    void onSignal(int source) {
+        if (!isAuto() || dense || fused == null) return;
+        if (!backoff[source].allow(System.currentTimeMillis())) {
+            if (source == MotionJudge.SRC_SENSOR) armSensor();
+            return;
+        }
+        if (MotionJudge.responseFor(source) == MotionJudge.WATCH) {
+            enterDense(source, MotionJudge.sourceName(source));
+        } else {
+            check(source, 0);
+        }
+    }
+
+    /** Low-power fixes: judged against the anchor. A precise fix decides; a
+     *  rough one can only ask for a check. */
+    private void judgeLowPowerFixes(List<android.location.Location> locs) {
+        for (android.location.Location l : locs) {
+            final double lat = l.getLatitude(), lng = l.getLongitude();
+            final float acc = l.hasAccuracy() ? l.getAccuracy() : -1f;
+            final float speed = l.hasSpeed() ? l.getSpeed() : 0f;
+            lastLat = lat;
+            lastLng = lng;
+            int v = MotionJudge.judgeFix(lat, lng, acc, speed, anchor);
+            if (v == MotionJudge.MOVING) {
+                resetBackoffs();
+                enterDense(MotionJudge.SRC_NONE, "precise fix " + fromAnchor(lat, lng) + " from where it stopped");
+                return;
+            }
+            if (v == MotionJudge.STILL) {
+                anchor = anchor == null ? MotionJudge.Anchor.of(lat, lng, acc) : anchor.fold(lat, lng, acc);
+                continue;
+            }
+            // Rough. With no anchor yet, the best available position starts
+            // one; it says how rough it is, and a precise fix soon outweighs it.
+            if (anchor == null) {
+                if (acc >= 0 && acc <= 150f) anchor = MotionJudge.Anchor.of(lat, lng, acc);
+                continue;
+            }
+            double d = GeofenceReceiver.metresBetween(anchor.lat, anchor.lng, lat, lng);
+            if (d <= MotionJudge.movingBar(acc, anchor)) continue;
+            boolean allows = backoff[MotionJudge.SRC_ROUGH].allow(System.currentTimeMillis());
+            if (MotionJudge.roughAsksForCheck(d, acc, anchor, allows, provenDriftM)) {
+                check(MotionJudge.SRC_ROUGH, d);
+                return;
+            }
+        }
+    }
+
+    /**
+     * One fresh GPS fix decides. maxUpdateAge 0, so a cached network position
+     * (the very thing in doubt) cannot answer; 30 s, then no answer. Held
+     * under a wake lock so the processor does not sleep through it. One at a
+     * time: a signal arriving during a check is answered by it.
+     */
+    private void check(int source, double roughM) {
+        if (checking || fused == null) return;
+        checking = true;
+        checkSource = source;
+        checkRoughM = roughM;
+        disarmSensor();
+        try {
+            PowerManager pm = (PowerManager) getSystemService(Context.POWER_SERVICE);
+            if (pm != null) {
+                if (checkLock == null) {
+                    checkLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "roamkeep:check");
+                    checkLock.setReferenceCounted(false);
+                }
+                checkLock.acquire(CHECK_TIMEOUT_MS + 5_000);
+            }
+        } catch (Exception e) {
+            Log.w(TAG, "check wake lock failed", e);
+        }
+        checkCancel = new CancellationTokenSource();
+        // A check abandoned by cancelCheck can still answer late; the
+        // generation makes sure that answer is never read as a newer one's.
+        final int gen = ++checkGen;
+        try {
+            CurrentLocationRequest req = new CurrentLocationRequest.Builder()
+                    .setPriority(Priority.PRIORITY_HIGH_ACCURACY)
+                    .setMaxUpdateAgeMillis(0)
+                    .setDurationMillis(CHECK_TIMEOUT_MS)
+                    .build();
+            fused.getCurrentLocation(req, checkCancel.getToken())
+                    .addOnCompleteListener(task -> {
+                        if (gen != checkGen) return;
+                        onCheckResult(task.isSuccessful() ? task.getResult() : null, task.isCanceled());
+                    });
+        } catch (SecurityException e) {
+            Log.w(TAG, "check: missing location permission", e);
+            finishCheck();
+        }
+    }
+
+    private void finishCheck() {
+        checking = false;
+        if (checkLock != null) {
+            try { if (checkLock.isHeld()) checkLock.release(); } catch (Exception ignored) {}
+        }
+    }
+
+    /** Abandon a check in flight (the profile went dense another way, or the
+     *  service is stopping). Its answer is then ignored. */
+    private void cancelCheck() {
+        checkGen++;
+        if (checkCancel != null) {
+            try { checkCancel.cancel(); } catch (Exception ignored) {}
+            checkCancel = null;
+        }
+        finishCheck();
+    }
+
+    private void onCheckResult(android.location.Location loc, boolean cancelled) {
+        if (!checking || cancelled) return;     // abandoned: dense already, or stopping
+        finishCheck();
+        final int source = checkSource;
+        final long now = System.currentTimeMillis();
+        int v = MotionJudge.UNKNOWN;
+        if (loc != null) {
+            final float acc = loc.hasAccuracy() ? loc.getAccuracy() : -1f;
+            v = MotionJudge.judgeFix(loc.getLatitude(), loc.getLongitude(), acc,
+                    loc.hasSpeed() ? loc.getSpeed() : 0f, anchor);
+            // Through the shared serial worker like any other fix, so the
+            // pin and trail see it (the doze-exit fix does the same).
+            LocationUpdateReceiver.submit(getApplicationContext(), Collections.singletonList(loc), null);
+        }
+        new PrefsStore(this).recordMotionCheck(v, source);
+        if (dense || !isAuto()) return;         // decided another way meanwhile
+
+        if (MotionJudge.checkGoesDense(v, source)) {
+            if (v == MotionJudge.MOVING) {
+                resetBackoffs();
+                enterDense(MotionJudge.SRC_NONE, "check after " + MotionJudge.sourceName(source) + ", "
+                        + fromAnchor(loc.getLatitude(), loc.getLongitude()) + " from where it stopped");
+            } else {
+                // No GPS answer to a rough position: GPS anyway, as before
+                // 4.13.0. If that watch ends still, this source backs off.
+                enterDense(source, MotionJudge.sourceName(source) + ", no GPS fix to check it");
+            }
+            return;
+        }
+        if (v == MotionJudge.STILL) {
+            final float acc = loc.hasAccuracy() ? loc.getAccuracy() : -1f;
+            anchor = anchor == null ? MotionJudge.Anchor.of(loc.getLatitude(), loc.getLongitude(), acc)
+                                    : anchor.fold(loc.getLatitude(), loc.getLongitude(), acc);
+            if (source == MotionJudge.SRC_ROUGH) provenDriftM = Math.max(provenDriftM, checkRoughM);
+        }
+        backoff[source].onNothing(now);
+        armSensor();
+    }
+
+    /** Has any fix in this batch left the anchor by MotionJudge's rule? With
+     *  no anchor there is nothing to have left, and detectMoving's verdict
+     *  (which the caller has already had) stands. */
+    private boolean movedFromAnchor(List<android.location.Location> locs) {
+        if (anchor == null) return true;
+        for (android.location.Location l : locs) {
+            if (MotionJudge.judgeFix(l.getLatitude(), l.getLongitude(),
+                    l.hasAccuracy() ? l.getAccuracy() : -1f,
+                    l.hasSpeed() ? l.getSpeed() : 0f, anchor) == MotionJudge.MOVING) return true;
+        }
+        return false;
+    }
+
+    /** "240m" from the anchor, or "?" without one. Distances only: the
+     *  journal never carries a coordinate. */
+    private String fromAnchor(double lat, double lng) {
+        if (anchor == null) return "?";
+        long m = Math.round(GeofenceReceiver.metresBetween(anchor.lat, anchor.lng, lat, lng));
+        return m >= 1000 ? String.format(java.util.Locale.US, "%.1fkm", m / 1000.0) : m + "m";
+    }
+
+    /**
+     * Go dense (GPS). `source` is the signal that opened this spell, or
+     * SRC_NONE when movement is already established; if the spell ends still
+     * without seeing movement, that source backs off. `why` goes on the
+     * journal line, or null for no line (the caller wrote its own).
+     *
+     * detectMoving measures the first GPS fix against the previous fix,
+     * which on low power was a rough one; measured from the anchor instead,
+     * a watch at home does not count its own first fix as travel.
+     */
+    private void enterDense(int source, String why) {
+        final boolean was = dense;
+        if (!was && anchor != null) {
+            lastLat = anchor.lat;
+            lastLng = anchor.lng;
+        }
+        dense = true;
+        lastMovingMs = System.currentTimeMillis();
+        denseSource = source;
+        denseMoved = false;
+        disarmSensor();
+        cancelCheck();
+        applyProfile();
+        if (!was && why != null) {
+            new PrefsStore(this).journal("auto: moving — dense profile (" + why + ")");
+        }
+    }
+
+    /**
+     * Back to low power after STILL_AFTER of no movement. The new anchor is
+     * the last fix, folded into the old one if this was a watch that went
+     * nowhere (same place, and what was learned there about drift still
+     * holds); otherwise a fresh start.
+     */
+    private void enterStill() {
+        final long now = System.currentTimeMillis();
+        final boolean auto = isAuto();
+        if (auto && !denseMoved && denseSource != MotionJudge.SRC_NONE) {
+            backoff[denseSource].onNothing(now);
+        }
+        final boolean wentNowhere = !denseMoved;
+        dense = false;
+        denseSource = MotionJudge.SRC_NONE;
+        denseMoved = false;
+        if (!Double.isNaN(lastLat) && lastFixAcc >= 0 && lastFixAcc <= 150f) {
+            boolean samePlace = wentNowhere && anchor != null
+                    && GeofenceReceiver.metresBetween(anchor.lat, anchor.lng, lastLat, lastLng)
+                       <= MotionJudge.movingBar(lastFixAcc, anchor);
+            if (samePlace) {
+                anchor = anchor.fold(lastLat, lastLng, lastFixAcc);
+            } else {
+                anchor = MotionJudge.Anchor.of(lastLat, lastLng, lastFixAcc);
+                provenDriftM = 0;
+            }
+        } else if (!wentNowhere) {
+            anchor = null;
+            provenDriftM = 0;
+        }
+        applyProfile();
+        new PrefsStore(this).journal("auto: still — low-power profile");
+        if (auto) armSensor();
+    }
+
     @Override
     public void onDestroy() {
         running = false;
@@ -656,6 +1111,18 @@ public class LocationForegroundService extends Service {
         if (dozeReceiver != null) {
             try { unregisterReceiver(dozeReceiver); } catch (Exception ignored) {}
             dozeReceiver = null;
+        }
+        // The in-process signals end with the service. Activity recognition
+        // does not: it is how a killed service comes back (stop() withdraws
+        // it when the stop is deliberate).
+        disarmSensor();
+        cancelCheck();
+        if (wifiCallback != null) {
+            try {
+                ConnectivityManager cm = (ConnectivityManager) getSystemService(Context.CONNECTIVITY_SERVICE);
+                if (cm != null) cm.unregisterNetworkCallback(wifiCallback);
+            } catch (Exception ignored) {}
+            wifiCallback = null;
         }
         if (fused != null && locationCallback != null) {
             try { fused.removeLocationUpdates(locationCallback); } catch (Exception ignored) {}

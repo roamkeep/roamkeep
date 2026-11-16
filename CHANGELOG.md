@@ -7,6 +7,40 @@ the app says so, and an owner updates it from **Settings → Family server**.
 An older server keeps working; it just goes without the new features that
 need it.
 
+## 4.13.0 (in testing)
+
+No server update is needed.
+
+- **Trips are noticed when they start, not when the phone catches up.**
+  While someone sits still, Roamkeep saves battery by using the rough
+  position a phone works out from Wi-Fi and mobile networks. That position
+  can go stale: one phone said it was still at home five minutes into a
+  school run, so the drive was never recorded and "left Home" came nearly
+  ten minutes late. Now several signs that a trip has started wake GPS to
+  check: the phone leaving its Wi-Fi network, the phone's motion sensor,
+  a rough position far from where the phone stopped, and, if you allow it,
+  Android's activity recognition, which notices within about a minute that
+  someone has started driving, cycling or walking. Only GPS decides.
+- **Less GPS while sitting still.** A rough position wandering around a
+  phone on a table used to switch GPS on for three minutes or more at a
+  time, many times a day. Now one quick GPS check settles it, and a phone
+  that keeps wandering the same way is not checked again.
+- **New, optional: Physical activity.** The setup list asks for it once.
+  What it learns is used on the phone only and never sent anywhere. Without
+  it, the other signs still work.
+- **See who is driving, riding or walking.** A small 🚗, 🚴 or 🚶 on
+  someone's map pin while they are on the move, a short fading tail behind
+  it showing which way they are heading, and a line on their Family card
+  such as "🚗 Driving for 6 min". It is worked out from the trip they are
+  on, the same way History labels trips, so the two always agree. Someone
+  sitting still shows nothing. If their phone stops reporting mid-trip, the
+  icon turns grey and the card says "Was driving when last seen". Speed is
+  never shown.
+- **Family cards show places straight away.** When the app opened, the
+  cards could show coordinates instead of "At Home" for up to a minute.
+- **Tracking diagnostics** show which signs this phone has and what the GPS
+  checks found.
+
 ## 4.12.1 (in testing)
 
 No server update is needed.

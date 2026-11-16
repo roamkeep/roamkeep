@@ -1495,7 +1495,15 @@
         const st = await setupStatus();
         _hadBackgroundLocation = st ? !!st.backgroundLocation : null;
         if (st) await applyDisclosureState(st);
-        if (await setupIncomplete()) await openSetup();
+        // 4.13.0: Physical activity is optional, so on its own it would never
+        // open the sheet, and a phone that updated would never be asked. Ask
+        // once, on the first launch that finds it missing; never again.
+        const askActivity = !!st && st.activityRecognition === false
+          && !(await prefGet(ACTIVITY_ASKED_KEY));
+        if (await setupIncomplete() || askActivity) {
+          if (askActivity) await prefSet(ACTIVITY_ASKED_KEY, '1');
+          await openSetup();
+        }
       } finally {
         // The last moment launch may open a sheet. Anything that wants to
         // open one of its own (the invite after creating a Keep, a role
@@ -1517,6 +1525,9 @@
       // while they're still in the relative window; once they cross the
       // 1h mark formatActivityTime switches to a static absolute time.
       setInterval(renderCheckins, 60000);
+      // A phone that stops reporting mid-drive turns grey (4.13.0). No event
+      // says so; only time passing does.
+      setInterval(motionChanged, 30000);
       // Re-evaluate the Live/Stale header badge every 30 s. The badge
       // also updates immediately on every pushLocation, but a periodic
       // tick is what catches the transition Live → Stale during long
@@ -1740,6 +1751,9 @@
     S.members = rows.filter(m => m.approved !== false);
     S.pending = rows.filter(m => m.approved === false);
     renderMembers();
+    // What each of them is doing (4.13.0). Not awaited: the list is drawn,
+    // and the badges follow when the breadcrumbs land.
+    readMotion(S.members.map(m => m.id));
     syncSosFromRow();
     checkMyRole();   // a role change made while this phone wasn't looking
     checkResetNotice();   // likewise a reset code made or used for this account
@@ -1794,6 +1808,11 @@
     const at = checkedInPlace(S.members.find(m => m.id === S.myId));
     if (at) S.insidePlaces.add(at.id);
     renderPlaces();
+    // The cards say where people are in terms of places, and at launch they
+    // were drawn before this list arrived: everyone read as coordinates
+    // until a pin update or the minute's redraw. Their driving or walking
+    // line needs it too (the nearest place, and a stop inside one).
+    renderMembers();
     return true;
   }
 
@@ -1872,6 +1891,7 @@
           if (!gone) return;
           if (gone === S.myId) { if (!_leaving) onRemovedFromKeep(); return; }
           S.members = S.members.filter(m => m.id !== gone);
+          _motion.delete(gone);
           // A join declined by another owner, or withdrawn by its sender.
           S.pending = S.pending.filter(m => m.id !== gone);
           renderMembers();
@@ -1921,6 +1941,7 @@
         }
         renderMembers();
         renderPins();
+        notePin(c);
       })
       .on('postgres_changes', {
         event: 'INSERT', schema: 'public', table: 'checkins',
@@ -2038,6 +2059,8 @@
         S.trail.push({ lat: row.lat, lng: row.lng, speed: row.speed,
                        recorded_at: row.recorded_at });
         updateTrailPill();
+        // The same row keeps their badge current between reads.
+        if (addMotionPoints(row.member_id, [row])) motionChanged();
         scheduleDraw();
       })
       .subscribe();
@@ -2423,6 +2446,7 @@
     if (keys.length > 200) keys.slice(0, 60).forEach(k => delete S.tiles[k]);
     drawPlaceCircles(ctx);
     drawTrail(ctx);
+    drawMotionTails(ctx);
     renderPins();
   }
 
@@ -2730,12 +2754,21 @@
       const cls = 'map-pin' +
         (m.id === S.myId ? ' me' : '') +
         (m.sos ? ' sos' : '');
-      frag.appendChild(el('div', {
+      // Driving, riding or walking (4.13.0): a badge, grey once their phone
+      // has gone quiet. Still means no badge, so a quiet map stays quiet.
+      const mo = motionOf(m);
+      const words = mo ? (MOTION_WORDS[mo.mode] || MOTION_WORDS.walk) : null;
+      const pin = el('div', {
         class: cls,
         style: 'left:' + pos.x + 'px;top:' + pos.y + 'px',
         dataset: { action: 'pin-click', id: m.id },
+        'aria-label': m.name + (words ? ', ' + (mo.stale ? 'was ' : '') + words[1].toLowerCase() : ''),
         text: m.avatar
-      }));
+      });
+      if (words) {
+        pin.appendChild(el('span', { class: 'pin-move' + (mo.stale ? ' quiet' : ''), 'aria-hidden': 'true', text: words[0] }));
+      }
+      frag.appendChild(pin);
     }
     clear(host);
     host.appendChild(frag);
@@ -2803,6 +2836,8 @@
       : paused ? ('⏸ Location paused' + (m.paused_until ? ' · resumes ' + pauseClock(m.paused_until) : ''))
       : (m.status || '') }));
     if (!paused) {
+      const mo = motionOf(m);
+      if (mo) pop.appendChild(el('div', { class: 'pp-s', text: motionText(m, mo) }));
       pop.appendChild(el('div', { class: 'pp-s',
         text: '🔋 ' + m.battery + '%' + (m.last_seen ? ' · ' + timeAgo(m.last_seen) : '') }));
     }
@@ -3036,6 +3071,15 @@
         rows.push(['Battery unrestricted', st.ignoringBatteryOptimizations ? 'Yes' : 'No', !!st.ignoringBatteryOptimizations]);
         rows.push(['Notifications allowed', st.notifications ? 'Yes' : 'No', !!st.notifications]);
         rows.push(['Permissions kept (no auto-reset)', st.autoRevokeWhitelisted ? 'Yes' : 'No', !!st.autoRevokeWhitelisted]);
+        // 4.13.0: what can wake GPS when a trip starts, and what the GPS
+        // checks those signals asked for found. Older native builds report
+        // neither, so the rows appear only when there is something to say.
+        if (st.activityRecognition !== undefined) {
+          rows.push(['Physical activity', st.activityRecognition ? 'Yes' : 'No', !!st.activityRecognition]);
+          rows.push(['Motion sensor', st.motionSensor ? 'Yes' : 'Not on this phone', null]);
+          rows.push(['GPS checks: moving / still / no fix',
+            (st.checkMovingCount || 0) + ' / ' + (st.checkStillCount || 0) + ' / ' + (st.checkNoneCount || 0), null]);
+        }
         rows.push(['Background fixes recorded', String(st.locationFireCount || 0), (st.locationFireCount || 0) > 0]);
         // A tick when points are flowing, but NEVER a cross. Zero written is
         // the correct answer for a phone that has not left a saved place, and
@@ -4447,11 +4491,17 @@
       // is exactly what they chose to stop sharing. Suppressed on SOS
       // too, because the status line is already shouting and the
       // navigable position belongs on the SOS activity entry.
-      const whereText = (paused || m.sos) ? '' : whereIs(m);
+      // Driving, riding or walking (4.13.0; motionOf says nothing during a
+      // pause or an SOS), on its own line above the where line: one line for
+      // both was cut short on a phone. Greyed once their phone has gone
+      // quiet. While they are moving, the where line drops its "At".
+      const mo = motionOf(m);
+      const whereText = (paused || m.sos) ? '' : (mo && !mo.stale) ? whereMoving(m) : whereIs(m);
 
       const main = el('div', { class: 'mc-main' }, [
         nameEl,
         el('div', { class: 'mc-st', text: statusText }),
+        mo ? el('div', { class: 'mc-where mc-move' + (mo.stale ? ' quiet' : ''), text: motionText(m, mo) }) : null,
         whereText ? el('div', { class: 'mc-where', text: '📍 ' + whereText }) : null,
         // What being a child means, on the child's own card: the limits,
         // and the one thing that is always theirs to do.
@@ -5186,6 +5236,304 @@
     return [lead, drive, tail].filter(Boolean);
   }
 
+  // ── WHAT SOMEONE IS DOING NOW (4.13.0) ─────────────────────────
+  //
+  // Driving, riding or walking: the badge on a member's pin, the fading tail
+  // behind it, and the first line of their Family card.
+  //
+  // Worked out from their breadcrumbs, never from the Physical activity
+  // permission. The privacy page promises that never leaves the phone, and a
+  // member who said no to it has to read the same as one who said yes.
+  // Breadcrumbs carry the verdict that matters anyway: LocationUpdateReceiver
+  // writes none while the phone is still, none inside a saved place and none
+  // from a fix too rough to trust, so a phone still writing them has decided
+  // it is moving. A pin says only that the phone is alive. A still one writes
+  // it every minute, drift and all, which is why nothing here measures
+  // movement from one pin to the next.
+  //
+  // The label is History's (tripsFrom), from the trip ending at the newest
+  // breadcrumb. So the pin never says Walking for what History will call a
+  // Drive, a trip too short for History shows nothing, and a car crawling in
+  // traffic stays a drive, because a trip is labelled from all of it.
+  //
+  // Breadcrumbs are not on the main realtime channel (subscribeTrail says
+  // why), so they are read: for the family when the member list loads, then
+  // for one member when their pin says something may have changed (notePin).
+  //
+  // Known limit: nothing is written inside a saved place, so nothing shows
+  // while someone crosses one (a town saved as a place, say) until they leave.
+
+  // Moving means a breadcrumb within this of their last sign of life, and
+  // live means a sign of life within this of now. Longer than saver mode's
+  // two minutes between pins, the slowest any phone reports while moving.
+  const MOTION_FRESH_MS = 3 * 60 * 1000;
+  // How far back the first read goes from their last sign of life, and how
+  // much is kept. A trip that began before it shows no "for N min".
+  const MOTION_WINDOW_MS = 30 * 60 * 1000;
+  // At most one read per member this often while they are moving.
+  const MOTION_READ_MS = 20 * 1000;
+  // The tail behind a moving pin: the last two minutes, drawn no longer than
+  // MOTION_TAIL_PX. Two minutes of driving is a third of the screen at street
+  // zoom and reads as a route; capped, a walker's tail is still the shorter.
+  const MOTION_TAIL_MS = 2 * 60 * 1000;
+  const MOTION_TAIL_PX = 130;
+  // The first stretch is under the 42 px pin, so the fade starts at its edge.
+  const MOTION_TAIL_HIDDEN_PX = 21;
+  // One read's ceiling: half an hour of someone driving.
+  const MOTION_READ_ROWS = 1500;
+  // How long a walk at the end of a drive must last before the pin says
+  // Walking. History splits off two minutes on foot (WALK_LEG_MIN_MS), but
+  // that is at the end of a FINISHED trip. Live, the end is now, and by speed
+  // alone two minutes in a traffic jam is a walk. A pin that says Driving a
+  // few minutes into a walk from the car park is late; one that says Walking
+  // in a jam is wrong. Known limit: a jam this long at walking pace all the
+  // way through still reads as a walk.
+  const MOTION_WALK_AFTER_DRIVE_MS = 5 * 60 * 1000;
+  // History's icons, so the pin and the timeline say the same thing.
+  const MOTION_WORDS = { drive: ['🚗', 'Driving'], ride: ['🚴', 'Riding'], walk: ['🚶', 'Walking'] };
+
+  /**
+   * What someone was doing at their last sign of life, or null.
+   *
+   * `pts` are their recent breadcrumbs, oldest first. `pin` is { ms, inPlace }:
+   * when their pin was written and whether it is inside a saved place. The
+   * answer is { mode, startMs, aliveMs, stale }; `stale` when that sign of
+   * life is older than MOTION_FRESH_MS, so the family is told what the phone
+   * was last doing, not what it is doing.
+   *
+   * A pin inside a saved place and newer than every breadcrumb has stopped
+   * there. Nothing is written inside a place, so it is the pin that says so,
+   * at once, rather than the breadcrumbs going quiet three minutes later.
+   */
+  function motionFrom(pts, pin, nowMs) {
+    if (!pts || !pts.length) return null;
+    const newestMs = Date.parse(pts[pts.length - 1].recorded_at);
+    if (!isFinite(newestMs)) return null;
+    const pinMs = pin && isFinite(pin.ms) ? pin.ms : -Infinity;
+    const aliveMs = Math.max(newestMs, pinMs);
+    if (aliveMs - newestMs > MOTION_FRESH_MS) return null;
+    if (pin && pin.inPlace && pinMs > newestMs) return null;
+    const trips = tripsFrom(pts);
+    let cur = trips[trips.length - 1];
+    if (!cur || cur.endMs !== newestMs) return null;
+    // A walk split off the drive it ends (the two share a point), still
+    // shorter than MOTION_WALK_AFTER_DRIVE_MS, is still the drive.
+    const prev = trips[trips.length - 2];
+    if (cur.mode === 'walk' && prev && prev.mode === 'drive' && prev.endMs === cur.startMs
+        && cur.durMs < MOTION_WALK_AFTER_DRIVE_MS) cur = prev;
+    return { mode: cur.mode, startMs: cur.startMs, aliveMs, stale: nowMs - aliveMs > MOTION_FRESH_MS };
+  }
+
+  // Per member: the breadcrumbs read so far (a new array on every change,
+  // because tripsFrom memoises on the array), from when they are complete,
+  // and where and when the last read was.
+  const _motion = new Map();
+
+  function motionSlot(id) {
+    let s = _motion.get(id);
+    if (!s) {
+      s = { pts: [], fromMs: NaN, readMs: 0, readSeenMs: 0, readLat: null, readLng: null, busy: false };
+      _motion.set(id, s);
+    }
+    return s;
+  }
+
+  /** Adds breadcrumb rows to a member's slot; true if any was new. */
+  function addMotionPoints(id, rows) {
+    const s = motionSlot(id);
+    const have = new Set(s.pts.map(p => Date.parse(p.recorded_at)));
+    const fresh = [];
+    for (const r of (rows || [])) {
+      if (!r || typeof r.lat !== 'number' || typeof r.lng !== 'number') continue;
+      const t = Date.parse(r.recorded_at);
+      if (!isFinite(t) || have.has(t)) continue;
+      have.add(t);
+      fresh.push({ lat: r.lat, lng: r.lng, speed: r.speed, recorded_at: r.recorded_at });
+    }
+    if (!fresh.length) return false;
+    const pts = s.pts.concat(fresh)
+      .sort((a, b) => Date.parse(a.recorded_at) - Date.parse(b.recorded_at));
+    const keepFrom = Date.parse(pts[pts.length - 1].recorded_at) - MOTION_WINDOW_MS;
+    s.pts = pts.filter(p => Date.parse(p.recorded_at) >= keepFrom);
+    if (isFinite(s.fromMs)) s.fromMs = Math.max(s.fromMs, keepFrom);
+    return true;
+  }
+
+  /**
+   * Reads breadcrumbs for these members, one request for all of them. Each
+   * member's window ends at their own last sign of life, so a phone that went
+   * quiet mid-drive an hour ago still reads as having been driving.
+   */
+  async function readMotion(ids) {
+    if (!S.sb || !S.keepId) return;
+    const want = [];
+    for (const id of ids) {
+      const m = S.members.find(x => x.id === id);
+      if (!m || isPausedRow(m) || !m.last_seen) continue;
+      const seenMs = Date.parse(m.last_seen);
+      if (!isFinite(seenMs)) continue;
+      const s = motionSlot(id);
+      // Read already, and no sign of life since: nothing can have changed.
+      if (s.busy || (s.readSeenMs && seenMs <= s.readSeenMs)) continue;
+      const newest = s.pts.length ? Date.parse(s.pts[s.pts.length - 1].recorded_at) : NaN;
+      // A minute behind the newest: a batch queued on a bad connection lands
+      // late, with older times than rows already read.
+      const from = isFinite(s.fromMs) && isFinite(newest) ? newest - 60 * 1000 : seenMs - MOTION_WINDOW_MS;
+      want.push({ id, m, s, from, seenMs });
+    }
+    if (!want.length) return;
+    for (const w of want) w.s.busy = true;
+    try {
+      // Times quoted: PostgREST reserves '.' and ':' inside or().
+      const or = want.map(w => 'and(member_id.eq.' + w.id + ',recorded_at.gt."'
+        + new Date(w.from).toISOString() + '")').join(',');
+      const { data, error } = await S.sb.from('location_history')
+        .select('member_id,lat,lng,speed,recorded_at')
+        .eq('keep_id', S.keepId).or(or)
+        .order('recorded_at', { ascending: false }).limit(MOTION_READ_ROWS);
+      // A failed read changes nothing: what is on screen stays, and the next
+      // pin or resume asks again.
+      if (error) { console.warn('readMotion', error.code || '', error.message || ''); return; }
+      const rows = data || [];
+      // A full page lost its oldest rows, so the read is complete only from
+      // the oldest row it has.
+      const floor = rows.length >= MOTION_READ_ROWS ? Date.parse(rows[rows.length - 1].recorded_at) : -Infinity;
+      for (const w of want) {
+        if (!isFinite(w.s.fromMs)) w.s.fromMs = Math.max(w.from, floor);
+        addMotionPoints(w.id, rows.filter(r => r.member_id === w.id));
+        w.s.readMs = Date.now();
+        w.s.readSeenMs = w.seenMs;
+        w.s.readLat = w.m.lat;
+        w.s.readLng = w.m.lng;
+      }
+      motionChanged();
+    } catch (e) {
+      console.warn('readMotion', e);
+    } finally {
+      for (const w of want) w.s.busy = false;
+    }
+  }
+
+  /**
+   * A member's pin landed. Read their breadcrumbs again if what they are
+   * doing may have changed: every MOTION_READ_MS while they are moving, and
+   * otherwise once the pin is further from where it was at the last read
+   * than the widest fix a pin is written from (CHECKED_IN_SLACK_M), so drift
+   * round a parked phone reads nothing.
+   */
+  function notePin(m) {
+    if (!m || isPausedRow(m) || typeof m.lat !== 'number' || typeof m.lng !== 'number') return;
+    const mo = motionOf(m);
+    if (mo && !mo.stale) scheduleDraw();   // the tail's head is the pin
+    const s = motionSlot(m.id);
+    if (s.busy || Date.now() - s.readMs < MOTION_READ_MS) return;
+    const moved = s.readLat == null
+      || distanceM(s.readLat, s.readLng, m.lat, m.lng) > CHECKED_IN_SLACK_M;
+    if ((mo && !mo.stale) || moved) readMotion([m.id]);
+  }
+
+  /** motionFrom for a member as they stand, or null. Never during an SOS or
+   *  a pause: those cards say something more important. */
+  function motionOf(m) {
+    if (!m || m.sos || isPausedRow(m) || typeof m.lat !== 'number' || typeof m.lng !== 'number') return null;
+    const s = _motion.get(m.id);
+    if (!s || !s.pts.length) return null;
+    const pinMs = m.last_seen ? Date.parse(m.last_seen) : NaN;
+    return motionFrom(s.pts, { ms: pinMs, inPlace: !!placeContaining(m.lat, m.lng) }, Date.now());
+  }
+
+  /**
+   * The words for it. Live: "🚗 Driving for 6 min". Gone quiet: "🚗 Was
+   * driving when last seen", beside the card's own last-seen time.
+   */
+  function motionText(m, mo) {
+    const [ico, verb] = MOTION_WORDS[mo.mode] || MOTION_WORDS.walk;
+    if (mo.stale) return ico + ' Was ' + verb.toLowerCase() + ' when last seen';
+    let text = ico + ' ' + verb;
+    // Timed on the moving phone's own clock at both ends. Not when the trip
+    // began before what was read: "for 30 min" would be a guess.
+    const s = _motion.get(m.id);
+    const dur = mo.aliveMs - mo.startMs;
+    if (s && isFinite(s.fromMs) && mo.startMs - s.fromMs >= 60 * 1000 && dur >= 60 * 1000) {
+      text += ' for ' + formatDur(dur);
+    }
+    return text;
+  }
+
+  /** Where someone on the move is: whereIs without its "At", because "At
+   *  School" is the wrong word for driving past it. */
+  function whereMoving(m) {
+    const near = nearestPlace(m.lat, m.lng);
+    if (near && near.metres <= NEAR_PLACE_MAX_M) {
+      return formatDistance(near.metres) + ' from ' + near.place.icon + ' ' + near.place.name;
+    }
+    return formatCoords(m.lat, m.lng);
+  }
+
+  // Redraws when what someone is doing changes. Going quiet is time passing,
+  // which no event announces, so this also runs on a timer.
+  let _motionSig = '';
+  function motionChanged() {
+    const sig = S.members.map(m => {
+      const mo = motionOf(m);
+      return m.id + ':' + (mo ? mo.mode + (mo.stale ? '-' : '+') : '');
+    }).join('|');
+    if (sig !== _motionSig) {
+      _motionSig = sig;
+      renderMembers();
+    }
+    scheduleDraw();
+  }
+
+  /**
+   * The last MOTION_TAIL_MS of a moving member's trip, fading out behind
+   * their pin: which way they are heading and roughly how fast, with no
+   * number on it. Not for the member whose whole trail is on screen, and not
+   * once their phone has gone quiet.
+   */
+  function drawMotionTails(ctx) {
+    ctx.save();
+    // Butt ends: the tail is drawn in short translucent pieces, and round
+    // ends would overlap at every join and bead it.
+    ctx.lineCap = 'butt';
+    ctx.lineWidth = 5;
+    ctx.strokeStyle = '#0E7C7B';
+    for (const m of S.members) {
+      if (m.id === S.trailMemberId) continue;
+      const mo = motionOf(m);
+      if (!mo || mo.stale) continue;
+      const pinMs = m.last_seen ? Date.parse(m.last_seen) : NaN;
+      const fromMs = Math.max(mo.startMs, (isFinite(pinMs) ? pinMs : mo.aliveMs) - MOTION_TAIL_MS);
+      // Up to the pin, never past it: breadcrumbs are read a few seconds
+      // ahead of the throttled pin, and a tail beyond its head reads backwards.
+      const px = _motion.get(m.id).pts.filter(p => {
+        const t = Date.parse(p.recorded_at);
+        return t >= fromMs && !(t > pinMs);
+      }).map(p => ll2px(p.lat, p.lng));
+      px.push(ll2px(m.lat, m.lng));
+      // Back from the head in pieces of a few pixels, each fainter by its
+      // distance along the path, until MOTION_TAIL_PX.
+      let along = 0;
+      for (let i = px.length - 1; i > 0 && along < MOTION_TAIL_PX; i--) {
+        const b = px[i], a = px[i - 1];
+        const len = Math.hypot(b.x - a.x, b.y - a.y);
+        for (let d = 0; d < len && along < MOTION_TAIL_PX; ) {
+          const step = Math.min(6, len - d, MOTION_TAIL_PX - along);
+          const p0 = d / len, p1 = (d + step) / len;
+          const seen = Math.max(0, along + step / 2 - MOTION_TAIL_HIDDEN_PX);
+          ctx.globalAlpha = 0.8 * (1 - seen / (MOTION_TAIL_PX - MOTION_TAIL_HIDDEN_PX));
+          ctx.beginPath();
+          ctx.moveTo(b.x + (a.x - b.x) * p0, b.y + (a.y - b.y) * p0);
+          ctx.lineTo(b.x + (a.x - b.x) * p1, b.y + (a.y - b.y) * p1);
+          ctx.stroke();
+          d += step;
+          along += step;
+        }
+      }
+    }
+    ctx.restore();
+  }
+
   // Stays at saved places, from arrived/left pairs (4.12.1).
   //
   // Paired per place: a "left" ends that place's stay. Until 4.12.1 one stay
@@ -5708,6 +6056,16 @@
       action: 'setup-fix-battery', cta: 'Allow'
     },
     {
+      // 4.13.0: optional. Activity recognition tells the phone within about
+      // a minute that a drive, ride or walk has started, which wakes GPS
+      // even when the phone's own position is out of date (a school run
+      // went unrecorded that way on 2026-11-10). Used on the phone only.
+      key: 'activityRecognition', required: false, icon: '🚶',
+      title: 'Physical activity',
+      why: 'Notices the moment a drive or walk starts, even when your phone’s position is out of date. Used on this phone only, never sent anywhere.',
+      action: 'setup-fix-activity', cta: 'Allow'
+    },
+    {
       // 4.11.1: required. Roamkeep shows a notification whenever it shares
       // your location, and stops sharing if it can't (see
       // applyDisclosureState). This also answers for a blocked tracking
@@ -5729,6 +6087,8 @@
   // buried everything else — so collapse near-simultaneous requests.
   let _lastArmMs = 0;
   const ARM_THROTTLE_MS = 15000;
+  // Set once the setup sheet has been opened to ask for Physical activity.
+  const ACTIVITY_ASKED_KEY = 'rk_activity_asked';
 
   // What the OS is currently registered for, as a comparable string.
   // Anything that changes a fence's geometry has to be in here, or a
@@ -5926,6 +6286,26 @@
     // The dialog resolves immediately; the answer lands when we resume.
   }
 
+  // Physical activity (4.13.0, optional). Android stops showing the dialog
+  // after it has been refused twice and answers at once; an answer that
+  // quick means no dialog was shown, so go where the setting lives instead
+  // of doing nothing. A slower "denied" is the person saying no: leave it.
+  async function setupFixActivity() {
+    const NG = nativeGeo();
+    if (!NG || typeof NG.requestActivityRecognition !== 'function') return;
+    const t0 = Date.now();
+    let res = null;
+    try { res = await NG.requestActivityRecognition(); } catch (_) {}
+    if (res && res.status === 'granted') {
+      toast('✅ Trips starting are noticed sooner now', 'ok');
+    } else if (Date.now() - t0 < 500) {
+      toast('Choose Allow under Permissions → Physical activity');
+      try { await NG.openAppSettings(); } catch (_) {}
+      return;
+    }
+    await renderSetup();
+  }
+
   async function setupFixNotifications() {
     // Registering the token and creating the channels is what actually makes
     // push work; this used to request the permission and stop there, so a
@@ -5967,6 +6347,9 @@
       toast('✅ Arrive/leave alerts are now active', 'ok');
     }
     _hadBackgroundLocation = nowHas;
+    // Physical activity allowed in system settings needs nothing here: every
+    // resume restarts the tracking service, and its start registers activity
+    // recognition whenever the permission is there.
     await applyDisclosureState(st);
     // Keep the sheet honest if it happens to be open.
     if ($('setup-sheet') && $('setup-sheet').classList.contains('open')) {
@@ -6682,6 +7065,7 @@
     'setup-fix-location': setupFixLocation,
     'setup-fix-background': setupFixBackground,
     'setup-fix-battery': setupFixBattery,
+    'setup-fix-activity': setupFixActivity,
     'setup-fix-notifications': setupFixNotifications,
     'rotate-code': rotateCode,
     'share-invite': shareInvite,
