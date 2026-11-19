@@ -193,6 +193,26 @@ public class MotionJudgeTest {
 
     // ── The journal line ─────────────────────────────────────────────────
 
+    // ── What decided "moving" (4.13.1) ──────────────────────────────────
+
+    @Test public void aSpeedThatDecidedIsNamedWithTheFix() {
+        // judgeFix checks speed first, so the line says speed even when the
+        // distance would also have cleared the bar.
+        assertEquals(MOVING, judge(500, 8f, 2.6f, HOME));
+        assertEquals("fix ±8m at 9.4 km/h", MotionJudge.movingWhy(8f, 2.6f, 500));
+    }
+
+    @Test public void aDistanceThatDecidedIsNamedWithTheFix() {
+        assertEquals(MOVING, judge(64, 8f, NO_SPEED, HOME));
+        assertEquals("fix ±8m, 64m from where it stopped", MotionJudge.movingWhy(8f, NO_SPEED, 64.4));
+        assertEquals("fix ±12m, 1.3km from where it stopped",
+                MotionJudge.movingWhy(12f, 0.6f, 1_300));   // at the speed bar, not over it
+    }
+
+    @Test public void noAnchorSaysOnlyTheFix() {
+        assertEquals("fix ±8m", MotionJudge.movingWhy(8f, NO_SPEED, -1));
+    }
+
     @Test public void theCheckLineSaysCountsAndSourcesOnly() {
         int[] by = new int[MotionJudge.SOURCES];
         by[SRC_SENSOR] = 4;

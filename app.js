@@ -8069,12 +8069,19 @@
 
   // Never shown and never needed: everything goes through the Management
   // API, not a direct database connection. It can be reset in the Supabase
-  // dashboard if anyone ever wants one.
+  // dashboard if anyone ever wants one. A byte is used only below 228, the
+  // largest multiple of the 57 characters that fits in one: the remainder
+  // of a byte above it would favour the first 28 characters.
   function pvDbPassword() {
     const A = 'ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789';
-    const b = new Uint8Array(32);
-    crypto.getRandomValues(b);
-    return Array.from(b, (x) => A[x % A.length]).join('');
+    const limit = 256 - (256 % A.length);
+    let out = '';
+    while (out.length < 32) {
+      for (const x of crypto.getRandomValues(new Uint8Array(32))) {
+        if (x < limit && out.length < 32) out += A[x % A.length];
+      }
+    }
+    return out;
   }
 
   async function pvKeepAwake(on) {

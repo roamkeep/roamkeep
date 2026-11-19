@@ -138,6 +138,28 @@ final class MotionJudge {
     }
 
     /**
+     * Why judgeFix said MOVING, for the journal line that goes dense (4.13.1):
+     * the fix's accuracy and the rule that decided, in judgeFix's own order.
+     * A field journal from 4.13.0 showed GPS switched on at home a dozen
+     * times a day and could not say whether a speed or a distance did it.
+     * Never a position.
+     *   "fix ±8m at 9.4 km/h"
+     *   "fix ±8m, 64m from where it stopped"
+     *
+     * @param fromAnchorM distance from the anchor, m; negative for no anchor
+     */
+    static String movingWhy(float acc, float speed, double fromAnchorM) {
+        String fix = "fix ±" + Math.round(Math.max(acc, 0f)) + "m";
+        if (speed > MOVING_SPEED_MS) {
+            return fix + String.format(java.util.Locale.US, " at %.1f km/h", speed * 3.6f);
+        }
+        if (fromAnchorM < 0) return fix;
+        long m = Math.round(fromAnchorM);
+        String dist = m >= 1000 ? String.format(java.util.Locale.US, "%.1fkm", m / 1000.0) : m + "m";
+        return fix + ", " + dist + " from where it stopped";
+    }
+
+    /**
      * Should a rough position ask for a check? Drift stays inside a radius
      * and travel leaves it, so the answer depends on how far out drift has
      * already been PROVEN to reach here (`provenDriftM`: the furthest rough

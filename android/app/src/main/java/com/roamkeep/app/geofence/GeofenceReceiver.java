@@ -4,6 +4,7 @@ import android.content.BroadcastReceiver;
 import android.content.Context;
 import android.content.Intent;
 import android.location.Location;
+import android.os.PowerManager;
 import android.util.Log;
 
 import com.google.android.gms.location.Geofence;
@@ -106,8 +107,10 @@ public class GeofenceReceiver extends BroadcastReceiver {
     // drift-gated one already was, and it leaves the hold the same two ways:
     // confirmed once it has lasted CONFIRM_DWELL_MS, and announced for its
     // ENTER's time; or discarded at its EXIT, and then neither side is
-    // announced. Departures are not held: "left school" is the alert people
-    // wait for, and a "left" is still never sent without its "arrived".
+    // announced. Departures are not held for the dwell: "left school" is the
+    // alert people wait for, and a "left" is still never sent without its
+    // "arrived". Since 4.13.1 they wait DEPART_WAIT_MS, seconds, for a reason
+    // of their own (see "Every departure waits").
     //
     // A precise fix inside no longer confirms anything by itself, because a
     // car driving through gives exactly those. It turns a drift hold into a
@@ -188,6 +191,38 @@ public class GeofenceReceiver extends BroadcastReceiver {
     // REPAIR_SETTLE_MS and CONFIRM_DWELL_MS; the departure itself is dated
     // from the evidence, not from the confirmation.
     static final long EXIT_SETTLE_MS = 3 * 60_000;
+
+    // ── Every departure waits (4.13.1) ─────────────────────────────
+    //
+    // Play Services can say we left a place we never left, and take it back
+    // seconds later. It happens on the first location after deep Doze, when
+    // fences are re-stated: a phone that sat at home all night got EXIT Home
+    // on its first fix of the morning, then ENTER Home 6 to 9 s later. A
+    // clear-cut EXIT was announced at once, and the arrival that followed
+    // was held and announced too, so the family got "left Home" and
+    // "arrived Home" for someone asleep in bed. Four times in one week, on
+    // two of three phones.
+    //
+    // So every EXIT for a place we are inside now WAITS DEPART_WAIT_MS before
+    // it is announced, as a held departure with a due time. State still says
+    // inside, so the ENTER that takes it back lands as it does on a drift
+    // hold: Play Services' next ENTER discards it, and nothing is said either
+    // way. When the wait is over with no ENTER, the departure is announced
+    // through settleDeparture, for the EXIT's own time. This reverses the
+    // 4.12.1 rule that departures are never delayed, by seconds: four of four
+    // phantoms were back inside within 9 s, and "left school" still goes out
+    // within half a minute.
+    //
+    // Only Play Services' ENTER discards a wait. A precise fix inside is our
+    // evidence, not the OS's (the 4.11.4 rule): Play Services has us outside
+    // and would never fire again when they really go.
+    //
+    // Nothing happens at the moment it is due, so three things end a wait:
+    // the worker that made it, which stays awake for it (settleWhenDue); the
+    // breadcrumb batches (confirmHeldExits); and, if the process died in
+    // between, the first batch after the service is back. A late one is
+    // still dated from its EXIT, and says how late in the journal.
+    static final long DEPART_WAIT_MS = 30_000;
 
     // judgeHeldExit verdicts.
     static final int EXIT_WAIT = 0;      // nothing to change
@@ -323,22 +358,27 @@ public class GeofenceReceiver extends BroadcastReceiver {
 
         final PendingResult pr = goAsync();
         new Thread(() -> {
+            long due = 0L;
             try {
-                handleTransitions(context.getApplicationContext(), ids, finalType, whenMs, tLat, tLng, tAcc);
+                due = handleTransitions(context.getApplicationContext(), ids, finalType, whenMs, tLat, tLng, tAcc);
             } catch (Exception e) {
                 Log.w(TAG, "receiver worker failed", e);
             } finally {
                 pr.finish();
             }
+            // After finish(), not inside the broadcast: a wait plus a slow
+            // POST could outlast the broadcast deadline (4.13.1).
+            if (due > 0L) settleWhenDue(context.getApplicationContext(), due);
         }, "RoamkeepGeofenceWorker").start();
     }
 
-    private void handleTransitions(Context ctx, String[] ids, String type, long whenMs,
+    /** @return the latest end of any departure wait this event started, 0 none */
+    private long handleTransitions(Context ctx, String[] ids, String type, long whenMs,
                                    Double tLat, Double tLng, Float tAcc) {
         PrefsStore prefs = new PrefsStore(ctx);
         if (!prefs.hasContext()) {
             Log.w(TAG, "no Supabase context — skipping " + ids.length + " events");
-            return;
+            return 0L;
         }
 
         // A geofence just fired, so the app is alive and not force-stopped.
@@ -358,6 +398,7 @@ public class GeofenceReceiver extends BroadcastReceiver {
         String memberId    = prefs.getMemberId();
 
         boolean anyAccepted = false;
+        long waitDue = 0L;   // latest end of a departure wait this event started (4.13.1)
         // Places this event sent a spurious EXIT for. Play Services can send
         // one for a whole list of fences at once, mid-drive, for places
         // nowhere near — ten in one burst on a 2026-09-26 test drive — and
@@ -473,8 +514,7 @@ public class GeofenceReceiver extends BroadcastReceiver {
                         } else {
                             PrefsStore.HeldExit hx = prefs.claimHeldExit(placeId);
                             outcome = hx == null ? "not announced (already inside)"
-                                    : "not announced (already inside); the departure held since "
-                                      + hhmm(hx.exitMs) + " was drift, discarded";
+                                    : "not announced (already inside); " + takenBack(hx, whenMs);
                         }
                     } else if (prefs.isInsidePlace(placeId)) {
                         prefs.holdExit(placeId, whenMs);
@@ -526,8 +566,8 @@ public class GeofenceReceiver extends BroadcastReceiver {
                     // was drift (4.11.4).
                     PrefsStore.HeldExit hx = prefs.claimHeldExit(placeId);
                     if (hx != null) {
-                        prefs.journal("geo: arrived " + p.name + " — already inside; the departure"
-                                + " held since " + hhmm(hx.exitMs) + " was drift, discarded");
+                        prefs.journal("geo: arrived " + p.name + " — already inside; "
+                                + takenBack(hx, whenMs));
                     }
                     // If that is because the arrival is held by the drift
                     // gate, this ENTER (one the gate let through, so precise
@@ -547,27 +587,23 @@ public class GeofenceReceiver extends BroadcastReceiver {
                     continue;
                 }
             } else {
-                // 4.11.1: one atomic step, as the ENTER side has been since
-                // 4.8.7. Test-then-remove let two workers handling the same
-                // EXIT both find "inside" and both announce a departure.
-                if (!prefs.claimExitPlace(placeId)) {
+                // 4.13.1: not announced yet. It waits DEPART_WAIT_MS for Play
+                // Services to take it back, with state still saying inside
+                // (see "Every departure waits"). The test that we are inside
+                // and the hold are one step, as claimExitPlace's test and
+                // remove were (4.11.1): two workers handling the same EXIT
+                // make one wait. A departure already held for this place
+                // (4.11.4) merges into it, and its evidence still dates it.
+                long due = System.currentTimeMillis() + DEPART_WAIT_MS;
+                if (!prefs.holdDepartureIfInside(placeId, whenMs, due,
+                        exitFixNote(p, tLat, tLng, tAcc, whenMs))) {
                     Log.i(TAG, "spurious EXIT — not currently inside, skipping");
                     spurious.add(p.name);   // journalled once, after the loop
                     continue;
                 }
-                // A departure already held for this place (4.11.4): with no
-                // ENTER since, Play Services has had us outside from then,
-                // so it is dated from the hold's evidence, no later than now.
-                long depMs = whenMs;
-                String note = "";
-                PrefsStore.HeldExit hx = prefs.claimHeldExit(placeId);
-                if (hx != null) {
-                    depMs = departureTime(hx.exitMs, hx.thereMs, whenMs);
-                    note = " — held since " + hhmm(hx.exitMs) + ", announced for " + hhmm(depMs);
-                }
-                if (!settleDeparture(prefs, rest, p, depMs, note)) continue;
-                anyAccepted = true;
-                updateMemberAfter(ctx, prefs, rest, memberId, p, "left", isoTime, tLat, tLng);
+                waitDue = Math.max(waitDue, due);
+                // Not "accepted": the member row keeps last_place_id until the
+                // wait is over, and the pin still moves (below).
                 continue;
             }
             // An arrival, newly inside. Held for the dwell (4.12.1), not
@@ -608,6 +644,176 @@ public class GeofenceReceiver extends BroadcastReceiver {
         // good moment to sweep. If a retry still fails, the entry
         // stays in the queue for the next attempt.
         drainPendingCheckins(prefs, rest);
+        return waitDue;
+    }
+
+    /**
+     * Stay awake until the departure waits this event started are over, then
+     * settle every wait that is due (4.13.1). On the worker thread, after the
+     * broadcast has finished. The process is normally the foreground
+     * service's, so it lives; if it dies anyway, the hold is persisted and
+     * the first breadcrumb batch after the service is back settles it.
+     */
+    static void settleWhenDue(Context ctx, long dueMs) {
+        PowerManager.WakeLock wl = null;
+        try {
+            PowerManager pm = (PowerManager) ctx.getSystemService(Context.POWER_SERVICE);
+            if (pm != null) {
+                wl = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "roamkeep:departure");
+                wl.setReferenceCounted(false);
+                // Bounded: the wait, then time for the POSTs.
+                wl.acquire(DEPART_WAIT_MS + 60_000);
+            }
+            // Never longer than the wait itself, whatever the clock did.
+            long sleepMs = Math.min(dueMs - System.currentTimeMillis(), DEPART_WAIT_MS);
+            if (sleepMs > 0L) Thread.sleep(sleepMs + 250);
+            PrefsStore prefs = new PrefsStore(ctx);
+            // A pause, a refusal or a sign-out during the wait: say nothing.
+            // A pause or refusal leaves the hold for when sharing resumes.
+            if (!prefs.hasContext() || prefs.isPaused() || prefs.isServerRejected()) return;
+            if (!LocationForegroundService.canDisclose(ctx)) return;
+            settleDueDepartures(prefs, new SupabaseRest(ctx), System.currentTimeMillis(), null, null);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        } catch (Exception e) {
+            Log.w(TAG, "departure wait failed", e);
+        } finally {
+            try { if (wl != null && wl.isHeld()) wl.release(); } catch (Exception ignored) {}
+        }
+    }
+
+    /**
+     * Announce every departure whose wait is over (4.13.1): the one place
+     * that does, whichever of the timer or a breadcrumb batch gets there
+     * first. Claim, then flip state, then settle, as confirmHeldExits does:
+     * an ENTER on the geofence worker may be discarding the same hold.
+     *
+     * @param lat,lng a position for choosing last_place_id among the places
+     *                still held, or null
+     */
+    static void settleDueDepartures(PrefsStore prefs, SupabaseRest rest, long nowMs,
+                                    Double lat, Double lng) {
+        Map<String, PrefsStore.HeldExit> held = prefs.getHeldExits();
+        if (held.isEmpty()) return;
+        String memberId = prefs.getMemberId();
+        if (prefs.getKeepId() == null || memberId == null) return;
+        for (Map.Entry<String, PrefsStore.HeldExit> e : held.entrySet()) {
+            PrefsStore.HeldExit h = e.getValue();
+            if (!waitOver(h.dueMs, nowMs)) continue;
+            String id = e.getKey();
+            PrefsStore.Place p = prefs.findPlace(id);
+            PrefsStore.HeldExit c = prefs.claimHeldExit(id);
+            if (c == null) continue;
+            if (p == null) {
+                prefs.journal("geo: held departure dropped — its place no longer exists");
+                continue;
+            }
+            if (!prefs.claimExitPlace(id)) continue;
+            long depMs = departureTime(c.exitMs, c.thereMs, c.outSinceMs);
+            boolean announced = settleDeparture(prefs, rest, p, depMs,
+                    waitNote(c.note, nowMs - (c.dueMs - DEPART_WAIT_MS), depMs, c.exitMs));
+            if (announced) writeLastPlace(prefs, rest, memberId, prefs.getLastPlaceSent(), lat, lng);
+        }
+    }
+
+    /**
+     * Is a departure's wait over? Pure. A drift hold (dueMs 0) never is: only
+     * fixes settle that. One due further ahead than the wait itself can be
+     * (the clock was set back) is over now, rather than parked out of reach.
+     */
+    static boolean waitOver(long dueMs, long nowMs) {
+        if (dueMs <= 0L) return false;
+        return nowMs >= dueMs || dueMs - nowMs > DEPART_WAIT_MS;
+    }
+
+    /**
+     * What the EXIT's own fix said about the place, for the journal: its
+     * accuracy, how far it was from the edge and on which side, and how soon
+     * after the phone woke or the fences were armed it came. Those are what
+     * tell a real departure from Play Services re-stating a fence. Distances
+     * only, never a position. Pure but for the clock-free statics it reads.
+     */
+    static String exitFixNote(PrefsStore.Place p, Double lat, Double lng, Float acc, long whenMs) {
+        Float edge = null;
+        if (lat != null && lng != null) {
+            edge = (float) (metresBetween(lat, lng, p.lat, p.lng) - p.radius);
+        }
+        return fixNote(acc, edge, whenMs, LocationForegroundService.lastDozeExitMs,
+                GeofenceArmer.lastArmMs);
+    }
+
+    // How soon after a wake or an arm an EXIT counts as following it.
+    static final long WAKE_NOTE_MS = 2 * 60_000;
+
+    /**
+     * Pure: "exit fix ±28m, 140m out, 4s after the phone woke".
+     *
+     * @param acc    the fix's accuracy, m; null none
+     * @param edgeM  its distance from the edge, m, positive outside; null none
+     * @param dozeExitMs, armMs when the phone last left deep Doze and when
+     *               the fences were last armed, in this process; 0 unknown
+     */
+    static String fixNote(Float acc, Float edgeM, long eventMs, long dozeExitMs, long armMs) {
+        StringBuilder sb = new StringBuilder();
+        if (acc == null && edgeM == null) {
+            sb.append("no exit fix");
+        } else {
+            sb.append("exit fix ").append(acc == null ? "±?" : "±" + Math.round(acc) + "m");
+            if (edgeM != null) {
+                long m = Math.round(Math.abs(edgeM));
+                sb.append(", ").append(m).append(edgeM >= 0 ? "m out" : "m in");
+            }
+        }
+        long sinceWake = sinceWithin(eventMs, dozeExitMs);
+        long sinceArm = sinceWithin(eventMs, armMs);
+        if (sinceWake >= 0 && (sinceArm < 0 || sinceWake <= sinceArm)) {
+            sb.append(", ").append(sinceWake / 1000).append("s after the phone woke");
+        } else if (sinceArm >= 0) {
+            sb.append(", ").append(sinceArm / 1000).append("s after the fences were armed");
+        }
+        return sb.toString();
+    }
+
+    /** ms from `fromMs` to `eventMs` if it lies within WAKE_NOTE_MS, else -1.
+     *  A fix stamped up to 10 s BEFORE it counts as at it: the EXIT's time is
+     *  its fix's, which can be taken a moment before the broadcast says so. */
+    private static long sinceWithin(long eventMs, long fromMs) {
+        if (fromMs <= 0L) return -1L;
+        long d = eventMs - fromMs;
+        if (d < -10_000L || d > WAKE_NOTE_MS) return -1L;
+        return Math.max(0L, d);
+    }
+
+    /**
+     * The end of a departure's journal line once its wait is over. Pure.
+     *   " (exit fix ±12m, 85m out)"
+     *   " (exit fix ±12m, 85m out; announced 6m after the exit, for 07:42)"
+     * Late means the wait outlived the process: a batch settled it.
+     */
+    static String waitNote(String fix, long waitedMs, long depMs, long exitMs) {
+        StringBuilder sb = new StringBuilder(" (");
+        sb.append(fix == null || fix.isEmpty() ? "no exit fix" : fix);
+        if (waitedMs > DEPART_WAIT_MS + 60_000) {
+            sb.append("; announced ").append(waitedMs / 60_000).append("m after the exit, for ")
+                    .append(hhmm(depMs));
+        } else if (depMs != exitMs) {
+            sb.append("; held since ").append(hhmm(exitMs)).append(", for ").append(hhmm(depMs));
+        }
+        return sb.append(')').toString();
+    }
+
+    /**
+     * The journal's account of a held departure that Play Services' ENTER
+     * took back. Pure.
+     */
+    static String takenBack(PrefsStore.HeldExit hx, long enterMs) {
+        if (!hx.waiting()) {
+            return "the departure held since " + hhmm(hx.exitMs) + " was drift, discarded";
+        }
+        long s = Math.max(0L, enterMs - hx.exitMs) / 1000;
+        return "its exit at " + hhmm(hx.exitMs) + " was taken back " + s
+                + "s later, so it was not announced ("
+                + (hx.note.isEmpty() ? "no exit fix" : hx.note) + ")";
     }
 
     /**
@@ -1357,6 +1563,10 @@ public class GeofenceReceiver extends BroadcastReceiver {
      */
     static void confirmHeldExits(PrefsStore prefs, SupabaseRest rest,
                                  double lat, double lng, float acc, long fixMs) {
+        // Departures whose wait is over (4.13.1): the backstop for a timer
+        // that did not survive. On this device's clock, not the fix's: the
+        // wait is about how long Play Services has had to take it back.
+        settleDueDepartures(prefs, rest, System.currentTimeMillis(), lat, lng);
         Map<String, PrefsStore.HeldExit> held = prefs.getHeldExits();
         if (held.isEmpty()) return;
         String memberId = prefs.getMemberId();
@@ -1366,6 +1576,10 @@ public class GeofenceReceiver extends BroadcastReceiver {
         for (Map.Entry<String, PrefsStore.HeldExit> e : held.entrySet()) {
             String id = e.getKey();
             PrefsStore.HeldExit h = e.getValue();
+            // A waiting departure is settled by time or by an ENTER, never
+            // by fixes: the EXIT was clear, and fixes are our evidence, not
+            // Play Services'.
+            if (h.waiting()) continue;
             PrefsStore.Place p = prefs.findPlace(id);
             if (p == null) {
                 if (prefs.claimHeldExit(id) != null) {
@@ -1557,7 +1771,7 @@ public class GeofenceReceiver extends BroadcastReceiver {
      * from what last landed.
      */
     private static void writeLastPlace(PrefsStore prefs, SupabaseRest rest, String memberId,
-                                       String prefer, double lat, double lng) {
+                                       String prefer, Double lat, Double lng) {
         String place = lastPlaceNow(prefs, prefer, lat, lng);
         try {
             JSONObject upd = new JSONObject();

@@ -197,9 +197,12 @@ public class PrefsStore {
     // two "arriving from travel" signals a held arrival is judged by.
     private static final String K_LAST_EXIT_MS = "last_exit_ms";
 
-    // {placeId: {t, out, there}} — departures the drift gate did not announce,
-    // waiting for evidence (4.11.4). See GeofenceReceiver.confirmHeldExits.
-    // Like the held arrivals, bookkeeping about what WE have said.
+    // {placeId: {t, out, there, due?, note?}} — departures not yet announced:
+    // the drift gate's, waiting for evidence (4.11.4), and since 4.13.1 every
+    // other one, waiting DEPART_WAIT_MS for Play Services to take it back
+    // (`due` set). See GeofenceReceiver.confirmHeldExits and
+    // settleDueDepartures. Like the held arrivals, bookkeeping about what WE
+    // have said.
     private static final String K_HELD_EXITS = "held_exits";
 
     // The last_place_id this device last wrote and saw land: a place id, ""
@@ -1179,11 +1182,19 @@ public class PrefsStore {
         public final long exitMs;       // when the gated EXIT happened
         public final long outSinceMs;   // first precise fix outside, of the current run; 0 none
         public final long thereMs;      // newest fix that still put us there; 0 none
-        HeldExit(long exitMs, long outSinceMs, long thereMs) {
+        // 4.13.1: a departure WAITING, not gated. When the wait is over (this
+        // device's clock); 0 for a drift hold, which only fixes can settle.
+        // Holds written before 4.13.1 have none and keep their old rules.
+        public final long dueMs;
+        public final String note;       // what the EXIT's fix said, for the journal; "" none
+        HeldExit(long exitMs, long outSinceMs, long thereMs, long dueMs, String note) {
             this.exitMs = exitMs;
             this.outSinceMs = outSinceMs;
             this.thereMs = thereMs;
+            this.dueMs = dueMs;
+            this.note = note == null ? "" : note;
         }
+        public boolean waiting() { return dueMs > 0L; }
     }
 
     private JSONObject readHeldExits() {
@@ -1197,13 +1208,16 @@ public class PrefsStore {
     private static HeldExit parseHeldExit(JSONObject o) {
         if (o == null) return null;
         long t = o.optLong("t", 0L);
-        return t > 0L ? new HeldExit(t, o.optLong("out", 0L), o.optLong("there", 0L)) : null;
+        return t > 0L ? new HeldExit(t, o.optLong("out", 0L), o.optLong("there", 0L),
+                o.optLong("due", 0L), o.optString("note", "")) : null;
     }
 
     /**
      * Hold a departure. If one is already held for this place, keep its
      * EARLIER time and its evidence: without an ENTER between them, Play
-     * Services has had us outside since the first.
+     * Services has had us outside since the first. A wait already running
+     * (4.13.1) keeps running: a fuzzy EXIT on top of a clear one is no reason
+     * to start asking fixes instead.
      */
     public void holdExit(String id, long exitMs) {
         if (id == null) return;
@@ -1215,11 +1229,54 @@ public class PrefsStore {
                 o.put("t", prev != null ? Math.min(prev.exitMs, exitMs) : exitMs);
                 o.put("out", prev != null ? prev.outSinceMs : 0L);
                 o.put("there", prev != null ? prev.thereMs : 0L);
+                if (prev != null && prev.waiting()) {
+                    o.put("due", prev.dueMs);
+                    o.put("note", prev.note);
+                }
                 all.put(id, o);
             } catch (JSONException e) {
                 return;
             }
             sp.edit().putString(K_HELD_EXITS, all.toString()).commit();
+        }
+    }
+
+    /**
+     * Start the departure wait for a place (4.13.1), in one step with the
+     * test that we are inside it, as claimExitPlace was: two workers handling
+     * one EXIT make one wait, and an EXIT for a place we are not inside makes
+     * none. State is left saying inside; only the end of the wait changes it.
+     *
+     * Merged into a hold already there: the earlier EXIT time, and this EXIT
+     * as proof of being out unless a run of fixes proved it earlier. A drift
+     * hold becomes a waiting one, and the evidence it gathered still dates the
+     * departure. A wait already running keeps its end, so a burst of EXITs
+     * cannot keep pushing it back.
+     *
+     * @param exitMs the EXIT's own time, which becomes the departure's
+     * @param dueMs  when the wait ends, on this device's clock
+     * @return false (and nothing held) if state says we are not inside it
+     */
+    public boolean holdDepartureIfInside(String id, long exitMs, long dueMs, String note) {
+        if (id == null) return false;
+        synchronized (LOCK) {
+            if (!getInsidePlaceIds().contains(id)) return false;
+            JSONObject all = readHeldExits();
+            HeldExit prev = parseHeldExit(all.optJSONObject(id));
+            try {
+                JSONObject o = new JSONObject();
+                o.put("t", prev != null ? Math.min(prev.exitMs, exitMs) : exitMs);
+                o.put("out", prev != null && prev.outSinceMs > 0L
+                        ? Math.min(prev.outSinceMs, exitMs) : exitMs);
+                o.put("there", prev != null ? prev.thereMs : 0L);
+                o.put("due", prev != null && prev.waiting() ? prev.dueMs : dueMs);
+                o.put("note", prev != null && prev.waiting() ? prev.note : (note == null ? "" : note));
+                all.put(id, o);
+            } catch (JSONException e) {
+                return false;
+            }
+            sp.edit().putString(K_HELD_EXITS, all.toString()).commit();
+            return true;
         }
     }
 

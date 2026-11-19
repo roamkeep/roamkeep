@@ -25,6 +25,18 @@ const OUT = path.join(ROOT, 'landing-dist');
 
 fs.rmSync(OUT, { recursive: true, force: true });
 
+// One pass is not enough: in "<!-<!-- a -->- b -->" taking out the inner
+// comment joins the outer one up. So repeat until nothing changes.
+function stripComments(html) {
+  let before;
+  do {
+    before = html;
+    html = html.replace(/<!--[\s\S]*?-->\s*/g, '');
+  } while (html !== before);
+  return html;
+}
+
+const pages = [];
 function walk(dir) {
   for (const name of fs.readdirSync(dir)) {
     const from = path.join(dir, name);
@@ -34,7 +46,8 @@ function walk(dir) {
     const to = path.join(OUT, rel);
     fs.mkdirSync(path.dirname(to), { recursive: true });
     if (name.endsWith('.html')) {
-      fs.writeFileSync(to, fs.readFileSync(from, 'utf8').replace(/<!--[\s\S]*?-->\s*/g, ''));
+      fs.writeFileSync(to, stripComments(fs.readFileSync(from, 'utf8')));
+      pages.push(rel);
     } else if (name.endsWith('.js')) {
       fs.writeFileSync(to, esbuild.transformSync(fs.readFileSync(from, 'utf8'), { minify: true, legalComments: 'none' }).code);
     } else {
@@ -56,7 +69,7 @@ walk(SRC);
 
 // Nothing that was a comment may survive into what is published.
 let leaks = 0;
-for (const f of ['index.html', 'privacy/index.html', 'terms/index.html', 's/index.html']) {
+for (const f of pages) {
   if (/<!--/.test(fs.readFileSync(path.join(OUT, f), 'utf8'))) { leaks++; console.error('  comment left in ' + f); }
 }
 if (leaks) process.exit(1);

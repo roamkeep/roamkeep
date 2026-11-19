@@ -1,5 +1,9 @@
 ext {
-    minSdkVersion = 23
+    // Android 7.0 (4.13.1). Play's automatic protection ("Installer checks")
+    // needs 24: with it on, Play refused the 4.11.0 upload at 23, so it was
+    // switched off. 24 lets it go back on. Android 6.0 phones keep the
+    // version they have and get no further updates.
+    minSdkVersion = 24
     // Android 16. Play requires the target to be within one year of the
     // latest release: from 31 Aug 2026 an app targeting 35 cannot be
     // updated at all, which surfaced as a closed-testing rejection.

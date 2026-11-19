@@ -111,7 +111,9 @@ previous fix, because drift wanders around a point while travel moves away
 from it. A sign that turns out to be nothing backs off, and a rough position
 inside the radius drift has already been shown to reach is not checked again,
 so a phone on a table settles quickly. Activity recognition is a trigger only:
-when it once chose the mode outright, it got stuck both ways.
+when it once chose the mode outright, it got stuck both ways. It is also the
+only thing Roamkeep uses it for. Roamkeep has no health or fitness features,
+and declares none to Google Play.
 
 **No notification, no recording.** The notification is the person's proof
 that their location is being shared, so every recording path first checks
@@ -183,7 +185,16 @@ dwell event (which still arrives when a phone maker's battery manager has
 stopped the app), or the departure itself, if the stay lasted. A departure
 that comes first discards the arrival, and is then not announced either, so
 the family is never told someone left a place they were never told they had
-reached. Departures themselves are not delayed.
+reached.
+
+Departures wait half a minute. Play services can report leaving a place and
+take it back seconds later, typically on a phone's first location after a
+long deep sleep, when it re-checks every fence: a phone that sat at home all
+night reported leaving home and arriving home a few seconds apart. So a
+departure is announced only once 30 seconds have passed without Play
+services reporting the person back inside, and it keeps the time of the
+crossing. Until then the phone still counts itself inside, so the arrival
+that takes it back changes nothing and nothing is said either way.
 
 A crossing reported with a fuzzy fix near the boundary is held for longer,
 because it may be drift: it waits for a precise fix inside it, or, when the

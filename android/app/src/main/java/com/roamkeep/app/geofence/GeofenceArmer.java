@@ -179,6 +179,12 @@ final class GeofenceArmer {
         return arm(context, places, why, null);
     }
 
+    // When Play Services last accepted an arm, in this process; 0 unknown.
+    // Read by GeofenceReceiver for the journal (4.13.1): re-registering makes
+    // Play Services re-state every fence, and an EXIT seconds after an arm
+    // may be that rather than a departure.
+    static volatile long lastArmMs = 0L;
+
     /**
      * Register every place in one shot, and prune anything absent.
      *
@@ -281,6 +287,7 @@ final class GeofenceArmer {
             LocationServices.getGeofencingClient(ctx)
                     .addGeofences(req, pendingIntent(ctx))
                     .addOnSuccessListener(unused -> {
+                        lastArmMs = System.currentTimeMillis();
                         prefs.journal("geo: armed " + n + " fence(s) (" + why + ")"
                                 + (bg ? "" : " (foreground only — no background permission)"));
                         if (done != null) done.settled(asked, true);

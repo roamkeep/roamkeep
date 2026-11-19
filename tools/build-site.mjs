@@ -98,6 +98,19 @@ function changelogPage() {
   };
 }
 
+// One pass is not enough: in "<!-<!-- a -->- b -->" taking out the inner
+// comment joins the outer one up. So repeat until nothing changes, and
+// refuse to publish a page if anything that opens a comment is left.
+function stripComments(html, name) {
+  let before;
+  do {
+    before = html;
+    html = html.replace(/<!--[\s\S]*?-->\s*/g, '');
+  } while (html !== before);
+  if (html.includes('<!--')) throw new Error('comment left in ' + name);
+  return html;
+}
+
 function copy(from, to) {
   fs.mkdirSync(path.dirname(to), { recursive: true });
   fs.copyFileSync(from, to);
@@ -114,7 +127,7 @@ pages.push(changelogPage());
 for (const page of pages) {
   // Comments are notes for whoever edits the source (drafts, hosting
   // details); none of them is for visitors, so none is published.
-  const html = render(layout, sprite, page).replace(/<!--[\s\S]*?-->\s*/g, '');
+  const html = stripComments(render(layout, sprite, page), page.meta.path);
   const dir = path.join(OUT, page.meta.path);
   fs.mkdirSync(dir, { recursive: true });
   fs.writeFileSync(path.join(dir, 'index.html'), html);

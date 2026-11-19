@@ -7,6 +7,26 @@ the app says so, and an owner updates it from **Settings → Family server**.
 An older server keeps working; it just goes without the new features that
 need it.
 
+## 4.13.1 (in testing)
+
+No server update is needed.
+
+- **No more "left Home" and "arrived Home" seconds apart.** After a phone
+  had been asleep for a while, Android's location service could report
+  someone leaving a place and then, a few seconds later, arriving back,
+  while they never moved. Both were announced. Now a departure waits 30
+  seconds, and if Android takes it back in that time, nothing is said.
+  Real departures are announced half a minute later than before, with the
+  time they actually left.
+- **Android 7.0 or later is now needed.** Phones on Android 6.0 keep the
+  version they have but will not get this update or later ones.
+- **Tracking diagnostics** say more about each departure and about what
+  switched GPS on, to help with problem reports.
+- **Setting up a new family** now picks every character of the database
+  password equally often. Before, some came up slightly more often than
+  others. That password is never used after setup and was always far too
+  long to guess, so existing servers need nothing.
+
 ## 4.13.0 (in testing)
 
 No server update is needed.

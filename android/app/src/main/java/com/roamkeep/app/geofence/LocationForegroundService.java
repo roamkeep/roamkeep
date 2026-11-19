@@ -297,6 +297,12 @@ public class LocationForegroundService extends Service {
     // lives here (the service is the longest-lived context we own).
     private BroadcastReceiver dozeReceiver;
 
+    // When the phone last left deep Doze, in this process; 0 unknown. Read by
+    // GeofenceReceiver for the journal (4.13.1): Play Services' phantom EXITs
+    // come on the first location after a wake, so an EXIT seconds after one
+    // is worth saying so.
+    static volatile long lastDozeExitMs = 0L;
+
     private void registerDozeReceiver() {
         if (Build.VERSION.SDK_INT < 23 || dozeReceiver != null) return;
         dozeReceiver = new BroadcastReceiver() {
@@ -308,6 +314,7 @@ public class LocationForegroundService extends Service {
                     dozeEnteredMs = System.currentTimeMillis();
                     prefs.journal("doze: enter (location suspends device-wide)");
                 } else {
+                    lastDozeExitMs = System.currentTimeMillis();
                     if (dozeEnteredMs > 0) {
                         dozeMsSinceFix += System.currentTimeMillis() - dozeEnteredMs;
                         dozeEnteredMs = 0;
@@ -893,7 +900,8 @@ public class LocationForegroundService extends Service {
             int v = MotionJudge.judgeFix(lat, lng, acc, speed, anchor);
             if (v == MotionJudge.MOVING) {
                 resetBackoffs();
-                enterDense(MotionJudge.SRC_NONE, "precise fix " + fromAnchor(lat, lng) + " from where it stopped");
+                enterDense(MotionJudge.SRC_NONE, "precise " + MotionJudge.movingWhy(acc, speed,
+                        anchorDistance(lat, lng)));
                 return;
             }
             if (v == MotionJudge.STILL) {
@@ -1000,7 +1008,9 @@ public class LocationForegroundService extends Service {
             if (v == MotionJudge.MOVING) {
                 resetBackoffs();
                 enterDense(MotionJudge.SRC_NONE, "check after " + MotionJudge.sourceName(source) + ", "
-                        + fromAnchor(loc.getLatitude(), loc.getLongitude()) + " from where it stopped");
+                        + MotionJudge.movingWhy(loc.hasAccuracy() ? loc.getAccuracy() : -1f,
+                                loc.hasSpeed() ? loc.getSpeed() : 0f,
+                                anchorDistance(loc.getLatitude(), loc.getLongitude())));
             } else {
                 // No GPS answer to a rough position: GPS anyway, as before
                 // 4.13.0. If that watch ends still, this source backs off.
@@ -1031,12 +1041,11 @@ public class LocationForegroundService extends Service {
         return false;
     }
 
-    /** "240m" from the anchor, or "?" without one. Distances only: the
+    /** Metres from the anchor, or -1 without one. Distances only: the
      *  journal never carries a coordinate. */
-    private String fromAnchor(double lat, double lng) {
-        if (anchor == null) return "?";
-        long m = Math.round(GeofenceReceiver.metresBetween(anchor.lat, anchor.lng, lat, lng));
-        return m >= 1000 ? String.format(java.util.Locale.US, "%.1fkm", m / 1000.0) : m + "m";
+    private double anchorDistance(double lat, double lng) {
+        if (anchor == null) return -1;
+        return GeofenceReceiver.metresBetween(anchor.lat, anchor.lng, lat, lng);
     }
 
     /**

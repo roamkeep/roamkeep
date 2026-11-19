@@ -29,7 +29,7 @@
 // project had no way in. The last step here prints that first link.
 
 import path from 'node:path';
-import { randomBytes } from 'node:crypto';
+import { randomInt } from 'node:crypto';
 import { intro, outro, text, password, select, confirm, spinner, isCancel, cancel, note, log } from '@clack/prompts';
 import color from 'picocolors';
 import QRCode from 'qrcode';
@@ -349,8 +349,10 @@ async function main() {
       // Never needed again — the wizard drives everything through the
       // Management API rather than a direct DB connection. From node:crypto
       // rather than the global, which Node 18 only had behind a flag.
-      const dbPass = [...randomBytes(24)]
-        .map((b) => 'ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789'[b % 56]).join('');
+      // randomInt picks every character equally often; a byte taken
+      // modulo the alphabet's size would not.
+      const PASS_CHARS = 'ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789';
+      const dbPass = Array.from({ length: 24 }, () => PASS_CHARS[randomInt(PASS_CHARS.length)]).join('');
 
       const s = spinner();
       s.start('Creating the project');

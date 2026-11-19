@@ -1132,6 +1132,54 @@ console.log('\nnative: the location service never stops under a pending start');
   }
 }
 
+// Every departure waits (4.13.1). Play Services sent EXIT Home on the first
+// location after deep Doze and ENTER Home seconds later, and the family got
+// "left Home" and "arrived Home" for someone asleep. DepartureWaitTest pins
+// the rules; the wiring between them needs PrefsStore, so this reads the
+// real source for its shape: nothing announces a departure on receipt, the
+// timer runs outside the broadcast, a batch is the backstop and never judges
+// a waiting departure by fixes, and nothing is said while sharing is off.
+console.log('\nnative: every departure waits for Play Services to take it back');
+{
+  const java = fs.readFileSync(path.join(REPO,
+    'android/app/src/main/java/com/roamkeep/app/geofence/GeofenceReceiver.java'), 'utf8');
+  const body = (head) => {
+    const at = java.indexOf(head);
+    if (at < 0) return null;
+    let depth = 0, i = java.indexOf('{', at);
+    for (; i < java.length; i++) {
+      if (java[i] === '{') depth++;
+      else if (java[i] === '}' && --depth === 0) break;
+    }
+    return java.slice(at, i + 1).replace(/\/\*[\s\S]*?\*\//g, '').replace(/\/\/.*$/gm, '');
+  };
+  const recv = body('public void onReceive(Context context, Intent intent)');
+  const handle = body('private long handleTransitions(');
+  const confirm = body('static void confirmHeldExits(');
+  const settle = body('static void settleDueDepartures(');
+  const timer = body('static void settleWhenDue(Context ctx, long dueMs)');
+  if (!recv || !handle || !confirm || !settle || !timer) {
+    check('GeofenceReceiver departure-wait methods found', false, 'moved or renamed');
+  } else {
+    check('an EXIT starts a wait and announces nothing on receipt',
+      /holdDepartureIfInside\(/.test(handle) && !/settleDeparture\(|claimExitPlace\(|announceLeft\(/.test(handle));
+    check('the wait runs after the broadcast has finished',
+      recv.indexOf('pr.finish()') >= 0 && recv.indexOf('settleWhenDue(') > recv.indexOf('pr.finish()'));
+    check('a breadcrumb batch settles waits that are over, and never judges one by fixes',
+      /settleDueDepartures\(/.test(confirm)
+      && confirm.indexOf('h.waiting()') >= 0 && confirm.indexOf('h.waiting()') < confirm.indexOf('judgeHeldExit('));
+    const order = ['waitOver(', 'claimHeldExit(', 'claimExitPlace(', 'settleDeparture('].map((s) => settle.indexOf(s));
+    check('a wait is claimed, then state flipped, then announced',
+      order.every((n, k) => n >= 0 && (k === 0 || n > order[k - 1])), JSON.stringify(order));
+    const said = timer.indexOf('settleDueDepartures(');
+    check('nothing is announced at the end of a wait while sharing is off',
+      ['isPaused()', 'isServerRejected()', 'canDisclose('].every((s) => {
+        const n = timer.indexOf(s);
+        return n >= 0 && n < said;
+      }));
+  }
+}
+
 console.log('\nwizard: every source file parses');
 
 // security.txt (RFC 9116), published on both sites from one file. Its Expires
@@ -1531,6 +1579,31 @@ console.log('\napp: Share journal sends the whole journal');
   const app = fs.readFileSync(path.join(REPO, 'app.js'), 'utf8');
   check('the Share journal button reaches its handler', /data-action="share-diag"/.test(html)
     && /'share-diag': shareDiagnostics,/.test(app));
+}
+
+// The phone's database password (4.13.1): every character equally likely.
+// A byte from 228 (4 x 57) up is skipped, not folded back into the first 28
+// characters as a plain remainder would.
+{
+  const src = cutFromApp('function pvDbPassword()');
+  check('app.js pvDbPassword found', !!src, 'moved or renamed');
+  if (src) {
+    const A = 'ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789';
+    // Bytes 228..255 come first, then 0 onwards: only the second run counts.
+    let next = 228;
+    const stub = { getRandomValues: (b) => { for (let i = 0; i < b.length; i++) { b[i] = next; next = (next + 1) % 256; } return b; } };
+    const pw = new Function('crypto', src + '\nreturn pvDbPassword();')(stub);
+    check('pvDbPassword skips bytes from 228 up', pw === A.slice(0, 32), pw);
+    const real = new Function('crypto', src + '\nreturn pvDbPassword;')(globalThis.crypto ?? (await import('node:crypto')).webcrypto);
+    const seen = new Set();
+    let ok = true;
+    for (let i = 0; i < 400; i++) {
+      const p = real();
+      if (p.length !== 32 || [...p].some((c) => !A.includes(c))) ok = false;
+      for (const c of p) seen.add(c);
+    }
+    check('pvDbPassword: 32 characters from its alphabet, every one in use', ok && seen.size === A.length, seen.size + ' of ' + A.length);
+  }
 }
 
 // The suite read src/index.js as TEXT for the --from checks above and never
