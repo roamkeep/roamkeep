@@ -69,6 +69,9 @@
   // tracking notification cannot be shown (LocationForegroundService
   // .STATUS_NOTIFICATIONS_OFF; keep the two identical).
   const STATUS_NOTIFICATIONS_OFF = '🔕 Not sharing: notifications are off';
+  // 4.13.2: the same, when Roamkeep has no precise location
+  // (LocationForegroundService.STATUS_LOCATION_OFF; keep the two identical).
+  const STATUS_LOCATION_OFF = '🚫 Not sharing: location access is off';
 
   // Assigned once a backend is resolved; every consumer reads these.
   let SB_URL = '';
@@ -1234,16 +1237,18 @@
   async function initPushNotifications(fromSetupSheet) {
     const Push = pushPlugin();
     if (!Push) return;
-    // See _disclosurePending. requestPermissions() below raises the Android
-    // 13+ POST_NOTIFICATIONS dialog, and launchApp fires this un-awaited —
-    // so on a first run it landed on top of the disclosure sheet.
-    if (_disclosurePending && !fromSetupSheet) return;
     try {
       // Android 13+ surfaces a runtime POST_NOTIFICATIONS prompt;
       // pre-13 it's auto-granted from the manifest declaration.
-      const perm = await Push.requestPermissions();
-      if (perm && perm.receive !== 'granted') {
-        console.info('Push permission not granted: ' + perm.receive);
+      // Asked only from the setup sheet's tap (see "THE RULE" above
+      // requestLocationPermission); launch only checks, and registers if
+      // notifications are already allowed. Until 4.13.2 launch skipped
+      // this whenever location was missing, so a phone that declined
+      // location registered for push only through the Notifications row.
+      const perm = fromSetupSheet ? await Push.requestPermissions()
+        : (typeof Push.checkPermissions === 'function' ? await Push.checkPermissions() : null);
+      if (!perm || perm.receive !== 'granted') {
+        console.info('Push permission not granted: ' + (perm && perm.receive));
         return;
       }
 
@@ -1429,44 +1434,21 @@
     initMap();
     subscribeRT();
     pruneOwnHistory();   // trim our own breadcrumbs older than 24h
-    // Ask for location permission BEFORE arming geofences. addGeofence
-    // rejects outright without it, and syncNativeAddPlace swallows the
-    // rejection — so on a first run (where the prompt used to come later,
-    // in startGPS) every place failed to register and the device never
-    // fired a check-in until the app was opened a second time.
+    // Permissions (4.13.2). Launch and resume only CHECK them; the one thing
+    // that asks is a tap on Allow in the setup sheet (see "THE RULE" above
+    // requestLocationPermission). With something missing the app runs
+    // without it and says so in a banner; a family member who declines
+    // location can still see everyone else.
     //
-    // But on a device that has never granted it, the disclosure has to
-    // come first. Play's Prominent Disclosure rule is not only "explain
-    // background collection" — the explanation must precede the runtime
-    // request and the request must follow an affirmative tap, not fire on
-    // its own. Calling ensureLocationPermission() here put the system
-    // dialog on screen ~1.2s before the sheet that explains it, which is
-    // the exact ordering reviewers reject on.
-    //
-    // So: no permission yet → open the setup sheet and let the user's tap
-    // on "Allow" issue the request (setupFixLocation, which also re-arms
-    // afterwards — the repair path this leans on already existed).
-    // Already granted → nothing changes, launch is exactly as before.
-    //
-    // initNativeGeofence still runs either way: it writes the native
-    // context that the headless receivers need, and arms nothing until
-    // permission exists, which is the state setupFixLocation repairs.
-    // Only when the status actually came back AND said the permission is
-    // missing. `!(await setupStatus())?.fineLocation` was wrong: setupStatus
-    // returns null whenever the plugin is not ready yet, and `null?.x` is
-    // undefined, so a FAILED CHECK was indistinguishable from NO PERMISSION
-    // — popping the disclosure sheet on a fully granted device and gating
-    // its permission requests for the rest of the session.
+    // initNativeGeofence runs either way: it writes the native context the
+    // headless receivers need, and arms nothing until permission exists,
+    // which is the state setupFixLocation (or a grant made in system
+    // settings, through reconcileSetup) repairs.
     const _st0 = isNative() ? await setupStatus() : null;
     // 4.11.1: before startGPS below, so the app's own location writes are
-    // stopped from the first fix when notifications are off.
-    if (_st0) await applyDisclosureState(_st0);
-    if (_st0 && !_st0.fineLocation) {
-      _disclosurePending = true;
-      await openSetup();
-    } else {
-      await ensureLocationPermission();
-    }
+    // stopped from the first fix when notifications are off. At launch it
+    // restarts nothing itself; startGPS below does that.
+    if (_st0) await applyDisclosureState(_st0, true);
 
     // Initialise the native geofence plugin *before* starting the BG
     // location watcher. Otherwise the first few GPS fixes (which the
@@ -1479,6 +1461,7 @@
     // Push registration is independent of geofence wiring; we kick it
     // off without awaiting because the FCM token can take a beat to
     // arrive (network round-trip), and we don't want to block startGPS.
+    // Registers only if notifications are already allowed; it never asks.
     initPushNotifications();
     // Load the saved tracking mode before starting GPS so the first
     // watcher is armed with the right distanceFilter.
@@ -1486,10 +1469,9 @@
     startGPS();
 
     // Seed the background-permission watermark so reconcileSetup can spot
-    // the transition to granted, then surface the setup sheet if anything
-    // required is still missing. Deferred a beat so the permission prompt
-    // startGPS() raises has resolved first — otherwise we'd render the
-    // checklist against a stale answer.
+    // the transition to granted, then open the setup sheet if something it
+    // asks for has newly gone missing (setupNewlyMissing). Deferred a beat
+    // so the map is up first, behind it.
     setTimeout(async () => {
       try {
         const st = await setupStatus();
@@ -1500,7 +1482,7 @@
         // once, on the first launch that finds it missing; never again.
         const askActivity = !!st && st.activityRecognition === false
           && !(await prefGet(ACTIVITY_ASKED_KEY));
-        if (await setupIncomplete() || askActivity) {
+        if ((st && await setupNewlyMissing(st)) || askActivity) {
           if (askActivity) await prefSet(ACTIVITY_ASKED_KEY, '1');
           await openSetup();
         }
@@ -1672,7 +1654,12 @@
     // check-ins for a place that no longer existed. And a refetch that
     // FAILED left an older S.places behind, which must not be armed as if
     // it were current.
-    if (isNative() && placesOk && !isPausedRow(myMember())) {
+    //
+    // 4.13.2: not while location is off. Nothing can be armed then, and each
+    // try only journalled "stored but NOT armed" again, at every resume.
+    // Location coming back re-arms the whole current list
+    // (applyDisclosureState), so nothing is lost by waiting.
+    if (isNative() && placesOk && !isPausedRow(myMember()) && !S._locationOff) {
       if (placesSignature() !== _armedSig) {
         await rearmGeofencesFromPlaces('places changed while backgrounded', true);
       }
@@ -1691,7 +1678,7 @@
     // system dialog by itself if permission is missing. Skip the whole
     // block, not just the Capacitor branch — falling through to
     // navigator.geolocation would prompt via the WebView instead.
-    if (_disclosurePending) return;
+    if (!(await haveLocation())) return;
     try {
       const Geo = window.Capacitor?.Plugins?.Geolocation;
       if (Geo && typeof Geo.getCurrentPosition === 'function') {
@@ -3040,6 +3027,13 @@
     }
   }
 
+  // Roamkeep's location permission in the words Android's settings use.
+  // Below Android 10 there is no separate "all the time": fine covers it.
+  function locationLevel(st) {
+    if (!st.fineLocation) return st.approximateLocation ? 'Approximate only' : 'Off';
+    return st.backgroundLocation ? 'All the time' : 'While using the app';
+  }
+
   // What the readout shows, gathered once for the screen and for Share
   // journal alike, so the text someone sends is what they were looking at.
   async function collectDiagnostics() {
@@ -3067,7 +3061,10 @@
       }
       if (st) {
         rows.push(['Tracking service', st.serviceRunning ? 'Running' : 'Not running', !!st.serviceRunning]);
-        rows.push(['Location: all the time', st.backgroundLocation ? 'Yes' : 'No', !!st.backgroundLocation]);
+        // 4.13.2: the level, not just "all the time": a tester's phone read
+        // "No" here while it had no location at all, and Approximate is a
+        // third state with its own fix.
+        rows.push(['Location access', locationLevel(st), !!(st.fineLocation && st.backgroundLocation)]);
         rows.push(['Battery unrestricted', st.ignoringBatteryOptimizations ? 'Yes' : 'No', !!st.ignoringBatteryOptimizations]);
         rows.push(['Notifications allowed', st.notifications ? 'Yes' : 'No', !!st.notifications]);
         rows.push(['Permissions kept (no auto-reset)', st.autoRevokeWhitelisted ? 'Yes' : 'No', !!st.autoRevokeWhitelisted]);
@@ -4168,50 +4165,67 @@
     $('sidebar')?.classList.remove('mob');
   }
 
-  // Foreground location prompt, split out of startGPS so launchApp can
-  // await it BEFORE arming geofences. Ordering matters more than it
-  // looks: addGeofence refuses to register without location permission,
-  // so arming first meant a first run registered nothing at all.
-  // True between opening the first-run disclosure sheet and the user acting
-  // on it.
+  // THE RULE (4.13.2): on the Android app NOTHING raises a system permission
+  // dialog except the person tapping Allow on a row of the setup sheet. Play
+  // requires the disclosure to precede the request and the request to follow
+  // an affirmative action. And a tester's phone with location declined
+  // (2026-11-18) showed what asking on our own costs: the sheet over every
+  // launch, the dialog or a red toast on every return, an app that looked
+  // broken until it was given up on.
   //
-  // THE RULE: while this is set, NOTHING may raise a system permission
-  // dialog. The only thing allowed to request a permission is the user
-  // tapping Allow on a row of the sheet. Play requires the disclosure to
-  // precede the request and the request to follow an affirmative action,
-  // and a dialog landing on top of the sheet fails both.
+  // Until 4.13.2 this was a flag (_disclosurePending) holding the requests
+  // only while the first-run sheet was up, and it was got wrong three times,
+  // each time by fixing one call site instead of the rule. Launch and resume
+  // now only check (haveLocation, Push.checkPermissions), so the set of
+  // things that may ask is closed. They are the setup sheet's own:
   //
-  // This has been got wrong three times, each time by fixing one call site
-  // instead of the rule, so here is the complete set. Anything added to it
-  // must be gated:
+  //   requestLocationPermission()   fine + coarse       setupFixLocation
+  //   requestBackgroundLocation     "all the time"       setupFixBackground
+  //   requestActivityRecognition    Physical activity    setupFixActivity
+  //   initPushNotifications(true)   POST_NOTIFICATIONS   setupFixNotifications
   //
-  //   ensureLocationPermission()   explicit  ACCESS_FINE_LOCATION
-  //   startGPS() watchPosition     IMPLICIT  — @capacitor/geolocation asks
-  //                                            by itself when a method is
-  //                                            called without permission
-  //   onResume() getCurrentPosition IMPLICIT — same, and the whole block is
-  //                                            skipped because falling
-  //                                            through to
-  //                                            navigator.geolocation
-  //                                            prompts via the WebView
-  //   initPushNotifications()      explicit  POST_NOTIFICATIONS (API 33+),
-  //                                            fired un-awaited by launchApp
+  // and two that would ask by themselves, gated on haveLocation():
   //
-  // Cleared by setupFixLocation (the affirmative tap) and by closeSetup
-  // (dismissing counts as having seen it). Both then restart what was held.
-  let _disclosurePending = false;
+  //   startGPS() watchPosition      @capacitor/geolocation asks when called
+  //                                 without permission
+  //   onResume() getCurrentPosition the same; the whole block is skipped,
+  //                                 because falling through to
+  //                                 navigator.geolocation prompts via the
+  //                                 WebView
+  //
+  // Anything added that can raise a dialog belongs in one of the two lists.
 
-  async function ensureLocationPermission() {
-    if (!isNative()) return;
-    if (_disclosurePending) return;
-    const Geo = window.Capacitor.Plugins && window.Capacitor.Plugins.Geolocation;
-    if (!Geo || !Geo.requestPermissions) return;
+  // Whether Roamkeep may use precise location, found out without asking: a
+  // check never raises a dialog. The native answer is the one the tracking
+  // service gets; the geolocation plugin's own check only where it is missing.
+  async function haveLocation() {
+    if (!isNative()) return true;
+    const st = await setupStatus();
+    if (st) return !!st.fineLocation;
+    const Geo = window.Capacitor?.Plugins?.Geolocation;
     try {
-      const perm = await Geo.requestPermissions({ permissions: ['location'] });
-      if (perm && perm.location !== 'granted' && perm.location !== 'prompt') {
-        toast('Location permission denied', 'err');
-      }
-    } catch (_) { /* some OEMs throw on already-granted; ignore */ }
+      const p = Geo && typeof Geo.checkPermissions === 'function' ? await Geo.checkPermissions() : null;
+      return !!p && p.location === 'granted';
+    } catch (_) { return false; }
+  }
+
+  // The tap on Allow in the setup sheet's Location row, and nothing else.
+  // Answers 'granted', 'approximate' or 'denied' (null if it could not ask),
+  // with how long Android took, which says whether a dialog was shown at all.
+  async function requestLocationPermission() {
+    const t0 = Date.now();
+    let status = null;
+    const NG = nativeGeo();
+    if (NG && typeof NG.requestLocation === 'function') {
+      try { const r = await NG.requestLocation(); status = (r && r.status) || null; } catch (_) {}
+    } else {
+      const Geo = window.Capacitor?.Plugins?.Geolocation;
+      try {
+        const p = Geo && Geo.requestPermissions ? await Geo.requestPermissions({ permissions: ['location'] }) : null;
+        if (p) status = p.location === 'granted' ? 'granted' : 'denied';
+      } catch (_) { /* refused outright, e.g. with the phone's Location off */ }
+    }
+    return { status, ms: Date.now() - t0 };
   }
 
   async function startGPS() {
@@ -4219,18 +4233,12 @@
     // pause has to actually stop tracking, not just flag a column. The
     // auto-resume watcher re-runs startGPS + initNativeGeofence at expiry.
     if (isPausedRow(myMember())) return;
-    // Hold everything while the first-run disclosure is on screen.
-    // @capacitor/geolocation REQUESTS THE PERMISSION ITSELF when one of its
-    // methods is called without it — so gating ensureLocationPermission()
-    // alone (4.5.3) achieved nothing: watchPosition below raised the system
-    // dialog over the disclosure sheet moments later, which is the exact
-    // ordering Play rejects. setupFixLocation calls restartGPS() once the
-    // user has actually tapped Allow, so nothing is lost by waiting.
-    if (_disclosurePending) return;
     if (isNative()) {
+      // Without location there is nothing to start, and watchPosition below
+      // would ask for it by itself (see THE RULE). The native call still
+      // goes: refused, it records the stop once and tells the family.
+      if (!(await haveLocation())) { startNativeLocationUpdates(); return; }
       const Geo = window.Capacitor.Plugins && window.Capacitor.Plugins.Geolocation;
-      // Normally already answered by launchApp; harmless if so.
-      await ensureLocationPermission();
 
       // Background trail + live pin: our own foreground service owns the
       // FusedLocation updates (via LocationUpdateReceiver). It survives
@@ -4290,14 +4298,22 @@
   // Used by the resume health check when fixes have gone silent. The
   // native foreground service is re-armed by startGPS → it's idempotent.
   // Safe to call when no watch exists; safe to call repeatedly.
-  async function restartGPS() {
-    const Geo = window.Capacitor?.Plugins?.Geolocation;
-    if (Geo && S.geoWatchId != null && Geo.clearWatch) {
-      try { await Geo.clearWatch({ id: S.geoWatchId }); }
-      catch (e) { console.warn('clearWatch', e); }
-      S.geoWatchId = null;
-    }
-    await startGPS();
+  // 4.13.2: and at the same time. Location granted in system settings is
+  // seen on a resume that may also find the fix stale, and two restarts
+  // side by side each started a watch, leaving one nothing could clear.
+  let _restartGPSInFlight = null;
+  function restartGPS() {
+    if (_restartGPSInFlight) return _restartGPSInFlight;
+    _restartGPSInFlight = (async () => {
+      const Geo = window.Capacitor?.Plugins?.Geolocation;
+      if (Geo && S.geoWatchId != null && Geo.clearWatch) {
+        try { await Geo.clearWatch({ id: S.geoWatchId }); }
+        catch (e) { console.warn('clearWatch', e); }
+        S.geoWatchId = null;
+      }
+      await startGPS();
+    })().finally(() => { _restartGPSInFlight = null; });
+    return _restartGPSInFlight;
   }
 
   function trackBattery() {
@@ -6040,7 +6056,9 @@
     {
       key: 'fineLocation', required: true, icon: '📍',
       title: 'Location access',
-      why: 'Needed to show your place on the family map at all.',
+      why: 'Needed to show your place on the family map. Without it you can still see your family, but they can’t see you.',
+      // 4.13.2: Approximate is its own state, fixed by one switch.
+      whyApprox: 'Roamkeep has only your approximate location, which can’t tell one place from the next, so it shares nothing. Turn on “Use precise location”.',
       action: 'setup-fix-location', cta: 'Allow'
     },
     {
@@ -6089,6 +6107,8 @@
   const ARM_THROTTLE_MS = 15000;
   // Set once the setup sheet has been opened to ask for Physical activity.
   const ACTIVITY_ASKED_KEY = 'rk_activity_asked';
+  // The required rows that were missing at the last launch (4.13.2).
+  const SETUP_SEEN_KEY = 'rk_setup_seen';
 
   // What the OS is currently registered for, as a comparable string.
   // Anything that changes a fence's geometry has to be in here, or a
@@ -6165,12 +6185,54 @@
     try { return await NG.getReliabilityStatus(); } catch (_) { return null; }
   }
 
-  // True when something the app genuinely needs is still missing.
-  async function setupIncomplete() {
-    if (!isNative()) return false;
-    const st = await setupStatus();
-    if (!st) return false;
-    return SETUP_ITEMS.some(i => i.required && !st[i.key]);
+  // Whether launch should open the setup sheet by itself (4.13.2): only when
+  // a required row is missing now that was not missing at the last launch,
+  // which includes the first launch ever. Until 4.13.2 it opened at every
+  // launch while anything required was missing, so a person who had said no
+  // to one permission met the same sheet every time they opened the app.
+  // Now they meet it once, and after that the banner says what is off.
+  // Revoking something later counts as new, so the sheet comes back for it.
+  async function setupNewlyMissing(st) {
+    const missing = SETUP_ITEMS.filter(i => i.required && !st[i.key]).map(i => i.key);
+    const seenRaw = await prefGet(SETUP_SEEN_KEY);
+    await prefSet(SETUP_SEEN_KEY, missing.join(','));
+    if (seenRaw == null) return missing.length > 0;
+    const seen = seenRaw.split(',');
+    return missing.some(k => !seen.includes(k));
+  }
+
+  // What was missing at launch and has been granted since is no longer
+  // "seen missing", so losing it again opens the sheet at the next launch.
+  // Called whenever the permissions are read (applyDisclosureState).
+  async function forgetGranted(st) {
+    const seenRaw = await prefGet(SETUP_SEEN_KEY);
+    if (!seenRaw) return;
+    const kept = seenRaw.split(',').filter(k => !st[k]).join(',');
+    if (kept !== seenRaw) await prefSet(SETUP_SEEN_KEY, kept);
+  }
+
+  // 4.13.2: one line under the header for the first thing the sheet would
+  // ask for: what is off, what it costs, and a tap to fix it. It is what a
+  // person who has declined a permission sees instead of the sheet.
+  function renderSetupBanner(st) {
+    const b = $('setup-banner');
+    if (!b) return;
+    let text = '', action = 'open-setup', soft = false;
+    if (!st.fineLocation) {
+      text = st.approximateLocation
+        ? '📍 You’re not sharing your location: Roamkeep has only your approximate location. Tap to fix.'
+        : '📍 You’re not sharing your location: location is off for Roamkeep. Tap to fix.';
+    } else if (!st.notifications) {
+      text = '🔕 Location sharing is off because notifications are off for Roamkeep. Tap to turn them on.';
+      action = 'setup-fix-notifications';
+    } else if (!st.backgroundLocation) {
+      text = '🌙 Arrive and leave alerts only work while Roamkeep is open. Tap to fix.';
+      soft = true;
+    }
+    b.textContent = text;
+    b.dataset.action = action;
+    b.classList.toggle('soft', soft);
+    b.style.display = text ? 'block' : 'none';
   }
 
   async function openSetup() {
@@ -6184,12 +6246,6 @@
   }
 
   function closeSetup() {
-    // Dismissing counts as having seen it. Without this the gate would
-    // stay shut for the rest of the session and no later caller —
-    // startGPS, a resume, the sheet reopened by hand — could ever ask for
-    // location again. The disclosure has been shown, which is what the
-    // rule actually requires.
-    _disclosurePending = false;
     const sheet = $('setup-sheet');
     const scrim = $('setup-scrim');
     if (sheet) sheet.classList.remove('open', 'half', 'full');
@@ -6215,7 +6271,8 @@
         el('div', { class: 'setup-body' }, [
           el('div', { class: 'setup-title', text: item.title +
             (item.required ? '' : ' (recommended)') }),
-          el('div', { class: 'setup-why', text: ok ? 'All set.' : item.why })
+          el('div', { class: 'setup-why', text: ok ? 'All set.'
+            : (item.whyApprox && st && st.approximateLocation) ? item.whyApprox : item.why })
         ]),
         ok ? null : el('button', {
           class: 'setup-btn', dataset: { action: item.action }, text: item.cta
@@ -6226,27 +6283,38 @@
     if (foot) {
       const missing = SETUP_ITEMS.filter(i => !(st && st[i.key]));
       foot.textContent = missing.length
-        ? 'Tap Allow on each item. Some open Android settings. Come back here afterwards and this list updates itself.'
+        ? 'Tap Allow on each item. Some open Android settings. Come back here afterwards and this list updates itself. Anything you leave off, Roamkeep works without.'
         : 'Everything is set up. Your Keep will stay up to date in the background.';
     }
   }
 
-  // Foreground location, via the same plugin the GPS watcher uses.
-  // This is the affirmative tap the disclosure exists to collect, so it
-  // is what lifts the gate on ensureLocationPermission.
+  // The Location row's Allow: the affirmative tap the disclosure exists to
+  // collect. Android stops showing its dialog once it has been refused
+  // ("Don't allow" twice, or Approximate turned down) and then answers at
+  // once; until 4.13.2 the row then only said "Location permission denied",
+  // for good. An answer that quick sends the person to the app's settings
+  // with the switch named, as the other rows do. A slower no was the person
+  // choosing, so it is left alone, and the row says what Approximate costs.
   async function setupFixLocation() {
-    _disclosurePending = false;
-    await ensureLocationPermission();
-    // Anything that failed to arm before the grant has to be pushed down
-    // again — nothing retries on its own.
+    const { status, ms } = await requestLocationPermission();
     const st = await setupStatus();
     if (st && st.fineLocation) {
-      await rearmGeofencesFromPlaces('location permission granted');
-      // launchApp's startGPS ran while the request was still gated, so it
-      // left without a watcher. Nothing else would start one until the
-      // next resume, and on a first run that is the whole first session.
-      restartGPS();
+      // The row was showing it missing, whatever this session last saw, so
+      // this is location coming back: applyDisclosureState re-arms the
+      // places (nothing retries on its own), starts sharing, and says so.
+      S._locationOff = true;
+      await applyDisclosureState(st);
+    } else if (status === null || ms < 500) {
+      toast(st && st.approximateLocation
+        ? 'Turn on “Use precise location” under Permissions → Location'
+        : 'Choose “Allow all the time” under Permissions → Location, with “Use precise location” on');
+      const NG = nativeGeo();
+      try { if (NG) await NG.openAppSettings(); } catch (_) {}
+      return;
     }
+    // A dialog over the app fires no resume, so nothing else would redraw
+    // the banner for an answer of Approximate.
+    if (st) renderSetupBanner(st);
     await renderSetup();
   }
 
@@ -6337,7 +6405,9 @@
     const st = await setupStatus();
     if (!st) return;
     const nowHas = !!st.backgroundLocation;
-    if (nowHas && _hadBackgroundLocation === false) {
+    // Not while location itself was off: then it is location coming back
+    // (applyDisclosureState below), which re-arms and says so itself.
+    if (nowHas && _hadBackgroundLocation === false && !S._locationOff) {
       // Re-seed through initNativeGeofence rather than the native
       // reArmGeofences: a device that first ran before permission was
       // granted has an EMPTY PrefsStore place list, and every native
@@ -6364,31 +6434,50 @@
   // status so the family can see; this side shows the person why, writes
   // nothing either, and starts sharing again once notifications are back.
   // Settings changes fire no callback, so this runs on every resume.
-  async function applyDisclosureState(st) {
+  //
+  // 4.13.2: the same for precise location. Without it the native side does
+  // not start, records the stop and gives the family STATUS_LOCATION_OFF;
+  // this side shows the banner (renderSetupBanner), and when location comes
+  // back re-arms the places and starts sharing. `launching`: launch's own
+  // startGPS follows, so nothing is restarted from here then.
+  async function applyDisclosureState(st, launching) {
     const off = !st.notifications;
+    const locOff = !st.fineLocation;
     const wasOff = !!S._sharingStopped;
+    const wasLocOff = !!S._locationOff;
     S._sharingStopped = off;
-    const banner = $('disclosure-banner');
-    if (banner) banner.style.display = off ? 'block' : 'none';
-    if (off) return;
-    if (!wasOff && !st.sharingStopped) return;
+    S._locationOff = locOff;
+    renderSetupBanner(st);
+    await forgetGranted(st);
+    // Location back, whether or not notifications let sharing run yet: the
+    // places were never armed without it and nothing retries, and nothing
+    // was started. restartGPS starts the foreground watch and the native
+    // service, which stops itself again if notifications are still off.
+    const locBack = wasLocOff && !locOff;
+    if (locBack && !launching && !isPausedRow(myMember())) {
+      await rearmGeofencesFromPlaces('location permission granted');
+      restartGPS();
+    }
+    if (off || locOff) return;
+    if (!wasOff && !locBack && !st.sharingStopped) return;
     // Back on. The service's own start clears the native stop and puts the
     // default status back; restarting it is the whole job here, except
     // when the person has paused (the service would stop again at once).
-    if (!isPausedRow(myMember())) await startNativeLocationUpdates();
+    if (!launching && !locBack && !isPausedRow(myMember())) await startNativeLocationUpdates();
     const me = myMember();
-    if (me && me.status === STATUS_NOTIFICATIONS_OFF) {
+    if (me && (me.status === STATUS_NOTIFICATIONS_OFF || me.status === STATUS_LOCATION_OFF)) {
       try {
         const { error } = await S.sb.from('keep_members')
           .update({ status: STATUS_DEFAULT })
           .eq('id', S.myId)
-          .eq('status', STATUS_NOTIFICATIONS_OFF);
+          .in('status', [STATUS_NOTIFICATIONS_OFF, STATUS_LOCATION_OFF]);
         if (!error) { me.status = STATUS_DEFAULT; renderMembers(); }
       } catch (_) { /* best effort; the native side posts it too */ }
     }
     // Said only when this session saw it off; a stop that happened and
     // ended while the app was closed restarts quietly.
-    if (wasOff) toast('✅ Notifications are on, so location sharing is back on', 'ok');
+    if (locBack) toast('✅ Location is on, so sharing is back on', 'ok');
+    else if (wasOff) toast('✅ Notifications are on, so location sharing is back on', 'ok');
   }
 
   function closeInvite() {

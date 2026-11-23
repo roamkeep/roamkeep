@@ -7,6 +7,31 @@ the app says so, and an owner updates it from **Settings → Family server**.
 An older server keeps working; it just goes without the new features that
 need it.
 
+## 4.13.2 (in testing)
+
+No server update is needed.
+
+- **Saying no to a permission no longer leaves the app nagging.** Roamkeep
+  used to open its setup list every time it started while anything was
+  missing, and ask for location again, or show "Location permission
+  denied", every time you came back to it. Now the setup list opens by
+  itself only when something newly goes missing. After that, a line under
+  the header says what is off and what that means, and tapping it takes
+  you to the fix. Roamkeep asks for a permission only when you tap Allow.
+- **Without location, you can still see your family.** If you turn
+  location off for Roamkeep, or allow only your approximate location, it
+  shares nothing, and your family now sees "Not sharing: location access
+  is off" instead of a position that quietly goes out of date.
+- **Every Allow button now works.** Once Android stops asking, the Location
+  button used to do nothing. Now it opens Roamkeep's settings and says
+  which switch to turn on, including "Use precise location".
+- **Tracking diagnostics** show your location access as Off, Approximate
+  only, While using the app or All the time, and the setup list has a link
+  to share them.
+- **More devices can install Roamkeep.** The QR code scanner made Google
+  Play treat a portrait screen as a requirement, which hid the app from
+  devices without one, such as some Chromebooks.
+
 ## 4.13.1 (in testing)
 
 No server update is needed.

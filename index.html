@@ -569,13 +569,11 @@
   <div id="update-banner" class="update-banner" style="display:none">
     ⬆️ A newer version of Roamkeep is available. Please update when you can.
   </div>
-  <!-- 4.11.1: shown while notifications are off for Roamkeep, which is when
-       it shares nothing (applyDisclosureState). Tapping it asks again, or
-       opens the app's notification settings once Android won't ask. -->
-  <button id="disclosure-banner" class="update-banner disclosure-banner" type="button"
-          data-action="setup-fix-notifications" style="display:none">
-    🔕 Location sharing is off because notifications are off for Roamkeep. Tap to turn them on.
-  </button>
+  <!-- Shown while something the setup sheet asks for is off: location,
+       notifications (4.11.1: then it shares nothing) or "all the time"
+       (4.13.2). renderSetupBanner writes the text and what a tap does. -->
+  <button id="setup-banner" class="update-banner setup-banner" type="button"
+          data-action="open-setup" style="display:none"></button>
   <div class="hdr">
     <div class="hdr-l">
       <!-- A lockup built from the registered mark: its teal tile and keep,
@@ -1055,7 +1053,11 @@
       leave a saved place, <strong>including when the app is closed or not
       in use</strong>. Only members of your Keep can ever see it.</p>
     <div id="setup-rows"></div>
-    <p class="note" id="setup-foot"></p>  </div>
+    <p class="note" id="setup-foot"></p>
+    <!-- 4.13.2: a tester whose app seemed to keep closing could not reach
+         the diagnostics in Settings; this sheet is what they do reach. -->
+    <button class="lnk-btn" data-action="share-diag">Something not working? Share diagnostics</button>
+  </div>
 </div>
 
 <!-- TOASTS -->

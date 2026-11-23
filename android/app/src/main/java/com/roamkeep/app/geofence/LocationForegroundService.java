@@ -369,8 +369,18 @@ public class LocationForegroundService extends Service {
         // that was the first tap of Allow on Location: notifications come
         // later in the setup sheet, and the grant fires two starts (the
         // resume self-heal and restartGPS), 25 ms apart on the device log.
+        //
+        // 4.13.2: nor without precise location. Android 14 refuses a location
+        // service without it (a SecurityException at every boot and update on
+        // a tester's phone, 2026-11-18), and below 14 the service ran with its
+        // notice up and recorded nothing. Location first: with it off there is
+        // nothing to share, whatever the notification can do.
+        if (!canLocate(ctx)) {
+            noteStopped(ctx, STATUS_LOCATION_OFF, "service start: " + why);
+            return;
+        }
         if (!canDisclose(ctx)) {
-            noteSharingStopped(ctx, "service start: " + why);
+            noteStopped(ctx, STATUS_NOTIFICATIONS_OFF, "service start: " + why);
             return;
         }
         Intent i = new Intent(ctx.getApplicationContext(), LocationForegroundService.class);
@@ -412,6 +422,26 @@ public class LocationForegroundService extends Service {
         start(ctx, "activity: " + what);
     }
 
+    /**
+     * 4.13.2: bring sharing in line with the permissions, with the app closed.
+     * They are changed in system settings, which tells nothing that is
+     * running, so a push wake asks: a stop that has not been recorded yet is
+     * recorded (and the family told), and a stop whose cause is gone ends,
+     * if the service may start from the background at all. Without "Allow
+     * all the time" Android 14 would refuse that start, so it waits for the
+     * app to be opened instead. Throws what start() throws.
+     */
+    static void reconcileSharing(Context ctx, String why) {
+        PrefsStore prefs = new PrefsStore(ctx);
+        if (!prefs.hasContext() || prefs.isPaused() || prefs.isServerRejected()) return;
+        String notice = stopNotice(ctx);
+        if (notice != null) {
+            noteStopped(ctx, notice, why);
+        } else if (prefs.isSharingStopped() && !running && GeofenceArmer.haveBackgroundLocation(ctx)) {
+            start(ctx, why);
+        }
+    }
+
     // ── No recording without the notification (4.11.1) ────────────────
     //
     // The privacy page promises a notification "whenever it is recording
@@ -428,9 +458,35 @@ public class LocationForegroundService extends Service {
     // the person why when it is next opened.
 
     /** What a stopped member's status says, shared with app.js
-     *  (STATUS_NOTIFICATIONS_OFF). */
+     *  (STATUS_NOTIFICATIONS_OFF, STATUS_LOCATION_OFF). */
     static final String STATUS_NOTIFICATIONS_OFF = "🔕 Not sharing: notifications are off";
+    static final String STATUS_LOCATION_OFF = "🚫 Not sharing: location access is off";
     static final String STATUS_DEFAULT = "📍 Location sharing on";
+
+    // ── No sharing without location (4.13.2) ──────────────────────────
+    //
+    // A tester's phone had no precise location for 15 days: Location off for
+    // Roamkeep, or Approximate. Nothing on it could record, and the family
+    // saw only a pin going stale. The service was still started at every
+    // boot and update, and Android 14 refused it each time. Now a missing
+    // permission is a stop like a missing notification: said once in the
+    // journal, the family told through the status, the app told at launch.
+    // Revoking a permission kills the process, so the next start attempt
+    // (app open, boot, update, an activity signal, a push wake) notices.
+
+    /** Whether Roamkeep may use precise location: the one question every
+     *  recording path depends on (GeofenceArmer asks the same). */
+    static boolean canLocate(Context ctx) {
+        return GeofenceArmer.haveFineLocation(ctx);
+    }
+
+    /** Why sharing cannot run right now, as the status the family should
+     *  see, or null if it can. Location first, as in start(). */
+    static String stopNotice(Context ctx) {
+        if (!canLocate(ctx)) return STATUS_LOCATION_OFF;
+        if (!canDisclose(ctx)) return STATUS_NOTIFICATIONS_OFF;
+        return null;
+    }
 
     /** Whether the tracking notification can be shown right now. */
     static boolean canDisclose(Context ctx) {
@@ -457,21 +513,37 @@ public class LocationForegroundService extends Service {
      * status the family sees are written once per stop, not per call.
      */
     static void stopForDisclosure(Context context, String why) {
-        noteSharingStopped(context, why);
+        noteStopped(context, STATUS_NOTIFICATIONS_OFF, why);
         stop(context.getApplicationContext());
     }
 
     /**
-     * stopForDisclosure without stopping the service: for start() and
-     * onStartCommand, which must not call stopService (see start()).
+     * Record that sharing is stopped, and why (`notice`, the status the
+     * family is given). Does not stop the service: for start() and
+     * onStartCommand, which must not call stopService (see start()), and for
+     * callers that have nothing running. Once per stop, and again only if
+     * the reason changes, so a phone with both off reads right as each is
+     * fixed.
      */
-    static void noteSharingStopped(Context context, String why) {
+    static void noteStopped(Context context, String notice, String why) {
         final Context ctx = context.getApplicationContext();
         final PrefsStore prefs = new PrefsStore(ctx);
-        if (prefs.markSharingStopped()) {
-            prefs.journal("sharing: STOPPED, the tracking notification can't be shown ("
-                    + why + "); nothing is recorded until it can");
-            postStatus(ctx, prefs, STATUS_NOTIFICATIONS_OFF);
+        // Signed out: no family to tell, and a stop marked now would never
+        // be told after sign-in (the mark says it already was).
+        if (!prefs.hasContext()) return;
+        if (prefs.markSharingStopped(notice)) {
+            if (STATUS_LOCATION_OFF.equals(notice)) {
+                prefs.journal("sharing: STOPPED, Roamkeep has no precise location permission ("
+                        + why + "); nothing is recorded until it has");
+                // Activity recognition would go on waking the process for a
+                // service that cannot start. The service's next start
+                // registers it again.
+                MotionSignalReceiver.unregister(ctx);
+            } else {
+                prefs.journal("sharing: STOPPED, the tracking notification can't be shown ("
+                        + why + "); nothing is recorded until it can");
+            }
+            postStatus(ctx, prefs, notice);
         } else if (prefs.getStatusOwed() != null) {
             // Already stopped, and the family was never told: this is the
             // retry. Every transition and start attempt while stopped comes
@@ -517,7 +589,8 @@ public class LocationForegroundService extends Service {
             upd.put("status", owed);
             SupabaseRest rest = new SupabaseRest(ctx);
             st = STATUS_DEFAULT.equals(owed)
-                    ? rest.updateMemberIfStatus(prefs.getMemberId(), STATUS_NOTIFICATIONS_OFF, upd)
+                    ? rest.updateMemberIfStatus(prefs.getMemberId(),
+                            new String[] { STATUS_NOTIFICATIONS_OFF, STATUS_LOCATION_OFF }, upd)
                     : rest.updateMemberStatus(prefs.getMemberId(), upd);
         } catch (Exception e) {
             Log.w(TAG, "status update failed", e);
@@ -703,6 +776,17 @@ public class LocationForegroundService extends Service {
             return START_NOT_STICKY;
         }
 
+        // No location or no notification (start() asks the same; this is for
+        // the starts that skip it, the sticky restart among them). Before the
+        // promotion check, so a start Android 14 refused for want of location
+        // is recorded as that, not as a failed promotion.
+        final String notice = stopNotice(this);
+        if (notice != null) {
+            noteStopped(this, notice, "service start: " + why);
+            ServiceCompat.stopForeground(this, ServiceCompat.STOP_FOREGROUND_REMOVE);
+            stopSelf(startId);
+            return START_NOT_STICKY;
+        }
         // 4.11.1: no notification, no recording (see canDisclose). A start
         // Android would not promote used to carry on as an ordinary service,
         // recording with nothing on screen. The next app open, boot or
@@ -712,15 +796,12 @@ public class LocationForegroundService extends Service {
             stopSelf(startId);
             return START_NOT_STICKY;
         }
-        if (!canDisclose(this)) {
-            noteSharingStopped(this, "service start: " + why);
-            ServiceCompat.stopForeground(this, ServiceCompat.STOP_FOREGROUND_REMOVE);
-            stopSelf(startId);
-            return START_NOT_STICKY;
-        }
         // Back after a stop: say so, once, and put the family's view back.
-        if (gate.clearSharingStopped()) {
-            gate.journal("sharing: resumed, the tracking notification is showing again");
+        final String was = gate.clearSharingStopped();
+        if (was != null) {
+            gate.journal("sharing: resumed, " + (STATUS_LOCATION_OFF.equals(was)
+                    ? "Roamkeep has precise location again"
+                    : "the tracking notification is showing again"));
             postStatus(this, gate, STATUS_DEFAULT);
         }
 

@@ -1180,6 +1180,147 @@ console.log('\nnative: every departure waits for Play Services to take it back')
   }
 }
 
+// A declined permission leaves a working app (4.13.2). A tester's phone with
+// location declined met the setup sheet at every launch and a prompt or a red
+// toast at every return, and its location service was started, and refused,
+// at every boot and update. So: nothing asks but a tap in the setup sheet,
+// the sheet opens by itself only for something newly missing, nothing starts
+// without location, and the family's "not sharing" notices are spelled the
+// same on both sides. The real code, cut out of the source.
+console.log('\napp: a declined permission leaves a working app');
+{
+  const app = fs.readFileSync(path.join(REPO, 'app.js'), 'utf8').replace(/\r\n/g, '\n');
+  const java = fs.readFileSync(path.join(REPO,
+    'android/app/src/main/java/com/roamkeep/app/geofence/LocationForegroundService.java'), 'utf8')
+    .replace(/\r\n/g, '\n');
+  const bodyIn = (src, head) => {
+    const at = src.indexOf(head);
+    if (at < 0) return null;
+    let depth = 0, i = src.indexOf('{', at);
+    for (; i < src.length; i++) {
+      if (src[i] === '{') depth++;
+      else if (src[i] === '}' && --depth === 0) break;
+    }
+    return src.slice(at, i + 1);
+  };
+  const code = (s) => s.replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '');
+
+  // Every request sits in one of the setup sheet's own functions.
+  const appCode = code(app);
+  const sheetOnly = new Set(['requestLocationPermission', 'initPushNotifications',
+    'setupFixBackground', 'setupFixActivity']);
+  const strays = [];
+  for (const m of appCode.matchAll(/\.(requestPermissions|requestLocation|requestBackgroundLocation|requestActivityRecognition)\(/g)) {
+    const fn = [...appCode.slice(0, m.index).matchAll(/function\s+(\w+)\s*\(/g)].pop();
+    if (!fn || !sheetOnly.has(fn[1])) strays.push((fn ? fn[1] : '?') + ' asks ' + m[1]);
+  }
+  check('only the setup sheet asks for a permission', strays.length === 0, strays.join(', '));
+  check('launch registers for push without asking',
+    /fromSetupSheet\s*\?\s*await Push\.requestPermissions\(\)/.test(appCode));
+  const setupFns = code(['setupFixLocation', 'setupFixNotifications']
+    .map((n) => bodyIn(app, `async function ${n}()`) || '').join('\n'));
+  check('the sheet\'s Location and Notifications rows are what ask',
+    /requestLocationPermission\(\)/.test(setupFns) && /initPushNotifications\(true\)/.test(setupFns));
+  const startGPS = bodyIn(appCode, 'async function startGPS()') || '';
+  const resume = bodyIn(appCode, 'async function _onResumeImpl()') || '';
+  const before = (src, a, b) => src.indexOf(a) >= 0 && src.indexOf(a) < src.indexOf(b);
+  check('startGPS checks for location before the watch, which would ask by itself',
+    before(startGPS, 'haveLocation()', 'Geo.watchPosition('));
+  check('resume checks for location before a fix, which would ask by itself',
+    before(resume, 'haveLocation()', 'getCurrentPosition('));
+
+  // The sheet opens by itself only for something newly missing.
+  const newly = bodyIn(app, 'async function setupNewlyMissing(st)');
+  const forget = bodyIn(app, 'async function forgetGranted(st)');
+  if (!newly || !forget) {
+    check('setupNewlyMissing and forgetGranted found in app.js', false, 'moved or renamed');
+  } else {
+    const AsyncFunction = Object.getPrototypeOf(async () => {}).constructor;
+    const store = {};
+    const make = (call) => new AsyncFunction('st', 'store', `
+      const SETUP_SEEN_KEY = 'rk_setup_seen';
+      const SETUP_ITEMS = [
+        { key: 'fineLocation', required: true }, { key: 'backgroundLocation', required: true },
+        { key: 'ignoringBatteryOptimizations', required: false }, { key: 'notifications', required: true }];
+      const prefGet = async (k) => (k in store ? store[k] : null);
+      const prefSet = async (k, v) => { store[k] = v; };
+      ${newly}
+      ${forget}
+      return ${call}(st);`);
+    const run = make('setupNewlyMissing');
+    const seenNow = make('forgetGranted');
+    const st = (fine, bg, notif, battery = false) =>
+      ({ fineLocation: fine, backgroundLocation: bg, notifications: notif, ignoringBatteryOptimizations: battery });
+    const steps = [
+      ['first launch, nothing allowed yet: opens', st(false, false, false), true],
+      ['location declined, notifications allowed: does not open again', st(false, false, true), false],
+      ['the same next time: does not open', st(false, false, true), false],
+      ['everything allowed: does not open', st(true, true, true), false],
+      ['location revoked later: opens for it', st(false, true, true), true],
+      ['still revoked: does not open again', st(false, true, true), false],
+      ['an optional row alone never opens it', st(true, true, true, false), false]
+    ];
+    for (const [label, s, want] of steps) {
+      const got = await run(s, store);
+      check(label, got === want, `got ${got}, stored ${JSON.stringify(store.rk_setup_seen)}`);
+    }
+    const fresh = {};
+    check('first launch with everything allowed: does not open', (await run(st(true, true, true), fresh)) === false);
+    // Granted during a session and revoked before the next launch: new again.
+    const s2 = {};
+    await run(st(false, false, true), s2);
+    await seenNow(st(true, false, true), s2);
+    check('location granted in a session, revoked by the next launch: opens',
+      (await run(st(false, false, true), s2)) === true, JSON.stringify(s2));
+    check('still missing after that: does not open again', (await run(st(false, false, true), s2)) === false);
+  }
+
+  // The banner says what is off, and a tap goes to the fix.
+  const banner = bodyIn(app, 'function renderSetupBanner(st)');
+  if (!banner) {
+    check('renderSetupBanner found in app.js', false, 'moved or renamed');
+  } else {
+    const b = { textContent: '', dataset: {}, style: {}, classes: new Set(),
+      classList: { toggle(c, on) { on ? b.classes.add(c) : b.classes.delete(c); } } };
+    const render = new Function('$', `${banner}\nreturn renderSetupBanner;`)(() => b);
+    const show = (s) => { render(s); return { text: b.textContent, action: b.dataset.action, soft: b.classes.has('soft'), shown: b.style.display !== 'none' }; };
+    let r = show({ fineLocation: false, approximateLocation: false, notifications: true, backgroundLocation: false });
+    check('location off: says so, a tap opens the sheet', r.shown && /location is off/.test(r.text) && r.action === 'open-setup' && !r.soft, JSON.stringify(r));
+    r = show({ fineLocation: false, approximateLocation: true, notifications: true, backgroundLocation: false });
+    check('approximate only: says so', r.shown && /approximate/.test(r.text), JSON.stringify(r));
+    r = show({ fineLocation: true, notifications: false, backgroundLocation: true });
+    check('notifications off: a tap asks for them', r.shown && r.action === 'setup-fix-notifications', JSON.stringify(r));
+    r = show({ fineLocation: true, notifications: true, backgroundLocation: false });
+    check('while using only: a plain line, not an alarm', r.shown && r.soft && /only work while/.test(r.text), JSON.stringify(r));
+    r = show({ fineLocation: true, notifications: true, backgroundLocation: true });
+    check('everything on: no banner', !r.shown, JSON.stringify(r));
+  }
+
+  // The family's notices, and the native gates.
+  const said = (src, name) => (src.match(new RegExp(name + "\\s*=\\s*['\"]([^'\"]+)['\"]")) || [])[1];
+  for (const name of ['STATUS_LOCATION_OFF', 'STATUS_NOTIFICATIONS_OFF']) {
+    check(`${name} is the same in app.js and the native side`,
+      !!said(app, name) && said(app, name) === said(java, name), `${said(app, name)} / ${said(java, name)}`);
+  }
+  const start = code(bodyIn(java, 'public static void start(Context ctx, String why)') || '');
+  const onStart = code(bodyIn(java, 'public int onStartCommand(Intent intent, int flags, int startId)') || '');
+  check('start() asks for location before the notification, and both before starting',
+    before(start, 'canLocate(', 'canDisclose(') && before(start, 'canDisclose(', 'startForegroundService('));
+  check('onStartCommand asks why it cannot share before judging the promotion',
+    before(onStart, 'stopNotice(', 'if (!promoted)'));
+}
+
+console.log('\nandroid: no hardware requirement narrows who can install');
+// 4.13.2. Google's code scanner, which reads an invite QR, locks one of its
+// screens to portrait, and Android then counts a portrait screen as required
+// hardware: Play hid the app from devices without one. The release build
+// also checks the built APK, where a library's own manifest shows up.
+{
+  const manifest = fs.readFileSync(path.join(REPO, 'android/app/src/main/AndroidManifest.xml'), 'utf8');
+  check('the manifest marks a portrait screen as optional',
+    /<uses-feature\s+android:name="android\.hardware\.screen\.portrait"\s+android:required="false"\s*\/>/.test(manifest));
+}
+
 console.log('\nwizard: every source file parses');
 
 // security.txt (RFC 9116), published on both sites from one file. Its Expires

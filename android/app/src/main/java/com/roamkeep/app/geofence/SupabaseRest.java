@@ -127,10 +127,18 @@ public class SupabaseRest {
     }
 
     /** updateMemberStatus, applied only while the row's status still reads
-     *  `ifStatus`. A row that has moved on matches nothing, which PostgREST
-     *  answers 204: there is then nothing to undo, so that is success too. */
-    public int updateMemberIfStatus(String memberId, String ifStatus, JSONObject body) {
-        String path = "/rest/v1/keep_members?id=eq." + enc(memberId) + "&status=eq." + enc(ifStatus);
+     *  one of `ifStatus`. A row that has moved on matches nothing, which
+     *  PostgREST answers 204: there is then nothing to undo, so that is
+     *  success too. Each value is quoted, as PostgREST asks of a list value
+     *  holding its separators; ours hold no quote or backslash. */
+    public int updateMemberIfStatus(String memberId, String[] ifStatus, JSONObject body) {
+        StringBuilder in = new StringBuilder("(");
+        for (int i = 0; i < ifStatus.length; i++) {
+            if (i > 0) in.append(',');
+            in.append('"').append(ifStatus[i]).append('"');
+        }
+        in.append(')');
+        String path = "/rest/v1/keep_members?id=eq." + enc(memberId) + "&status=in." + enc(in.toString());
         return doJsonWithRefresh("PATCH", path, body.toString(), "return=minimal");
     }
 

@@ -168,6 +168,15 @@ public class RoamkeepMessagingService extends MessagingService {
         reconcilePlaces(ctx, prefs);
         notifyOwnerRequests(ctx, prefs);
         notifyResetNotice(ctx, prefs);
+        // 4.13.2: location or notifications switched off (or back on) in
+        // system settings tell nothing running; a wake is the next chance to
+        // notice, so the family is not left reading a stale pin as sharing.
+        // Last, because a start Android refuses throws.
+        try {
+            LocationForegroundService.reconcileSharing(ctx, "push wake");
+        } catch (Exception e) {
+            Log.i(TAG, "push wake: sharing not restarted (" + e.getClass().getSimpleName() + ")");
+        }
     }
 
     /**

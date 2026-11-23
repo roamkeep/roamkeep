@@ -123,6 +123,22 @@ app explains why and offers to fix it. From Android 14 the notification can
 be swiped away, and no app can prevent that, so the app puts it straight
 back. Do not add a recording path without this check.
 
+**A declined permission leaves a working app.** Every permission is the
+person's to refuse, and the app has to stay usable and honest when one is.
+Nothing asks for a permission except a tap on Allow in the setup sheet:
+launch and coming back to the app only check. The sheet opens by itself
+when something it asks for has newly gone missing, not at every launch;
+after that, a line under the header says what is off and what that costs,
+and a tap on it leads to the fix. Each Allow button works even after
+Android has stopped showing its own question, by opening the app's settings
+with the switch named. Without precise location (Location off for the app,
+or Approximate) nothing is recorded and the tracking service is not
+started, the family sees "Not sharing: location access is off", and the
+person can still see everyone else. The same check runs when the phone
+starts up, when the app is updated and when the phone is woken for a sync,
+because permissions are changed in the phone's settings, which tell the app
+nothing.
+
 ### Trusting a fix
 
 A GPS fix comes with an error radius, and a phone sitting still produces

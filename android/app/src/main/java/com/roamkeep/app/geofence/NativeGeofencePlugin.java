@@ -69,10 +69,16 @@ import java.util.List;
  *   Roamkeep.NativeGeofence.setPaused({ pausedUntil })  → adult self-pause
  *   Roamkeep.NativeGeofence.getReliabilityStatus()  → diagnostics
  *   Roamkeep.NativeGeofence.requestActivityRecognition()  → Physical activity (optional)
+ *   Roamkeep.NativeGeofence.requestLocation()  → precise location (4.13.2)
  */
 @CapacitorPlugin(
         name = "NativeGeofence",
         permissions = {
+                // Coarse with fine: Android 12+ ignores a request for fine alone.
+                @Permission(
+                        alias = NativeGeofencePlugin.LOCATION,
+                        strings = { Manifest.permission.ACCESS_COARSE_LOCATION,
+                                    Manifest.permission.ACCESS_FINE_LOCATION }),
                 @Permission(
                         alias = NativeGeofencePlugin.BG_LOCATION,
                         strings = { Manifest.permission.ACCESS_BACKGROUND_LOCATION }),
@@ -82,6 +88,7 @@ import java.util.List;
         })
 public class NativeGeofencePlugin extends Plugin {
 
+    static final String LOCATION = "location";
     static final String BG_LOCATION = "backgroundLocation";
     static final String ACTIVITY = "activityRecognition";
     private static final String TAG = "RoamkeepGeo";
@@ -109,6 +116,41 @@ public class NativeGeofencePlugin extends Plugin {
     private boolean haveBackgroundLocation() {
         return Build.VERSION.SDK_INT < 29 || ContextCompat.checkSelfPermission(getContext(),
                 Manifest.permission.ACCESS_BACKGROUND_LOCATION) == PackageManager.PERMISSION_GRANTED;
+    }
+
+    /** Approximate location: what the person has when they turned "Use
+     *  precise location" off. Roamkeep can do nothing with it (geofences
+     *  need fine), which is why it is reported apart from Off. */
+    private boolean haveCoarseLocation() {
+        return ContextCompat.checkSelfPermission(getContext(),
+                Manifest.permission.ACCESS_COARSE_LOCATION) == PackageManager.PERMISSION_GRANTED;
+    }
+
+    /**
+     * Ask for precise location (4.13.2). Called only from a tap on Allow in
+     * the setup sheet: nothing else in the app raises a permission dialog.
+     *
+     * Here rather than through @capacitor/geolocation, whose request refuses
+     * outright while the phone's Location is switched off and cannot say
+     * Approximate. Answers "granted", "approximate" or "denied"; once
+     * Android has stopped showing the dialog the answer comes at once, and
+     * the app then opens its settings instead.
+     */
+    @PluginMethod
+    public void requestLocation(PluginCall call) {
+        if (haveFineLocation()) {
+            locationResult(call);
+            return;
+        }
+        requestPermissionForAlias(LOCATION, call, "locationResult");
+    }
+
+    @PermissionCallback
+    private void locationResult(PluginCall call) {
+        JSObject res = new JSObject();
+        res.put("status", haveFineLocation() ? "granted"
+                : haveCoarseLocation() ? "approximate" : "denied");
+        call.resolve(res);
     }
 
     /**
@@ -406,6 +448,9 @@ public class NativeGeofencePlugin extends Plugin {
         PrefsStore prefs = new PrefsStore(ctx);
         JSObject res = new JSObject();
         res.put("fineLocation", fine);
+        // 4.13.2: Approximate is not Off. The fix for it is one switch, "Use
+        // precise location", and the setup sheet and diagnostics name it.
+        res.put("approximateLocation", !fine && haveCoarseLocation());
         res.put("backgroundLocation", background);
         res.put("notifications", notifications);
         res.put("sharingStopped", prefs.isSharingStopped());
@@ -806,6 +851,9 @@ public class NativeGeofencePlugin extends Plugin {
     public void startLocationUpdates(PluginCall call) {
         String mode = call.getString("mode", "auto");
         if (!haveFineLocation()) {
+            // 4.13.2: nothing starts, but the stop is recorded once and the
+            // family told, as at a boot or update.
+            LocationForegroundService.reconcileSharing(getContext(), "app");
             call.reject("ACCESS_FINE_LOCATION not granted");
             return;
         }

@@ -435,25 +435,37 @@ public class PrefsStore {
         if (sp.getInt(K_REJECT_STREAK, 0) != 0) sp.edit().putInt(K_REJECT_STREAK, 0).apply();
     } }
     // Sharing stopped because the tracking notification could not be shown
-    // (4.11.1, LocationForegroundService.stopForDisclosure). Not the gate
-    // itself, which is asked live every time; this records that WE stopped,
-    // so the stop and the restart are each announced once.
+    // (4.11.1, LocationForegroundService.stopForDisclosure), or, since 4.13.2,
+    // because Roamkeep has no precise location. Not the gates themselves,
+    // which are asked live every time; this records that WE stopped, and the
+    // status the family was given for it, so the stop and the restart are
+    // each announced once, and a stop whose reason changes is announced again.
     private static final String K_SHARING_STOPPED = "sharing_stopped";
+    private static final String K_STOP_NOTICE     = "sharing_stop_notice";
 
     public boolean isSharingStopped() { return sp.getBoolean(K_SHARING_STOPPED, false); }
 
-    /** @return true if this call is the one that stopped sharing. */
-    public boolean markSharingStopped() { synchronized (LOCK) {
-        if (sp.getBoolean(K_SHARING_STOPPED, false)) return false;
-        sp.edit().putBoolean(K_SHARING_STOPPED, true).commit();
+    /** The status given for the current stop, null while sharing. A stop
+     *  recorded before 4.13.2 had only one possible reason, notifications. */
+    public String getStopNotice() {
+        if (!isSharingStopped()) return null;
+        return sp.getString(K_STOP_NOTICE, LocationForegroundService.STATUS_NOTIFICATIONS_OFF);
+    }
+
+    /** @return true if this call stopped sharing, or changed why it is stopped. */
+    public boolean markSharingStopped(String notice) { synchronized (LOCK) {
+        if (sp.getBoolean(K_SHARING_STOPPED, false) && notice.equals(getStopNotice())) return false;
+        sp.edit().putBoolean(K_SHARING_STOPPED, true).putString(K_STOP_NOTICE, notice).commit();
         return true;
     } }
 
-    /** @return true if sharing had been stopped and this call restarted it. */
-    public boolean clearSharingStopped() { synchronized (LOCK) {
-        if (!sp.getBoolean(K_SHARING_STOPPED, false)) return false;
-        sp.edit().putBoolean(K_SHARING_STOPPED, false).commit();
-        return true;
+    /** @return the notice of the stop this call ended, or null if sharing
+     *  was not stopped. */
+    public String clearSharingStopped() { synchronized (LOCK) {
+        String was = getStopNotice();
+        if (was == null) return null;
+        sp.edit().putBoolean(K_SHARING_STOPPED, false).remove(K_STOP_NOTICE).commit();
+        return was;
     } }
 
     public boolean isServerRejected()           { return sp.getBoolean(K_SERVER_REJECTED, false); }
